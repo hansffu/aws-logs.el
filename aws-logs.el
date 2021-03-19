@@ -8,7 +8,7 @@
 ;; Version: 0.0.1
 ;; Keywords: Symbol’s value as variable is void: finder-known-keywords
 ;; Homepage: https://github.com/hansffu/aws-logs
-;; Package-Requires: ((emacs "24.3"))
+;; Package-Requires: ((emacs "24.4"))
 ;;
 ;; This file is not part of GNU Emacs.
 ;;
@@ -18,45 +18,39 @@
 ;;
 ;;; Code:
 
+(require 'subr-x)
+
 (defvar aws-logs-cli "aws")
-(defvar aws-logs-endpoint "http://localhost:4566")
+(defvar aws-logs-endpoint nil)
 (defvar aws-logs-region "eu-west-1")
 
 (defun aws-logs--command (&rest args)
   "Build cli command with endpoint, region and ARGS."
-  (let ((aws aws-logs-cli)
-        (endpoint (if aws-logs-endpoint (format "--endpoint-url=%s" aws-logs-endpoint) ""))
+  (let ((endpoint (if aws-logs-endpoint (format "--endpoint-url=%s" aws-logs-endpoint) ""))
         (region (format "--region=%s" aws-logs-region)))
-    (format "aws %s %s %s" endpoint region (string-join args " "))
+    (string-join (append (list aws-logs-cli endpoint region) args) " ")
     )
   )
 
 (defun aws-logs--list-log-groups ()
   "Return log group name for all log groups."
-  (let* ((aws aws-logs-cli)
-         (endpoint (format "--endpoint-url=%s" aws-logs-endpoint))
-         (region (format "--region=%s" aws-logs-region))
-
-         (result (with-temp-buffer
+  (let* ((result (with-temp-buffer
                    (list :exit-status
-                         (call-process aws nil t nil endpoint region "logs" "describe-log-groups")
+                         (call-process-shell-command (aws-logs--command "logs" "describe-log-groups") nil t)
                          :output
                          (buffer-string))))
          (output (plist-get result :output))
          (json (json-parse-string output :object-type 'plist))
          (log-groups (alist-get 'logGroups (json-parse-string output :object-type 'alist) ))
          )
-    (--map (alist-get 'logGroupName it) log-groups)
+    (mapcar (lambda (log-group) (alist-get 'logGroupName log-group)) log-groups)
     )
   )
 
-(defun aws-logs-tail-log ()
+(defun aws-logs ()
   "Select a stream to tail."
   (interactive)
-  (let* ((aws aws-logs-cli)
-         (endpoint (format "--endpoint-url=%s" aws-logs-endpoint))
-         (region (format "--region=%s" aws-logs-region))
-         (log-group (completing-read "Log group: " (aws-logs--list-log-groups)))
+  (let* ((log-group (completing-read "Log group: " (aws-logs--list-log-groups)))
          (process (start-process-shell-command "aws-cli"
                                                (format "*AWS logs - %s*" log-group)
                                                (aws-logs--command "logs tail" log-group "--follow"))))
