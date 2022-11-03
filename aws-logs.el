@@ -8,7 +8,7 @@
 ;; Version: 0.0.1
 ;; Keywords: Symbol’s value as variable is void: finder-known-keywords
 ;; Homepage: https://github.com/hansffu/aws-logs
-;; Package-Requires: ((emacs "24.4"))
+;; Package-Requires: ((emacs "27.1"))
 ;;
 ;; This file is not part of GNU Emacs.
 ;;
@@ -20,9 +20,27 @@
 
 (require 'subr-x)
 
-(defvar aws-logs-cli "aws")
-(defvar aws-logs-endpoint nil)
-(defvar aws-logs-region "eu-west-1")
+(defcustom aws-logs-cli "aws"
+  "The cli command for aws cli"
+  :type 'string
+  :group 'aws-logs)
+(defcustom aws-logs-endpoint nil
+  "Customize endpoint"
+  :type 'string
+  :group 'aws-logs)
+(defcustom aws-logs-region "eu-west-1"
+  "Customize region"
+  :type 'string
+  :group 'aws-logs)
+(defcustom aws-logs-format "detailed"
+  "Sets the --format option on aws command"
+  :type 'string
+  :options '("detailed" "short" "json")
+  :group 'aws-logs)
+(defcustom aws-logs-since "10m"
+  "Sets the --since option on aws command"
+  :type 'string
+  :group 'aws-logs)
 
 (defun aws-logs--command (&rest args)
   "Build cli command with endpoint, region and ARGS."
@@ -53,7 +71,10 @@
   (let* ((log-group (completing-read "Log group: " (aws-logs--list-log-groups)))
          (process (start-process-shell-command "aws-cli"
                                                (format "*AWS logs - %s*" log-group)
-                                               (aws-logs--command "logs tail" log-group "--follow"))))
+                                               (aws-logs--command "logs tail" log-group
+                                                                  "--follow"
+                                                                  "--format" aws-logs-format
+                                                                  "--since" aws-logs-since))))
     (with-current-buffer (process-buffer process)
       (display-buffer (current-buffer))
       (require 'shell)
