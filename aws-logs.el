@@ -19,28 +19,39 @@
 ;;; Code:
 
 (require 'subr-x)
+(require 'comint)
 
 (defcustom aws-logs-cli "aws"
-  "The cli command for aws cli"
+  "The cli command for aws cli."
   :type 'string
   :group 'aws-logs)
 (defcustom aws-logs-endpoint nil
-  "Customize endpoint"
+  "Customize endpoint."
   :type 'string
   :group 'aws-logs)
 (defcustom aws-logs-region "eu-west-1"
-  "Customize region"
+  "Customize region."
   :type 'string
   :group 'aws-logs)
 (defcustom aws-logs-format "detailed"
-  "Sets the --format option on aws command"
+  "Sets the --format option on aws command."
   :type 'string
   :options '("detailed" "short" "json")
   :group 'aws-logs)
 (defcustom aws-logs-since "10m"
-  "Sets the --since option on aws command"
+  "Sets the --since option on aws command."
   :type 'string
   :group 'aws-logs)
+(defcustom aws-logs-mode-hook '()
+  "Hook for customizing aws-logs-mode."
+  :type 'hook
+  :group 'aws-logs)
+
+(defvar aws-logs-mode-map
+  (let ((map (make-keymap)))
+    (define-key map "q" 'quit-window)
+    map)
+  "Keymap for aws-logs-mode.")
 
 (defun aws-logs--command (&rest args)
   "Build cli command with endpoint, region and ARGS."
@@ -58,11 +69,17 @@
                          :output
                          (buffer-string))))
          (output (plist-get result :output))
-         (json (json-parse-string output :object-type 'plist))
          (log-groups (alist-get 'logGroups (json-parse-string output :object-type 'alist) ))
          )
     (mapcar (lambda (log-group) (alist-get 'logGroupName log-group)) log-groups)
     )
+  )
+
+(define-derived-mode aws-logs-mode comint-mode "AWS-LOGS"
+  "Displays logs fetched by aws-logs command."
+  :interactive nil
+  :group 'aws-logs
+  (read-only-mode 1)
   )
 
 (defun aws-logs ()
@@ -77,8 +94,7 @@
                                                                   "--since" aws-logs-since))))
     (with-current-buffer (process-buffer process)
       (display-buffer (current-buffer))
-      (require 'shell)
-      (shell-mode)
+      (aws-logs-mode)
       (set-process-filter process 'comint-output-filter))
     ))
 
