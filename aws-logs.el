@@ -49,9 +49,18 @@
 
 (defvar aws-logs-mode-map
   (let ((map (make-keymap)))
-    (define-key map "q" 'quit-window)
+    (define-key map "q" #'aws-logs-quit-process-and-window)
     map)
   "Keymap for aws-logs-mode.")
+
+
+(defun aws-logs-quit-process-and-window ()
+  "Quit current process and window."
+  (interactive)
+  (cl-letf (((symbol-function 'process-kill-buffer-query-function) (lambda () (always nil))))
+    (kill-buffer-and-window)
+    )
+  )
 
 (defun aws-logs--command (&rest args)
   "Build cli command with endpoint, region and ARGS."
@@ -95,7 +104,8 @@
     (with-current-buffer (process-buffer process)
       (display-buffer (current-buffer))
       (aws-logs-mode)
-      (set-process-filter process 'comint-output-filter))
+      (set-process-filter process 'comint-output-filter)
+      )
     ))
 
 (provide 'aws-logs)
