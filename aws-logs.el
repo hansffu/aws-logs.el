@@ -70,31 +70,10 @@
 (defvar aws-logs-time-range aws-logs-since
   "Selected time range (e.g. 10m). Used as --since for `aws logs tail`.")
 
-(defvar aws-logs--next-transient-value nil
-  "If non-nil, used as the initial value for the next `aws-logs-transient` session.")
-
-(defun aws-logs--args-from-backing-fields ()
-  "Build transient args list from backing fields. Omits unset options."
-  (delq nil
-        (list (when aws-logs-time-range (format "--since=%s" aws-logs-time-range))
-              (when aws-logs-log-group (format "--log-group=%s" aws-logs-log-group))
-              (when aws-logs-query (format "--query=%s" aws-logs-query))
-              (when aws-logs-follow "--follow"))))
-
-(defun aws-logs--sync-backing-fields-from-args (args)
-  "Update backing fields from ARGS."
-  (setq args (mapcar #'substring-no-properties args))
-  (setq aws-logs-time-range (aws-logs--getopt "--since=" args))
-  (setq aws-logs-log-group (aws-logs--getopt "--log-group=" args))
-  (setq aws-logs-query (aws-logs--getopt "--query=" args))
-  (setq aws-logs-follow (member "--follow" args)))
-
-(defun aws-logs--transient-reopen-with-backing-fields ()
-  "Reopen transient so UI reflects current backing fields."
-  (setq aws-logs--next-transient-value (aws-logs--args-from-backing-fields))
+(defun aws-logs--transient-reprompt ()
+  "Refresh transient so UI reflects current backing fields." 
   (transient-quit-one)
-  (transient-setup 'aws-logs-transient)
-  (setq aws-logs--next-transient-value nil))
+  (transient-setup 'aws-logs-transient))
 
 (defvar aws-logs-mode-map
   (let ((map (make-keymap)))
@@ -289,6 +268,10 @@ Returns the edited query string, or nil if canceled."
   :description "Query (Logs Insights)"
   :class 'transient-option
   :allow-empty t
+  :init-value (lambda (obj)
+                ;; Ensure the visible value always reflects the backing field
+                ;; when the transient is entered/re-entered.
+                (transient-infix-set obj aws-logs-query))
   :reader (lambda (_prompt initial _hist)
             ;; Keep this lightweight: just accept raw input if someone insists.
             ;; Most users should use the Edit/Preset/Clear suffixes.
@@ -304,14 +287,14 @@ Returns the edited query string, or nil if canceled."
   (let ((edited (aws-logs--insights-query-edit aws-logs-query)))
     (when edited
       (setq aws-logs-query (if (string-empty-p edited) nil edited))
-      (aws-logs--transient-reopen-with-backing-fields))))
+      (aws-logs--transient-reprompt))))
 
 (transient-define-suffix aws-logs-query-clear ()
   "Disable the Logs Insights query (unset `aws-logs-query`)."
   :transient t
   (interactive)
   (setq aws-logs-query nil)
-  (aws-logs--transient-reopen-with-backing-fields))
+  (aws-logs--transient-reprompt))
 
 (defcustom aws-logs-insights-query-presets nil
   "Alist of named Logs Insights query presets.
@@ -329,7 +312,7 @@ Each entry is (NAME . QUERY)."
   (let* ((name (completing-read "Preset: " (mapcar #'car aws-logs-insights-query-presets) nil t))
          (query (cdr (assoc name aws-logs-insights-query-presets))))
     (setq aws-logs-query query)
-    (aws-logs--transient-reopen-with-backing-fields)))
+    (aws-logs--transient-reprompt)))
 
 (transient-define-infix aws-logs-infix-follow ()
   :description "Follow (tail)"
@@ -365,6 +348,8 @@ Each entry is (NAME . QUERY)."
                                    (when aws-logs-time-range (format "--since=%s" aws-logs-time-range)))))
 
 (defvar aws-logs--transient-history nil)
+
+
 ;; Main transient prefix
 (transient-define-prefix aws-logs-transient ()
   "AWS Logs transient menu.
@@ -372,23 +357,18 @@ Each entry is (NAME . QUERY)."
 This transient currently only collects options; the Run action is a placeholder
 and is not implemented yet."
   :remember-value 'exit
-  :value (lambda ()
-           (let ((v (or aws-logs--next-transient-value
-                        (aws-logs--args-from-backing-fields))))
-             (aws-logs--sync-backing-fields-from-args v)
-             v))
   [["Target"
     ("g" aws-logs-infix-log-group)]
-   ["Query"
-    ("q" "Query" aws-logs-infix-query)
-    ("e" "Edit query…" aws-logs-query-edit)
-    ("p" "Preset…" aws-logs-query-preset)
-    ("x" "Clear query" aws-logs-query-clear)
-    ]
+   
    ["Time / Tail options"
     ("s" "Since" aws-logs-infix-since)
     ("f" "Follow (tail)" aws-logs-infix-follow)]
-   ["Actions"
+   
+   [4 :description (lambda ()(format "Query: %s" (aws-logs--query-summary)))
+      ("e" "Edit query…" aws-logs-query-edit)
+      ("p" "Preset…" aws-logs-query-preset)
+      ("x" "Clear query" aws-logs-query-clear)]]
+  [["Actions"
     ("t" "Tail" aws-logs-print-logs)]]
   ;; Hint line
   (interactive)
