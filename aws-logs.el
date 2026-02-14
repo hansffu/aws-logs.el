@@ -42,8 +42,36 @@
   :type 'string
   :options '("detailed" "short" "json")
   :group 'aws-logs)
+(defcustom aws-logs-default-profile "dev"
+  "Default AWS CLI profile name to use.
+
+The transient UI updates the session variable `aws-logs-profile` using `setq`.
+If you want to change the default for new Emacs sessions, customize this option."
+  :type '(choice (const :tag "Default" nil) string)
+  :group 'aws-logs)
+
 (defcustom aws-logs-since "10m"
-  "Sets the --since option on aws command."
+  "Default time range to use as --since for `aws logs tail`."
+  :type 'string
+  :group 'aws-logs)
+
+(defcustom aws-logs-default-log-group aws-logs-default-group
+  "Default CloudWatch log group used to initialize `aws-logs-log-group`."
+  :type '(choice (const :tag "None" nil) string)
+  :group 'aws-logs)
+
+(defcustom aws-logs-default-query nil
+  "Default Logs Insights query used to initialize `aws-logs-query`."
+  :type '(choice (const :tag "None" nil) string)
+  :group 'aws-logs)
+
+(defcustom aws-logs-default-follow nil
+  "Default value for `aws-logs-follow`."
+  :type 'boolean
+  :group 'aws-logs)
+
+(defcustom aws-logs-default-since aws-logs-since
+  "Default time range used to initialize `aws-logs-time-range`."
   :type 'string
   :group 'aws-logs)
 (defcustom aws-logs-mode-hook '()
@@ -52,23 +80,27 @@
   :group 'aws-logs)
 
 (defcustom aws-logs-default-group nil
-  "Default log group to use"
-  :type 'string
+  "Default log group to use (legacy). Prefer `aws-logs-default-log-group`."
+  :type '(choice (const :tag "None" nil) string)
   :group 'aws-logs)
 
 ;; Backing fields for transient options.
 ;; These are the source of truth for aws-logs option state.
-(defvar aws-logs-log-group aws-logs-default-group
-  "Selected CloudWatch log group.")
 
-(defvar aws-logs-query nil
-  "Selected CloudWatch Logs Insights query string, or nil when disabled.")
+(defvar aws-logs-profile aws-logs-default-profile
+  "AWS CLI profile name to use for this Emacs session.")
 
-(defvar aws-logs-follow nil
-  "Non-nil means follow (tail) logs.")
+(defvar aws-logs-log-group aws-logs-default-log-group
+  "Selected CloudWatch log group for this Emacs session.")
 
-(defvar aws-logs-time-range aws-logs-since
-  "Selected time range (e.g. 10m). Used as --since for `aws logs tail`.")
+(defvar aws-logs-query aws-logs-default-query
+  "Selected CloudWatch Logs Insights query string for this Emacs session, or nil when disabled.")
+
+(defvar aws-logs-follow aws-logs-default-follow
+  "Non-nil means follow (tail) logs for this Emacs session.")
+
+(defvar aws-logs-time-range aws-logs-default-since
+  "Selected time range (e.g. 10m) for this Emacs session. Used as --since for `aws logs tail`.")
 
 (defun aws-logs--transient-reprompt ()
   "Refresh transient so UI reflects current backing fields." 
@@ -205,10 +237,8 @@ Returns the edited query string, or nil if canceled."
   "Build cli command with endpoint, region and ARGS."
   (let ((endpoint (if aws-logs-endpoint (format "--endpoint-url=%s" aws-logs-endpoint) ""))
         (region (format "--region=%s" aws-logs-region))
-        (profile "--profile=dev"))
-    (string-join (append (list aws-logs-cli endpoint region profile) args) " ")
-    )
-  )
+        (profile (when aws-logs-profile (format "--profile=%s" aws-logs-profile))))
+    (string-join (delq nil (append (list aws-logs-cli endpoint region profile) args)) " ")))
 
 (defun aws-logs--list-log-groups ()
   "Return log group name for all log groups."
@@ -323,6 +353,17 @@ Each entry is (NAME . QUERY)."
             (setq aws-logs-follow (not initial))
             aws-logs-follow))
 
+(transient-define-infix aws-logs-infix-profile ()
+  :description "Profile"
+  :class 'transient-option
+  :allow-empty t
+  :init-value (lambda (obj) (transient-infix-set obj aws-logs-profile))
+  :reader (lambda (prompt initial hist)
+            (let ((val (read-string prompt initial hist)))
+              (setq aws-logs-profile (if (string-empty-p val) nil val))
+              aws-logs-profile))
+  :argument "--profile=")
+
 ;; Infix for specifying --since / time-range
 (transient-define-infix aws-logs-infix-since ()
   :description "Since / Time range"
@@ -357,20 +398,19 @@ Each entry is (NAME . QUERY)."
 This transient currently only collects options; the Run action is a placeholder
 and is not implemented yet."
   :remember-value 'exit
-  [["Target"
-    ("g" aws-logs-infix-log-group)]
-   
-   ["Time / Tail options"
-    ("s" "Since" aws-logs-infix-since)
-    ("f" "Follow (tail)" aws-logs-infix-follow)]
-   
-   [4 :description (lambda ()(format "Query: %s" (aws-logs--query-summary)))
-      ("e" "Edit query…" aws-logs-query-edit)
-      ("p" "Preset…" aws-logs-query-preset)
-      ("x" "Clear query" aws-logs-query-clear)]]
+  [["Config"
+    ("-g" aws-logs-infix-log-group)
+    ("-s" "Since" aws-logs-infix-since)
+    ("-f" "Follow (tail)" aws-logs-infix-follow)
+    ("-p" "Profile" aws-logs-infix-profile)]
+
+   [4 :description (lambda () (format "Query: %s" (aws-logs--query-summary)))
+      ("-q" "Edit query…" aws-logs-query-edit)
+      ("Q" "Preset…" aws-logs-query-preset)
+      ("X" "Clear query" aws-logs-query-clear)]]
+
   [["Actions"
     ("t" "Tail" aws-logs-print-logs)]]
-  ;; Hint line
   (interactive)
   (transient-setup 'aws-logs-transient))
 
