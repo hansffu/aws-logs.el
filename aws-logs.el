@@ -129,7 +129,10 @@ Prefer `aws-logs-default-log-group`."
 (defun aws-logs-quit-process-and-window ()
   "Quit current process and window."
   (interactive)
-  (cl-letf (((symbol-function 'process-kill-buffer-query-function) (lambda () (always nil))))))
+  (let ((proc (get-buffer-process (current-buffer))))
+    (when (process-live-p proc)
+      (delete-process proc))
+    (quit-window t)))
 
 
 (defun aws-logs--command (&rest args)
@@ -267,6 +270,7 @@ Each entry is (NAME . QUERY)."
 (transient-define-infix aws-logs-infix-since ()
   :description "Since / Time range"
   :class 'transient-option
+  :init-value (lambda (obj) (transient-infix-set obj aws-logs-time-range))
   :reader (lambda (prompt initial hist)
             (let ((val (read-string prompt initial hist)))
               (setq aws-logs-time-range val)
@@ -279,13 +283,169 @@ Each entry is (NAME . QUERY)."
   (when-let ((s (seq-find (lambda (a) (string-prefix-p name a)) args)))
     (substring s (length name))))
 
-(transient-define-suffix aws-logs-print-logs ()
+(defun aws-logs--tail-args ()
+  "Build argument list for `aws logs tail` using current backing fields."
+  (append
+   (list "logs" "tail" aws-logs-log-group
+         "--format" aws-logs-format)
+   (when aws-logs-follow
+     (list "--follow"))
+   (when (and aws-logs-time-range (not (string-empty-p aws-logs-time-range)))
+     (list "--since" aws-logs-time-range))))
+
+(defun aws-logs--global-args ()
+  "Build common AWS CLI arguments from current backing fields."
+  (delq nil
+        (list
+         (when aws-logs-endpoint (format "--endpoint-url=%s" aws-logs-endpoint))
+         (format "--region=%s" aws-logs-region)
+         (when aws-logs-profile (format "--profile=%s" aws-logs-profile)))))
+
+(defun aws-logs--parse-time-range-to-seconds (time-range)
+  "Convert TIME-RANGE like 10m/2h/1d/30s to seconds.
+
+Returns nil when TIME-RANGE cannot be parsed."
+  (when (and time-range
+             (string-match "\\`\\([0-9]+\\)\\([smhdw]\\)\\'" time-range))
+    (let ((value (string-to-number (match-string 1 time-range)))
+          (unit (match-string 2 time-range)))
+      (* value
+         (pcase unit
+           ("s" 1)
+           ("m" 60)
+           ("h" 3600)
+           ("d" 86400)
+           ("w" 604800))))))
+
+(defun aws-logs--insights-time-window ()
+  "Return (START END) epoch seconds for an Insights query."
+  (let* ((seconds (or (aws-logs--parse-time-range-to-seconds aws-logs-time-range)
+                      (user-error "Unsupported --since format for Insights: %s" aws-logs-time-range)))
+         (end (floor (float-time)))
+         (start (- end seconds)))
+    (list start end)))
+
+(defun aws-logs--call-cli-json (&rest args)
+  "Run AWS CLI with ARGS and parse JSON result."
+  (with-temp-buffer
+    (let ((exit-code (apply #'call-process aws-logs-cli nil t nil args))
+          (output (string-trim (buffer-string))))
+      (unless (zerop exit-code)
+        (user-error "AWS CLI failed (%s): %s" exit-code output))
+      (condition-case _err
+          (json-parse-string output :object-type 'alist)
+        (error
+         (user-error "Failed to parse AWS CLI JSON output: %s" output))))))
+
+(defun aws-logs--wait-for-insights-results (query-id)
+  "Poll get-query-results for QUERY-ID until complete."
+  (let ((max-polls 120)
+        (poll-delay 1)
+        (poll-count 0)
+        payload
+        status)
+    (while (< poll-count max-polls)
+      (setq payload (apply #'aws-logs--call-cli-json
+                           (append (aws-logs--global-args)
+                                   (list "logs" "get-query-results"
+                                         "--query-id" query-id))))
+      (setq status (alist-get 'status payload))
+      (cond
+       ((string= status "Complete")
+        (setq poll-count max-polls))
+       ((member status '("Scheduled" "Running" "Unknown"))
+        (setq poll-count (1+ poll-count))
+        (sleep-for poll-delay))
+       (t
+        (user-error "Insights query did not complete: %s" status))))
+    (if (string= status "Complete")
+        payload
+      (user-error "Timed out waiting for Insights query results"))))
+
+(defun aws-logs--render-insights-results (buffer query-id start-time end-time payload)
+  "Render Insights query PAYLOAD into BUFFER."
+  (with-current-buffer buffer
+    (let ((inhibit-read-only t)
+          (rows (alist-get 'results payload)))
+      (erase-buffer)
+      (insert (format "Insights query id: %s\n" query-id))
+      (insert (format "Log group: %s\n" aws-logs-log-group))
+      (insert (format "Time window: %s -> %s\n\n" start-time end-time))
+      (if (or (null rows) (= (length rows) 0))
+          (insert "No results.\n")
+        (mapc (lambda (row)
+                (insert
+                 (mapconcat (lambda (cell)
+                              (format "%s=%s"
+                                      (or (alist-get 'field cell) "")
+                                      (or (alist-get 'value cell) "")))
+                            row
+                            "  "))
+                (insert "\n"))
+              rows)))
+    (goto-char (point-min))
+    (aws-logs-mode)
+    (display-buffer buffer)))
+
+(transient-define-suffix aws-logs-tail ()
+  "Start streaming logs in a dedicated buffer using current transient selections."
+  :transient nil
   (interactive)
-  (message "aws-logs selection:\n  log-group=%S\n  since=%S\n  query=%S\n  follow=%S"
-           aws-logs-log-group aws-logs-time-range aws-logs-query aws-logs-follow)
-  (message "%s" (aws-logs--command "logs tail" aws-logs-log-group
-                                   (when aws-logs-follow "--follow")
-                                   (when aws-logs-time-range (format "--since=%s" aws-logs-time-range)))))
+  (unless (and aws-logs-log-group (not (string-empty-p aws-logs-log-group)))
+    (user-error "Select a log group first"))
+  (let* ((buffer (get-buffer-create (format "*AWS logs - %s*" aws-logs-log-group)))
+         (process-name (format "aws-logs-tail:%s" aws-logs-log-group))
+         (args (append (aws-logs--global-args) (aws-logs--tail-args)))
+         (process (apply #'start-process process-name buffer aws-logs-cli args)))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer))
+      (display-buffer buffer)
+      (aws-logs-mode)
+      (set-process-filter process #'comint-output-filter))
+    (set-process-query-on-exit-flag process nil)
+    (message "Started logs tail for %s" aws-logs-log-group)))
+
+(transient-define-suffix aws-logs-insights ()
+  "Run Logs Insights query and show results in a dedicated buffer."
+  :transient nil
+  (interactive)
+  (unless (and aws-logs-log-group (not (string-empty-p aws-logs-log-group)))
+    (user-error "Select a log group first"))
+  (unless (and aws-logs-query (not (string-empty-p aws-logs-query)))
+    (user-error "Set a Logs Insights query first"))
+  (let* ((time-window (aws-logs--insights-time-window))
+         (start-time (nth 0 time-window))
+         (end-time (nth 1 time-window))
+         (start-payload (apply #'aws-logs--call-cli-json
+                               (append
+                                (aws-logs--global-args)
+                                (list "logs" "start-query"
+                                      "--log-group-name" aws-logs-log-group
+                                      "--start-time" (number-to-string start-time)
+                                      "--end-time" (number-to-string end-time)
+                                      "--query-string" aws-logs-query))))
+         (query-id (alist-get 'queryId start-payload))
+         (results (aws-logs--wait-for-insights-results query-id))
+         (buffer (get-buffer-create (format "*AWS insights - %s*" aws-logs-log-group))))
+    (aws-logs--render-insights-results buffer query-id start-time end-time results)
+    (message "Insights query completed for %s" aws-logs-log-group)))
+
+(defun aws-logs--dwim-description ()
+  "Return dynamic description for the DWIM action."
+  (let ((target (if (and aws-logs-query (not (string-empty-p aws-logs-query)))
+                    "Insights"
+                  "Tail")))
+    (concat "Run " (propertize (format "(%s)" target) 'face 'transient-active-infix))))
+
+(transient-define-suffix aws-logs-dwim ()
+  "Run tail or Logs Insights depending on whether a query is set."
+  :description #'aws-logs--dwim-description
+  :transient nil
+  (interactive)
+  (if (and aws-logs-query (not (string-empty-p aws-logs-query)))
+      (call-interactively #'aws-logs-insights)
+    (call-interactively #'aws-logs-tail)))
 
 (defvar aws-logs--transient-history nil)
 
@@ -294,8 +454,7 @@ Each entry is (NAME . QUERY)."
 (transient-define-prefix aws-logs-transient ()
   "AWS Logs transient menu.
 
-This transient currently only collects options; the Run action is a placeholder
-and is not implemented yet."
+Use the Tail action to stream logs with current selections."
   :remember-value 'exit
   [["Config"
     ("-g" aws-logs-infix-log-group)
@@ -309,15 +468,14 @@ and is not implemented yet."
       ("X" "Clear query" aws-logs-query-clear)]]
 
   [["Actions"
-    ("t" "Tail" aws-logs-print-logs)]]
+    ("RET" aws-logs-dwim)
+    ("t" "Tail" aws-logs-tail)
+    ("l" "Logs Insights" aws-logs-insights)]]
   (interactive)
   (transient-setup 'aws-logs-transient))
 
 (defun aws-logs ()
-  "Open aws-logs transient menu for selecting log group, query and time options.
-
-This currently only opens the transient UI; executing the chosen options is
-not implemented yet."
+  "Open aws-logs transient menu for selecting and running log-tail options."
   (interactive)
   (call-interactively #'aws-logs-transient))
 
