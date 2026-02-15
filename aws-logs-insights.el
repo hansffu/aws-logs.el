@@ -53,11 +53,20 @@
 (defvar-local aws-logs--insights-overlays nil
   "Fold overlays in the current Insights results buffer.")
 
+(defvar-local aws-logs--insights-entry-overlays nil
+  "Entry overlays in the current Insights results buffer.")
+
 (defvar-local aws-logs--insights-refresh-context nil
   "Refresh context plist for the current Insights results buffer.")
 
 (defvar-local aws-logs--insights-seen-rows nil
   "Hash table of row signatures already rendered in this buffer.")
+
+(defvar-local aws-logs--insights-filter-string nil
+  "Current substring filter for Insights entries, or nil.")
+
+(defvar-local aws-logs--insights-current-line-overlay nil
+  "Overlay used to highlight current entry in Insights results buffers.")
 
 (defun aws-logs--insights-global-args ()
   "Build common AWS CLI arguments from current backing fields."
@@ -158,9 +167,14 @@ Returns nil when TIME-RANGE cannot be parsed."
       (user-error "Timed out waiting for Insights query results"))))
 
 (defun aws-logs--insights-clear-overlays ()
-  "Remove all fold overlays in the current buffer."
+  "Remove all fold and entry overlays in the current buffer."
   (mapc #'delete-overlay aws-logs--insights-overlays)
-  (setq aws-logs--insights-overlays nil))
+  (mapc #'delete-overlay aws-logs--insights-entry-overlays)
+  (when aws-logs--insights-current-line-overlay
+    (delete-overlay aws-logs--insights-current-line-overlay))
+  (setq aws-logs--insights-overlays nil)
+  (setq aws-logs--insights-entry-overlays nil)
+  (setq aws-logs--insights-current-line-overlay nil))
 
 (defun aws-logs--insights-overlay-at-point ()
   "Return fold overlay at point, or nil."
@@ -188,18 +202,110 @@ Returns nil when TIME-RANGE cannot be parsed."
     (dolist (ov aws-logs--insights-overlays)
       (overlay-put ov 'invisible (not show-any)))))
 
+(defun aws-logs--insights-entry-overlay-at-point (&optional pos)
+  "Return entry overlay at POS, or nil."
+  (catch 'found
+    (dolist (ov (overlays-at (or pos (point))))
+      (when (overlay-get ov 'aws-logs-entry)
+        (throw 'found ov)))
+    nil))
+
+(defun aws-logs--insights-highlight-current-line ()
+  "Update current entry highlight overlay in Insights results buffers."
+  (when (derived-mode-p 'aws-logs-insights-results-mode)
+    (let* ((pos (point))
+           (visible-pos
+            (if (invisible-p pos)
+                (or (next-single-char-property-change pos 'invisible nil (point-max))
+                    (previous-single-char-property-change pos 'invisible nil (point-min))
+                    pos)
+              pos))
+           (entry-ov (or (aws-logs--insights-entry-overlay-at-point visible-pos)
+                         (aws-logs--insights-entry-overlay-at-point pos))))
+      (if (not entry-ov)
+          (when aws-logs--insights-current-line-overlay
+            (delete-overlay aws-logs--insights-current-line-overlay)
+            (setq aws-logs--insights-current-line-overlay nil))
+        (let* ((entry-start (overlay-start entry-ov))
+               (entry-end (overlay-end entry-ov))
+               (fold-ov (overlay-get entry-ov 'aws-logs-fold-overlay))
+               (collapsed (and fold-ov (overlay-get fold-ov 'invisible)))
+               (highlight-end (if (and collapsed fold-ov)
+                                  (overlay-start fold-ov)
+                                entry-end)))
+          (unless aws-logs--insights-current-line-overlay
+            (setq aws-logs--insights-current-line-overlay (make-overlay entry-start highlight-end nil t t))
+            (overlay-put aws-logs--insights-current-line-overlay 'face 'hl-line)
+            (overlay-put aws-logs--insights-current-line-overlay 'priority 1000))
+          (move-overlay aws-logs--insights-current-line-overlay entry-start highlight-end))))))
+
+(defun aws-logs--insights-entry-filter-text (fields)
+  "Build searchable text blob from FIELDS."
+  (downcase
+   (mapconcat (lambda (pair)
+                (format "%s %s" (car pair) (cdr pair)))
+              fields
+              "\n")))
+
+(defun aws-logs--insights-filter-match-p (entry-overlay needle)
+  "Return non-nil when ENTRY-OVERLAY matches NEEDLE."
+  (string-match-p
+   (regexp-quote needle)
+   (or (overlay-get entry-overlay 'aws-logs-filter-text) "")))
+
+(defun aws-logs--insights-apply-filter ()
+  "Apply active filter to entry overlays in current buffer."
+  (let* ((needle (and aws-logs--insights-filter-string
+                      (string-trim aws-logs--insights-filter-string)))
+         (normalized (and needle (downcase needle))))
+    (dolist (entry-overlay aws-logs--insights-entry-overlays)
+      (overlay-put entry-overlay 'invisible
+                   (if (and normalized
+                            (not (string-empty-p normalized))
+                            (not (aws-logs--insights-filter-match-p entry-overlay normalized)))
+                       'aws-logs-insights-filter
+                     nil)))))
+
+(defun aws-logs-insights-narrow ()
+  "Hide entries whose fields do not contain a minibuffer substring."
+  (interactive)
+  (let ((needle (string-trim
+                 (read-string "Narrow Insights to string: "
+                              (or aws-logs--insights-filter-string "")))))
+    (when (string-empty-p needle)
+      (user-error "Narrow string cannot be empty"))
+    (setq aws-logs--insights-filter-string needle)
+    (aws-logs--insights-apply-filter)
+    (let ((visible 0))
+      (dolist (entry-overlay aws-logs--insights-entry-overlays)
+        (unless (overlay-get entry-overlay 'invisible)
+          (setq visible (1+ visible))))
+      (message "Insights narrowed to \"%s\" (%d visible row(s))" needle visible))))
+
+(defun aws-logs-insights-widen ()
+  "Clear Insights entry filter and show all rows."
+  (interactive)
+  (setq aws-logs--insights-filter-string nil)
+  (aws-logs--insights-apply-filter)
+  (message "Insights narrowing cleared"))
+
 (defvar-keymap aws-logs-insights-results-mode-map
   :doc "Keymap for Insights results buffers."
   "TAB" #'aws-logs-insights-toggle-entry
   "<tab>" #'aws-logs-insights-toggle-entry
   "<backtab>" #'aws-logs-insights-toggle-all
-  "C-c C-r" #'aws-logs-insights-refresh)
+  "C-c C-r" #'aws-logs-insights-refresh
+  "C-c C-n" #'aws-logs-insights-narrow
+  "C-c C-w" #'aws-logs-insights-widen)
 
 (define-derived-mode aws-logs-insights-results-mode special-mode "AWS-Insights"
   "Major mode for formatted AWS Logs Insights query results."
   :group 'aws-logs
   (setq-local truncate-lines t)
-  (setq-local buffer-invisibility-spec '(t)))
+  (setq-local line-move-ignore-invisible t)
+  (setq-local buffer-invisibility-spec '(t))
+  (add-to-invisibility-spec 'aws-logs-insights-filter)
+  (add-hook 'post-command-hook #'aws-logs--insights-highlight-current-line nil t))
 
 (defconst aws-logs--insights-timestamp-candidates
   '("@timestamp" "timestamp" "time" "ts"
@@ -373,8 +479,9 @@ Returns nil when TIME-RANGE cannot be parsed."
   "Insert one foldable results entry for ROW."
   (let* ((fields (aws-logs--insights-row-fields row))
          (sources (aws-logs--insights-json-sources fields))
+         (filter-text (aws-logs--insights-entry-filter-text fields))
          (summary-start (point))
-         details-start details-end ov)
+         details-start details-end fold-ov entry-ov)
     (insert (aws-logs--insights-summary fields sources) "\n")
     (setq details-start (point))
     (dolist (pair fields)
@@ -383,11 +490,16 @@ Returns nil when TIME-RANGE cannot be parsed."
       (insert ": " (cdr pair) "\n"))
     (insert "\n")
     (setq details-end (point))
-    (setq ov (make-overlay details-start details-end))
-    (overlay-put ov 'aws-logs-fold t)
-    (overlay-put ov 'invisible t)
-    (push ov aws-logs--insights-overlays)
-    (put-text-property summary-start (1- details-start) 'aws-logs-details-overlay ov)))
+    (setq fold-ov (make-overlay details-start details-end))
+    (overlay-put fold-ov 'aws-logs-fold t)
+    (overlay-put fold-ov 'invisible t)
+    (push fold-ov aws-logs--insights-overlays)
+    (setq entry-ov (make-overlay summary-start details-end))
+    (overlay-put entry-ov 'aws-logs-entry t)
+    (overlay-put entry-ov 'aws-logs-fold-overlay fold-ov)
+    (overlay-put entry-ov 'aws-logs-filter-text filter-text)
+    (push entry-ov aws-logs--insights-entry-overlays)
+    (put-text-property summary-start (1- details-start) 'aws-logs-details-overlay fold-ov)))
 
 (defun aws-logs--insights-row-signature (row)
   "Return a stable signature string for ROW."
@@ -448,7 +560,8 @@ Returns `asc` or `desc`. Defaults to `asc` when it cannot be inferred."
     (save-excursion
       (goto-char (aws-logs--insights-header-end-position))
       (mapc #'aws-logs--insights-insert-entry
-            (aws-logs--insights-sort-latest-first rows)))))
+            (aws-logs--insights-sort-latest-first rows))))
+  (aws-logs--insights-apply-filter))
 
 (defun aws-logs--insights-run-query-window (start-time end-time)
   "Run Insights query for START-TIME..END-TIME and return (QUERY-ID . PAYLOAD)."
@@ -467,23 +580,27 @@ Returns `asc` or `desc`. Defaults to `asc` when it cannot be inferred."
 (defun aws-logs--render-insights-results (buffer query-id start-time end-time payload refresh-context)
   "Render Insights query PAYLOAD into BUFFER."
   (with-current-buffer buffer
-    (let ((inhibit-read-only t)
+    (let ((active-filter aws-logs--insights-filter-string)
+          (inhibit-read-only t)
           (rows (aws-logs--insights-sort-latest-first
                  (append (alist-get 'results payload) nil))))
       (aws-logs-insights-results-mode)
+      (setq aws-logs--insights-filter-string active-filter)
       (aws-logs--insights-clear-overlays)
       (setq aws-logs--insights-seen-rows (make-hash-table :test 'equal))
       (erase-buffer)
       (insert (format "Insights query id: %s\n" query-id))
       (insert (format "Log group: %s\n" aws-logs-log-group))
       (insert (format "Time window: %s -> %s\n" start-time end-time))
-      (insert "TAB: toggle entry  S-TAB: toggle all  C-c C-r: refresh  q: quit\n\n")
+      (insert "TAB: toggle entry  S-TAB: toggle all  C-c C-r: refresh  C-c C-n: narrow  C-c C-w: widen  q: quit\n\n")
       (if (or (null rows) (= (length rows) 0))
           (insert "No results.\n")
         (mapc #'aws-logs--insights-insert-entry rows))
       (aws-logs--insights-mark-seen-rows rows)
-      (setq aws-logs--insights-refresh-context (copy-sequence refresh-context)))
+      (setq aws-logs--insights-refresh-context (copy-sequence refresh-context))
+      (aws-logs--insights-apply-filter))
     (goto-char (point-min))
+    (aws-logs--insights-highlight-current-line)
     (display-buffer buffer)))
 
 (defun aws-logs-insights-refresh ()
