@@ -97,6 +97,14 @@ message, for example: [service] [class]."
   "Default time range used to initialize `aws-logs-time-range`."
   :type 'string
   :group 'aws-logs)
+
+(defcustom aws-logs-default-custom-time-range nil
+  "Default explicit from/to range used to initialize `aws-logs-custom-time-range`.
+
+Value is nil or a cons cell (FROM . TO), where each value is a date-time
+string parseable by Emacs `date-to-time`."
+  :type '(choice (const :tag "None" nil) (cons :tag "From/To" string string))
+  :group 'aws-logs)
 (defcustom aws-logs-mode-hook '()
   "Hook for customizing aws-logs-mode."
   :type 'hook
@@ -139,6 +147,11 @@ Prefer `aws-logs-default-log-group`."
 (defvar aws-logs-time-range aws-logs-default-since
   "Selected time range (e.g. 10m) for this Emacs session. Used as --since for `aws logs tail`.")
 
+(defvar aws-logs-custom-time-range aws-logs-default-custom-time-range
+  "Selected explicit from/to range for this Emacs session.
+
+Value is nil or (FROM . TO), where both are date-time strings.")
+
 (defvar aws-logs-presets nil
   "Alist of named aws-logs presets.
 
@@ -153,6 +166,8 @@ a property list as accepted by `aws-logs-make-preset`.")
 
 (declare-function aws-logs--insights-query-edit "aws-logs-query" (initial))
 (declare-function aws-logs-insights-query-mode "aws-logs-query")
+(declare-function org-read-date "org"
+                  (&optional with-time to-time from-string prompt default-time default-input))
 (defvar aws-logs-mode-map
   (let ((map (make-keymap)))
     (define-key map "q" #'aws-logs-quit-process-and-window)
@@ -290,6 +305,7 @@ Each entry is (NAME . QUERY)."
 
 (defconst aws-logs--preset-keys
   '(:log-group :since :follow :profile :query
+    :custom-time-range
     :summary-timestamp-field :summary-level-field :summary-message-field
     :summary-extra-fields)
   "Allowed keys for aws-logs presets.")
@@ -316,6 +332,7 @@ with any subset of these keys:
 
 - `:log-group` string or nil
 - `:since` string or nil
+- `:custom-time-range` cons cell (FROM . TO) or nil
 - `:follow` boolean or nil
 - `:profile` string or nil
 - `:query` string or nil
@@ -344,6 +361,7 @@ If a preset with NAME already exists, it is replaced."
   "Apply preset PLIST to current session backing fields."
   (dolist (entry '((:log-group . aws-logs-log-group)
                    (:since . aws-logs-time-range)
+                   (:custom-time-range . aws-logs-custom-time-range)
                    (:follow . aws-logs-follow)
                    (:profile . aws-logs-profile)
                    (:query . aws-logs-query)
@@ -354,7 +372,14 @@ If a preset with NAME already exists, it is replaced."
     (let ((key (car entry))
           (var (cdr entry)))
       (when (plist-member plist key)
-        (set var (plist-get plist key))))))
+        (set var (plist-get plist key)))))
+  ;; Keep relative and explicit ranges mutually exclusive.
+  (when (and (plist-member plist :since)
+             (plist-get plist :since))
+    (setq aws-logs-custom-time-range nil))
+  (when (and (plist-member plist :custom-time-range)
+             (plist-get plist :custom-time-range))
+    (setq aws-logs-time-range nil)))
 
 (transient-define-suffix aws-logs-apply-preset ()
   "Select and apply a preset from `aws-logs-presets`."
@@ -397,8 +422,44 @@ If a preset with NAME already exists, it is replaced."
   :reader (lambda (prompt initial hist)
             (let ((val (read-string prompt initial hist)))
               (setq aws-logs-time-range val)
+              (setq aws-logs-custom-time-range nil)
+              (aws-logs--transient-reprompt)
               val))
   :argument "--since=")
+
+(defun aws-logs--custom-time-range-to-string ()
+  "Return `aws-logs-custom-time-range` as \"FROM - TO\", or nil."
+  (when aws-logs-custom-time-range
+    (format "%s - %s" (car aws-logs-custom-time-range) (cdr aws-logs-custom-time-range))))
+
+(defun aws-logs--select-custom-time-range ()
+  "Interactively select from/to using Org timestamp prompts.
+
+Returns a cons cell (FROM . TO), where both values are ISO-like strings."
+  (require 'org)
+  (let* ((initial-from (when aws-logs-custom-time-range
+                         (ignore-errors (date-to-time (car aws-logs-custom-time-range)))))
+         (initial-to (when aws-logs-custom-time-range
+                       (ignore-errors (date-to-time (cdr aws-logs-custom-time-range)))))
+         (from-time (org-read-date nil t nil "From: " initial-from))
+         (to-time (org-read-date nil t nil "To: " (or initial-to from-time))))
+    (when (time-less-p to-time from-time)
+      (user-error "To must be after From"))
+    (cons (format-time-string "%Y-%m-%dT%H:%M:%S%z" from-time)
+          (format-time-string "%Y-%m-%dT%H:%M:%S%z" to-time))))
+
+(transient-define-infix aws-logs-infix-custom-time-range ()
+  :description "Time Range"
+  :class 'transient-option
+  :allow-empty t
+  :init-value (lambda (obj)
+                (transient-infix-set obj (aws-logs--custom-time-range-to-string)))
+  :reader (lambda (_prompt _initial _hist)
+            (setq aws-logs-custom-time-range (aws-logs--select-custom-time-range))
+            (setq aws-logs-time-range nil)
+            (aws-logs--transient-reprompt)
+            (aws-logs--custom-time-range-to-string))
+  :argument "--time-range=")
 
 (transient-define-infix aws-logs-infix-summary-timestamp-field ()
   :description "Timestamp field"
@@ -517,8 +578,12 @@ If a preset with NAME already exists, it is replaced."
          "--format" aws-logs-format)
    (when aws-logs-follow
      (list "--follow"))
-   (when (and aws-logs-time-range (not (string-empty-p aws-logs-time-range)))
-     (list "--since" aws-logs-time-range))))
+   (cond
+    ((and aws-logs-custom-time-range (car aws-logs-custom-time-range))
+     ;; `aws logs tail` does not support end-time; use custom FROM as --since.
+     (list "--since" (car aws-logs-custom-time-range)))
+    ((and aws-logs-time-range (not (string-empty-p aws-logs-time-range)))
+     (list "--since" aws-logs-time-range)))))
 
 (defun aws-logs--global-args ()
   "Build common AWS CLI arguments from current backing fields."
@@ -582,6 +647,7 @@ Use the Tail action to stream logs with current selections."
   [["Config"
     ("-g" aws-logs-infix-log-group)
     ("-s" "Since" aws-logs-infix-since)
+    ("-t" "Time Range" aws-logs-infix-custom-time-range)
     ("-f" "Follow (tail)" aws-logs-infix-follow)
     ("-p" "Profile" aws-logs-infix-profile)]
 

@@ -18,6 +18,7 @@
 (defvar aws-logs-log-group)
 (defvar aws-logs-query)
 (defvar aws-logs-time-range)
+(defvar aws-logs-custom-time-range)
 (defvar aws-logs-summary-timestamp-field)
 (defvar aws-logs-summary-level-field)
 (defvar aws-logs-summary-message-field)
@@ -77,11 +78,23 @@ Returns nil when TIME-RANGE cannot be parsed."
 
 (defun aws-logs--insights-time-window ()
   "Return (START END) epoch seconds for an Insights query."
-  (let* ((seconds (or (aws-logs--insights-parse-time-range-to-seconds aws-logs-time-range)
-                      (user-error "Unsupported --since format for Insights: %s" aws-logs-time-range)))
-         (end (floor (float-time)))
-         (start (- end seconds)))
-    (list start end)))
+  (if aws-logs-custom-time-range
+      (let* ((from-time (or (ignore-errors (date-to-time (car aws-logs-custom-time-range)))
+                            (user-error "Invalid custom from-time: %s"
+                                        (car aws-logs-custom-time-range))))
+             (to-time (or (ignore-errors (date-to-time (cdr aws-logs-custom-time-range)))
+                          (user-error "Invalid custom to-time: %s"
+                                      (cdr aws-logs-custom-time-range))))
+             (start (floor (float-time from-time)))
+             (end (floor (float-time to-time))))
+        (when (>= start end)
+          (user-error "Custom from/to range must have From before To"))
+        (list start end))
+    (let* ((seconds (or (aws-logs--insights-parse-time-range-to-seconds aws-logs-time-range)
+                        (user-error "Unsupported --since format for Insights: %s" aws-logs-time-range)))
+           (end (floor (float-time)))
+           (start (- end seconds)))
+      (list start end))))
 
 (defun aws-logs--insights-call-cli-json (&rest args)
   "Run AWS CLI with ARGS and parse JSON result."
