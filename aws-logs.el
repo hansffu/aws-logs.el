@@ -139,6 +139,12 @@ Prefer `aws-logs-default-log-group`."
 (defvar aws-logs-time-range aws-logs-default-since
   "Selected time range (e.g. 10m) for this Emacs session. Used as --since for `aws logs tail`.")
 
+(defvar aws-logs-presets nil
+  "Alist of named aws-logs presets.
+
+Each element has the form (NAME . PLIST), where NAME is a string and PLIST is
+a property list as accepted by `aws-logs-make-preset`.")
+
 (defun aws-logs--transient-reprompt ()
   "Refresh transient so UI reflects current backing fields." 
   (transient-quit-one)
@@ -264,22 +270,103 @@ Prefer `aws-logs-default-log-group`."
   (setq aws-logs-query nil)
   (aws-logs--transient-reprompt))
 
-(defcustom aws-logs-insights-query-presets nil
-  "Alist of named Logs Insights query presets.
+(defcustom aws-logs-insights-saved-queries nil
+  "Alist of named saved Logs Insights queries.
 
 Each entry is (NAME . QUERY)."
   :type '(alist :key-type string :value-type string)
   :group 'aws-logs)
 
-(transient-define-suffix aws-logs-query-preset ()
-  "Select a preset Logs Insights query and store it in the backing field."
+(transient-define-suffix aws-logs-query-apply-saved ()
+  "Select a saved Logs Insights query and store it in the backing field."
   :transient t
   (interactive)
-  (unless aws-logs-insights-query-presets
-    (user-error "No presets configured in `aws-logs-insights-query-presets`"))
-  (let* ((name (completing-read "Preset: " (mapcar #'car aws-logs-insights-query-presets) nil t))
-         (query (cdr (assoc name aws-logs-insights-query-presets))))
+  (unless aws-logs-insights-saved-queries
+    (user-error "No saved queries configured in `aws-logs-insights-saved-queries`"))
+  (let* ((name (completing-read "Saved query: " (mapcar #'car aws-logs-insights-saved-queries) nil t))
+         (query (cdr (assoc name aws-logs-insights-saved-queries))))
     (setq aws-logs-query query)
+    (aws-logs--transient-reprompt)))
+
+(defconst aws-logs--preset-keys
+  '(:log-group :since :follow :profile :query
+    :summary-timestamp-field :summary-level-field :summary-message-field
+    :summary-extra-fields)
+  "Allowed keys for aws-logs presets.")
+
+(defun aws-logs--preset-plist-valid-p (plist)
+  "Return non-nil if PLIST is valid for `aws-logs-make-preset`.
+
+Signals a `user-error` when an unsupported key is present."
+  (let ((cursor plist))
+    (while cursor
+      (let ((key (car cursor)))
+        (unless (keywordp key)
+          (user-error "Preset key must be a keyword, got: %S" key))
+        (unless (memq key aws-logs--preset-keys)
+          (user-error "Unsupported preset key: %S" key)))
+      (setq cursor (cddr cursor))))
+  t)
+
+(defun aws-logs-make-preset (name &rest options)
+  "Create or replace a named aws-logs preset NAME.
+
+NAME is a string (or symbol, which is converted to string). OPTIONS is a plist
+with any subset of these keys:
+
+- `:log-group` string or nil
+- `:since` string or nil
+- `:follow` boolean or nil
+- `:profile` string or nil
+- `:query` string or nil
+- `:summary-timestamp-field` string or nil
+- `:summary-level-field` string or nil
+- `:summary-message-field` string or nil
+- `:summary-extra-fields` list of strings or nil
+
+Preset apply semantics:
+- Missing key: leave current session value unchanged
+- Key present with nil: unset/clear session value
+- Key present with non-nil: set session value
+
+If a preset with NAME already exists, it is replaced."
+  (let ((preset-name (if (symbolp name) (symbol-name name) name)))
+    (unless (stringp preset-name)
+      (user-error "Preset name must be a string or symbol, got: %S" name))
+    (unless (zerop (% (length options) 2))
+      (user-error "Preset options must be key/value pairs"))
+    (aws-logs--preset-plist-valid-p options)
+    (setq aws-logs-presets (assoc-delete-all preset-name aws-logs-presets))
+    (push (cons preset-name options) aws-logs-presets)
+    (car aws-logs-presets)))
+
+(defun aws-logs--apply-preset-plist (plist)
+  "Apply preset PLIST to current session backing fields."
+  (dolist (entry '((:log-group . aws-logs-log-group)
+                   (:since . aws-logs-time-range)
+                   (:follow . aws-logs-follow)
+                   (:profile . aws-logs-profile)
+                   (:query . aws-logs-query)
+                   (:summary-timestamp-field . aws-logs-summary-timestamp-field)
+                   (:summary-level-field . aws-logs-summary-level-field)
+                   (:summary-message-field . aws-logs-summary-message-field)
+                   (:summary-extra-fields . aws-logs-summary-extra-fields)))
+    (let ((key (car entry))
+          (var (cdr entry)))
+      (when (plist-member plist key)
+        (set var (plist-get plist key))))))
+
+(transient-define-suffix aws-logs-apply-preset ()
+  "Select and apply a preset from `aws-logs-presets`."
+  :transient t
+  (interactive)
+  (unless aws-logs-presets
+    (user-error "No presets configured; use `aws-logs-make-preset`"))
+  (let* ((name (completing-read "Preset: " (mapcar #'car aws-logs-presets) nil t))
+         (preset (assoc name aws-logs-presets)))
+    (unless preset
+      (user-error "Preset not found: %s" name))
+    (aws-logs--apply-preset-plist (cdr preset))
     (aws-logs--transient-reprompt)))
 
 (transient-define-infix aws-logs-infix-follow ()
@@ -491,6 +578,7 @@ Each entry is (NAME . QUERY)."
 
 Use the Tail action to stream logs with current selections."
   :remember-value 'exit
+  [[("@" "Apply preset…" aws-logs-apply-preset)]]
   [["Config"
     ("-g" aws-logs-infix-log-group)
     ("-s" "Since" aws-logs-infix-since)
@@ -499,7 +587,7 @@ Use the Tail action to stream logs with current selections."
 
    [4 :description (lambda () (format "Query: %s" (aws-logs--query)))
       ("-q" "Edit query…" aws-logs-query-edit)
-      ("Q" "Preset…" aws-logs-query-preset)
+      ("Q" "Apply saved query…" aws-logs-query-apply-saved)
       ("X" "Clear query" aws-logs-query-clear)
       ("f" "Formatting…" aws-logs-open-formatting)]]
 
