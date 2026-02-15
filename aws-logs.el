@@ -362,29 +362,241 @@ Returns nil when TIME-RANGE cannot be parsed."
         payload
       (user-error "Timed out waiting for Insights query results"))))
 
+(defface aws-logs-insights-timestamp-face
+  '((t :inherit shadow))
+  "Face for Insights timestamp summaries."
+  :group 'aws-logs)
+
+(defface aws-logs-insights-level-face
+  '((t :inherit font-lock-constant-face))
+  "Face for Insights level summaries."
+  :group 'aws-logs)
+
+(defface aws-logs-insights-message-face
+  '((t :inherit default))
+  "Face for Insights message summaries."
+  :group 'aws-logs)
+
+(defvar-local aws-logs--insights-overlays nil
+  "Fold overlays in the current Insights results buffer.")
+
+(defun aws-logs--insights-clear-overlays ()
+  "Remove all fold overlays in the current buffer."
+  (mapc #'delete-overlay aws-logs--insights-overlays)
+  (setq aws-logs--insights-overlays nil))
+
+(defun aws-logs--insights-overlay-at-point ()
+  "Return fold overlay at point, or nil."
+  (or (get-text-property (point) 'aws-logs-details-overlay)
+      (get-text-property (line-beginning-position) 'aws-logs-details-overlay)
+      (catch 'found
+        (dolist (ov (overlays-at (point)))
+          (when (overlay-get ov 'aws-logs-fold)
+            (throw 'found ov)))
+        nil)))
+
+(defun aws-logs-insights-toggle-entry ()
+  "Toggle fold state for current Insights result entry."
+  (interactive)
+  (when-let ((ov (aws-logs--insights-overlay-at-point)))
+    (overlay-put ov 'invisible (not (overlay-get ov 'invisible)))))
+
+(defun aws-logs-insights-toggle-all ()
+  "Toggle fold state for all Insights result entries."
+  (interactive)
+  (let ((show-any nil))
+    (dolist (ov aws-logs--insights-overlays)
+      (when (overlay-get ov 'invisible)
+        (setq show-any t)))
+    (dolist (ov aws-logs--insights-overlays)
+      (overlay-put ov 'invisible (not show-any)))))
+
+(defvar-keymap aws-logs-insights-results-mode-map
+  :doc "Keymap for Insights results buffers."
+  "TAB" #'aws-logs-insights-toggle-entry
+  "<tab>" #'aws-logs-insights-toggle-entry
+  "<backtab>" #'aws-logs-insights-toggle-all)
+
+(define-derived-mode aws-logs-insights-results-mode special-mode "AWS-Insights"
+  "Major mode for formatted AWS Logs Insights query results."
+  :group 'aws-logs
+  (setq-local truncate-lines t)
+  (setq-local buffer-invisibility-spec '(t)))
+
+(defconst aws-logs--insights-timestamp-candidates
+  '("@timestamp" "timestamp" "time" "ts"
+    "message.@timestamp" "message.timestamp" "message.time" "message.ts")
+  "Field/path candidates for summary timestamp.")
+
+(defconst aws-logs--insights-level-candidates
+  '("level" "severity" "logLevel" "lvl"
+    "message.level" "message.log.level" "message.severity" "log.level")
+  "Field/path candidates for summary level.")
+
+(defconst aws-logs--insights-message-candidates
+  '("@message" "message" "msg"
+    "message.message" "log.message")
+  "Field/path candidates for summary message.")
+
+(defun aws-logs--insights-value->string (value)
+  "Convert VALUE into a display string."
+  (cond
+   ((stringp value) value)
+   ((numberp value) (number-to-string value))
+   ((eq value t) "true")
+   ((eq value :false) "false")
+   ((null value) nil)
+   (t (format "%s" value))))
+
+(defun aws-logs--insights-parse-json-maybe (value)
+  "Parse VALUE as JSON object/list when possible."
+  (when (and (stringp value)
+             (string-match-p "\\`[[:space:]\n\r\t]*[{\\[]" value))
+    (condition-case nil
+        (json-parse-string value :object-type 'alist :array-type 'list
+                           :null-object nil :false-object :false)
+      (error nil))))
+
+(defun aws-logs--insights-get-child (node key)
+  "Return child KEY from NODE."
+  (cond
+   ((hash-table-p node)
+    (or (gethash key node)
+        (gethash (intern-soft key) node)))
+   ((listp node)
+    (or (alist-get key node nil nil #'equal)
+        (when-let ((sym (intern-soft key)))
+          (alist-get sym node))))
+   (t nil)))
+
+(defun aws-logs--insights-get-path (node path)
+  "Return value at PATH in NODE, where PATH is dot-separated."
+  (let ((parts (split-string path "\\."))
+        (current node)
+        (failed nil))
+    (while (and parts (not failed))
+      (setq current (aws-logs--insights-get-child current (car parts)))
+      (unless current
+        (setq failed t))
+      (setq parts (cdr parts)))
+    (unless failed
+      current)))
+
+(defun aws-logs--insights-row-fields (row)
+  "Return alist of string field/value pairs from ROW."
+  (let (fields)
+    (mapc (lambda (cell)
+            (let ((name (aws-logs--insights-value->string (alist-get 'field cell)))
+                  (value (aws-logs--insights-value->string (alist-get 'value cell))))
+              (when name
+                (push (cons name (or value "")) fields))))
+          row)
+    (nreverse fields)))
+
+(defun aws-logs--insights-json-sources (fields)
+  "Build an alist of parsed JSON roots from FIELDS."
+  (let (sources)
+    (dolist (pair fields)
+      (when-let ((json (aws-logs--insights-parse-json-maybe (cdr pair))))
+        (push (cons (car pair) json) sources)))
+    sources))
+
+(defun aws-logs--insights-resolve (fields sources candidate)
+  "Resolve CANDIDATE from FIELDS and parsed JSON SOURCES."
+  (or (cdr (assoc candidate fields))
+      (let* ((parts (split-string candidate "\\."))
+             (root (car parts))
+             (rest (string-join (cdr parts) ".")))
+        (or
+         (when-let ((root-json (cdr (assoc root sources))))
+           (if (string-empty-p rest)
+               (aws-logs--insights-value->string root-json)
+             (aws-logs--insights-value->string
+              (aws-logs--insights-get-path root-json rest))))
+         (when (= (length parts) 1)
+           (catch 'found
+             (dolist (source sources)
+               (when-let ((val (aws-logs--insights-get-path (cdr source) candidate)))
+                 (throw 'found (aws-logs--insights-value->string val))))
+             nil))))))
+
+(defun aws-logs--insights-first-match (fields sources candidates)
+  "Return first non-empty match from CANDIDATES."
+  (catch 'found
+    (dolist (candidate candidates)
+      (when-let ((value (aws-logs--insights-resolve fields sources candidate)))
+        (unless (string-empty-p value)
+          (throw 'found value))))
+    nil))
+
+(defun aws-logs--insights-level-face (level)
+  "Return face symbol suitable for LEVEL."
+  (let ((normalized (downcase (or level ""))))
+    (cond
+     ((string-match-p "\\`\\(error\\|fatal\\|crit\\|panic\\)" normalized) 'error)
+     ((string-match-p "\\`\\(warn\\|warning\\)" normalized) 'warning)
+     ((string-match-p "\\`\\(debug\\|trace\\)" normalized) 'font-lock-doc-face)
+     (t 'aws-logs-insights-level-face))))
+
+(defun aws-logs--insights-truncate (value limit)
+  "Truncate VALUE to LIMIT characters."
+  (if (> (length value) limit)
+      (concat (substring value 0 (- limit 1)) "…")
+    value))
+
+(defun aws-logs--insights-summary (fields sources)
+  "Build formatted summary line from FIELDS and JSON SOURCES."
+  (let* ((timestamp (or (aws-logs--insights-first-match
+                         fields sources aws-logs--insights-timestamp-candidates)
+                        "-"))
+         (level (or (aws-logs--insights-first-match
+                     fields sources aws-logs--insights-level-candidates)
+                    "-"))
+         (message (or (aws-logs--insights-first-match
+                       fields sources aws-logs--insights-message-candidates)
+                      (cdr (car fields))
+                      "-")))
+    (concat
+     (propertize timestamp 'face 'aws-logs-insights-timestamp-face)
+     " "
+     (propertize (upcase level) 'face (aws-logs--insights-level-face level))
+     " "
+     (propertize (aws-logs--insights-truncate message 240) 'face 'aws-logs-insights-message-face))))
+
+(defun aws-logs--insights-insert-entry (row)
+  "Insert one foldable results entry for ROW."
+  (let* ((fields (aws-logs--insights-row-fields row))
+         (sources (aws-logs--insights-json-sources fields))
+         (summary-start (point))
+         details-start details-end ov)
+    (insert (aws-logs--insights-summary fields sources) "\n")
+    (setq details-start (point))
+    (dolist (pair fields)
+      (insert "  " (car pair) ": " (cdr pair) "\n"))
+    (insert "\n")
+    (setq details-end (point))
+    (setq ov (make-overlay details-start details-end))
+    (overlay-put ov 'aws-logs-fold t)
+    (overlay-put ov 'invisible t)
+    (push ov aws-logs--insights-overlays)
+    (put-text-property summary-start (1- details-start) 'aws-logs-details-overlay ov)))
+
 (defun aws-logs--render-insights-results (buffer query-id start-time end-time payload)
   "Render Insights query PAYLOAD into BUFFER."
   (with-current-buffer buffer
     (let ((inhibit-read-only t)
           (rows (alist-get 'results payload)))
+      (aws-logs-insights-results-mode)
+      (aws-logs--insights-clear-overlays)
       (erase-buffer)
       (insert (format "Insights query id: %s\n" query-id))
       (insert (format "Log group: %s\n" aws-logs-log-group))
-      (insert (format "Time window: %s -> %s\n\n" start-time end-time))
+      (insert (format "Time window: %s -> %s\n" start-time end-time))
+      (insert "TAB: toggle entry  S-TAB: toggle all  q: quit\n\n")
       (if (or (null rows) (= (length rows) 0))
           (insert "No results.\n")
-        (mapc (lambda (row)
-                (insert
-                 (mapconcat (lambda (cell)
-                              (format "%s=%s"
-                                      (or (alist-get 'field cell) "")
-                                      (or (alist-get 'value cell) "")))
-                            row
-                            "  "))
-                (insert "\n"))
-              rows)))
+        (mapc #'aws-logs--insights-insert-entry rows)))
     (goto-char (point-min))
-    (aws-logs-mode)
     (display-buffer buffer)))
 
 (transient-define-suffix aws-logs-tail ()
