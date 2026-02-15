@@ -10,6 +10,7 @@
 
 (require 'json)
 (require 'subr-x)
+(require 'cl-lib)
 
 (defvar aws-logs-cli)
 (defvar aws-logs-endpoint)
@@ -51,6 +52,12 @@
 
 (defvar-local aws-logs--insights-overlays nil
   "Fold overlays in the current Insights results buffer.")
+
+(defvar-local aws-logs--insights-refresh-context nil
+  "Refresh context plist for the current Insights results buffer.")
+
+(defvar-local aws-logs--insights-seen-rows nil
+  "Hash table of row signatures already rendered in this buffer.")
 
 (defun aws-logs--insights-global-args ()
   "Build common AWS CLI arguments from current backing fields."
@@ -95,6 +102,23 @@ Returns nil when TIME-RANGE cannot be parsed."
            (end (floor (float-time)))
            (start (- end seconds)))
       (list start end))))
+
+(defun aws-logs--insights-window-context ()
+  "Return refresh context plist for current run."
+  (if aws-logs-custom-time-range
+      (let* ((time-window (aws-logs--insights-time-window))
+             (start (nth 0 time-window))
+             (end (nth 1 time-window)))
+        (list :mode 'custom-range
+              :start start
+              :end end))
+    (let* ((time-window (aws-logs--insights-time-window))
+           (start (nth 0 time-window))
+           (end (nth 1 time-window)))
+      (list :mode 'since
+            :start start
+            :end end
+            :last-end end))))
 
 (defun aws-logs--insights-call-cli-json (&rest args)
   "Run AWS CLI with ARGS and parse JSON result."
@@ -168,7 +192,8 @@ Returns nil when TIME-RANGE cannot be parsed."
   :doc "Keymap for Insights results buffers."
   "TAB" #'aws-logs-insights-toggle-entry
   "<tab>" #'aws-logs-insights-toggle-entry
-  "<backtab>" #'aws-logs-insights-toggle-all)
+  "<backtab>" #'aws-logs-insights-toggle-all
+  "C-c C-r" #'aws-logs-insights-refresh)
 
 (define-derived-mode aws-logs-insights-results-mode special-mode "AWS-Insights"
   "Major mode for formatted AWS Logs Insights query results."
@@ -364,34 +389,70 @@ Returns nil when TIME-RANGE cannot be parsed."
     (push ov aws-logs--insights-overlays)
     (put-text-property summary-start (1- details-start) 'aws-logs-details-overlay ov)))
 
-(defun aws-logs--render-insights-results (buffer query-id start-time end-time payload)
-  "Render Insights query PAYLOAD into BUFFER."
-  (with-current-buffer buffer
-    (let ((inhibit-read-only t)
-          (rows (alist-get 'results payload)))
-      (aws-logs-insights-results-mode)
-      (aws-logs--insights-clear-overlays)
-      (erase-buffer)
-      (insert (format "Insights query id: %s\n" query-id))
-      (insert (format "Log group: %s\n" aws-logs-log-group))
-      (insert (format "Time window: %s -> %s\n" start-time end-time))
-      (insert "TAB: toggle entry  S-TAB: toggle all  q: quit\n\n")
-      (if (or (null rows) (= (length rows) 0))
-          (insert "No results.\n")
-        (mapc #'aws-logs--insights-insert-entry rows)))
-    (goto-char (point-min))
-    (display-buffer buffer)))
+(defun aws-logs--insights-row-signature (row)
+  "Return a stable signature string for ROW."
+  (prin1-to-string row))
 
-(defun aws-logs-insights-run ()
-  "Run Logs Insights query and display formatted results."
-  (unless (and aws-logs-log-group (not (string-empty-p aws-logs-log-group)))
-    (user-error "Select a log group first"))
-  (unless (and aws-logs-query (not (string-empty-p aws-logs-query)))
-    (user-error "Set a Logs Insights query first"))
-  (let* ((time-window (aws-logs--insights-time-window))
-         (start-time (nth 0 time-window))
-         (end-time (nth 1 time-window))
-         (start-payload (apply #'aws-logs--insights-call-cli-json
+(defun aws-logs--insights-mark-seen-rows (rows)
+  "Mark ROWS as seen in `aws-logs--insights-seen-rows`."
+  (mapc (lambda (row)
+          (puthash (aws-logs--insights-row-signature row) t aws-logs--insights-seen-rows))
+        rows))
+
+(defun aws-logs--insights-unseen-rows (rows)
+  "Return subset of ROWS not previously seen."
+  (append (seq-filter (lambda (row)
+                        (not (gethash (aws-logs--insights-row-signature row) aws-logs--insights-seen-rows)))
+                      rows)
+          nil))
+
+(defun aws-logs--insights-row-epoch (row)
+  "Return epoch seconds for ROW timestamp, or nil."
+  (let* ((fields (aws-logs--insights-row-fields row))
+         (sources (aws-logs--insights-json-sources fields))
+         (ts (aws-logs--insights-first-match fields sources aws-logs--insights-timestamp-candidates)))
+    (when ts
+      (let ((parsed (ignore-errors (date-to-time ts))))
+        (when parsed
+          (floor (float-time parsed)))))))
+
+(defun aws-logs--insights-detect-order (rows)
+  "Detect display order from ROWS by timestamp.
+
+Returns `asc` or `desc`. Defaults to `asc` when it cannot be inferred."
+  (let* ((timestamps (delq nil (mapcar #'aws-logs--insights-row-epoch (append rows nil))))
+         (first (nth 0 timestamps))
+         (second (nth 1 timestamps)))
+    (if (and first second (> first second))
+        'desc
+      'asc)))
+
+(defun aws-logs--insights-sort-latest-first (rows)
+  "Return ROWS sorted by timestamp descending (latest first)."
+  (cl-stable-sort (append rows nil)
+                  (lambda (a b)
+                    (> (or (aws-logs--insights-row-epoch a) -1)
+                       (or (aws-logs--insights-row-epoch b) -1)))))
+
+(defun aws-logs--insights-header-end-position ()
+  "Return position where entries start (after header block)."
+  (save-excursion
+    (goto-char (point-min))
+    (if (search-forward "\n\n" nil t)
+        (point)
+      (point-min))))
+
+(defun aws-logs--insights-insert-new-rows (rows)
+  "Insert ROWS into current buffer in latest-first order."
+  (let ((inhibit-read-only t))
+    (save-excursion
+      (goto-char (aws-logs--insights-header-end-position))
+      (mapc #'aws-logs--insights-insert-entry
+            (aws-logs--insights-sort-latest-first rows)))))
+
+(defun aws-logs--insights-run-query-window (start-time end-time)
+  "Run Insights query for START-TIME..END-TIME and return (QUERY-ID . PAYLOAD)."
+  (let* ((start-payload (apply #'aws-logs--insights-call-cli-json
                                (append
                                 (aws-logs--insights-global-args)
                                 (list "logs" "start-query"
@@ -400,9 +461,95 @@ Returns nil when TIME-RANGE cannot be parsed."
                                       "--end-time" (number-to-string end-time)
                                       "--query-string" aws-logs-query))))
          (query-id (alist-get 'queryId start-payload))
-         (results (aws-logs--wait-for-insights-results query-id))
+         (results (aws-logs--wait-for-insights-results query-id)))
+    (cons query-id results)))
+
+(defun aws-logs--render-insights-results (buffer query-id start-time end-time payload refresh-context)
+  "Render Insights query PAYLOAD into BUFFER."
+  (with-current-buffer buffer
+    (let ((inhibit-read-only t)
+          (rows (aws-logs--insights-sort-latest-first
+                 (append (alist-get 'results payload) nil))))
+      (aws-logs-insights-results-mode)
+      (aws-logs--insights-clear-overlays)
+      (setq aws-logs--insights-seen-rows (make-hash-table :test 'equal))
+      (erase-buffer)
+      (insert (format "Insights query id: %s\n" query-id))
+      (insert (format "Log group: %s\n" aws-logs-log-group))
+      (insert (format "Time window: %s -> %s\n" start-time end-time))
+      (insert "TAB: toggle entry  S-TAB: toggle all  C-c C-r: refresh  q: quit\n\n")
+      (if (or (null rows) (= (length rows) 0))
+          (insert "No results.\n")
+        (mapc #'aws-logs--insights-insert-entry rows))
+      (aws-logs--insights-mark-seen-rows rows)
+      (setq aws-logs--insights-refresh-context (copy-sequence refresh-context)))
+    (goto-char (point-min))
+    (display-buffer buffer)))
+
+(defun aws-logs-insights-refresh ()
+  "Refresh current Insights buffer.
+
+For since-based runs, load only rows since the last refresh and merge them.
+For explicit from/to ranges, reload the full fixed range."
+  (interactive)
+  (unless aws-logs--insights-refresh-context
+    (user-error "No refresh context in this buffer"))
+  (message "Refreshing")
+  (let ((mode (plist-get aws-logs--insights-refresh-context :mode)))
+    (pcase mode
+      ('since
+       (let* ((start-time (plist-get aws-logs--insights-refresh-context :last-end))
+              (end-time (floor (float-time)))
+              (result (aws-logs--insights-run-query-window start-time end-time))
+              (query-id (car result))
+              (payload (cdr result))
+              (rows (append (alist-get 'results payload) nil))
+              (new-rows (aws-logs--insights-unseen-rows rows)))
+         (if (or (null new-rows) (= (length new-rows) 0))
+             (message "Insights refresh: no new rows")
+           (let ((inhibit-read-only t))
+             (save-excursion
+               (when (save-excursion
+                       (goto-char (point-max))
+                       (forward-line -1)
+                       (looking-at-p "No results\\.$"))
+                 (goto-char (point-max))
+                 (forward-line -1)
+                 (delete-region (line-beginning-position) (line-end-position))
+                 (delete-char 1))
+               (aws-logs--insights-insert-new-rows new-rows)))
+           (aws-logs--insights-mark-seen-rows new-rows)
+           (message "Insights refresh: %d new row(s)" (length new-rows)))
+         (let ((new-context (copy-sequence aws-logs--insights-refresh-context)))
+           (setq new-context (plist-put new-context :last-end end-time))
+           (setq new-context (plist-put new-context :last-query-id query-id))
+           (setq aws-logs--insights-refresh-context new-context))))
+      ('custom-range
+       (let* ((start-time (plist-get aws-logs--insights-refresh-context :start))
+              (end-time (plist-get aws-logs--insights-refresh-context :end))
+              (result (aws-logs--insights-run-query-window start-time end-time))
+              (query-id (car result))
+              (payload (cdr result)))
+         (aws-logs--render-insights-results
+          (current-buffer) query-id start-time end-time payload aws-logs--insights-refresh-context)
+         (message "Insights refresh: reloaded fixed time range")))
+      (_
+       (user-error "Unknown refresh mode: %S" mode)))))
+
+(defun aws-logs-insights-run ()
+  "Run Logs Insights query and display formatted results."
+  (unless (and aws-logs-log-group (not (string-empty-p aws-logs-log-group)))
+    (user-error "Select a log group first"))
+  (unless (and aws-logs-query (not (string-empty-p aws-logs-query)))
+    (user-error "Set a Logs Insights query first"))
+  (let* ((refresh-context (aws-logs--insights-window-context))
+         (start-time (plist-get refresh-context :start))
+         (end-time (plist-get refresh-context :end))
+         (result (aws-logs--insights-run-query-window start-time end-time))
+         (query-id (car result))
+         (results (cdr result))
          (buffer (get-buffer-create (format "*AWS insights - %s*" aws-logs-log-group))))
-    (aws-logs--render-insights-results buffer query-id start-time end-time results)
+    (aws-logs--render-insights-results buffer query-id start-time end-time results refresh-context)
     (message "Insights query completed for %s" aws-logs-log-group)))
 
 (provide 'aws-logs-insights)
