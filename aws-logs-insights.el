@@ -18,6 +18,10 @@
 (defvar aws-logs-log-group)
 (defvar aws-logs-query)
 (defvar aws-logs-time-range)
+(defvar aws-logs-summary-timestamp-field)
+(defvar aws-logs-summary-level-field)
+(defvar aws-logs-summary-message-field)
+(defvar aws-logs-summary-extra-fields)
 
 (defface aws-logs-insights-timestamp-face
   '((t :inherit shadow))
@@ -32,6 +36,11 @@
 (defface aws-logs-insights-message-face
   '((t :inherit default))
   "Face for Insights message summaries."
+  :group 'aws-logs)
+
+(defface aws-logs-insights-extra-face
+  '((t :inherit font-lock-variable-name-face))
+  "Face for bracketed extra segments in Insights summaries."
   :group 'aws-logs)
 
 (defface aws-logs-insights-key-face
@@ -275,22 +284,50 @@ Returns nil when TIME-RANGE cannot be parsed."
       (concat (substring value 0 (- limit 1)) "…")
     value))
 
+(defun aws-logs--insights-summary-value (fields sources explicit-field candidates)
+  "Return summary value from EXPLICIT-FIELD or CANDIDATES."
+  (if (and explicit-field (not (string-empty-p explicit-field)))
+      (or (aws-logs--insights-resolve fields sources explicit-field) "-")
+    (or (aws-logs--insights-first-match fields sources candidates) "-")))
+
 (defun aws-logs--insights-summary (fields sources)
   "Build formatted summary line from FIELDS and JSON SOURCES."
-  (let* ((timestamp (or (aws-logs--insights-first-match
-                         fields sources aws-logs--insights-timestamp-candidates)
-                        "-"))
-         (level (or (aws-logs--insights-first-match
-                     fields sources aws-logs--insights-level-candidates)
-                    "-"))
-         (message (or (aws-logs--insights-first-match
-                       fields sources aws-logs--insights-message-candidates)
-                      (cdr (car fields))
-                      "-")))
+  (let* ((timestamp (aws-logs--insights-summary-value
+                     fields sources
+                     aws-logs-summary-timestamp-field
+                     aws-logs--insights-timestamp-candidates))
+         (level (aws-logs--insights-summary-value
+                 fields sources
+                 aws-logs-summary-level-field
+                 aws-logs--insights-level-candidates))
+         (message (if (and aws-logs-summary-message-field
+                           (not (string-empty-p aws-logs-summary-message-field)))
+                      (or (aws-logs--insights-resolve
+                           fields sources aws-logs-summary-message-field)
+                          "-")
+                    (or (aws-logs--insights-first-match
+                         fields sources aws-logs--insights-message-candidates)
+                        (cdr (car fields))
+                        "-")))
+         (extras (delq nil
+                       (mapcar (lambda (field)
+                                 (when-let ((value (aws-logs--insights-resolve fields sources field)))
+                                   (unless (string-empty-p value)
+                                     value)))
+                               aws-logs-summary-extra-fields))))
     (concat
      (propertize timestamp 'face 'aws-logs-insights-timestamp-face)
      " "
      (propertize (upcase level) 'face (aws-logs--insights-level-face level))
+     (if extras
+         (concat " "
+                 (mapconcat (lambda (value)
+                              (propertize
+                               (format "[%s]" (aws-logs--insights-truncate value 80))
+                               'face 'aws-logs-insights-extra-face))
+                            extras
+                            " "))
+       "")
      " "
      (propertize (aws-logs--insights-truncate message 240) 'face 'aws-logs-insights-message-face))))
 

@@ -65,6 +65,29 @@ If you want to change the default for new Emacs sessions, customize this option.
   :type '(choice (const :tag "None" nil) string)
   :group 'aws-logs)
 
+(defcustom aws-logs-default-summary-timestamp-field nil
+  "Optional default field/path used for Insights summary timestamp."
+  :type '(choice (const :tag "Auto (guess)" nil) string)
+  :group 'aws-logs)
+
+(defcustom aws-logs-default-summary-level-field nil
+  "Optional default field/path used for Insights summary level."
+  :type '(choice (const :tag "Auto (guess)" nil) string)
+  :group 'aws-logs)
+
+(defcustom aws-logs-default-summary-message-field nil
+  "Optional default field/path used for Insights summary message."
+  :type '(choice (const :tag "Auto (guess)" nil) string)
+  :group 'aws-logs)
+
+(defcustom aws-logs-default-summary-extra-fields nil
+  "Optional list of extra field/paths to include in Insights summaries.
+
+Each configured field is rendered as a bracketed segment between level and
+message, for example: [service] [class]."
+  :type '(choice (const :tag "None" nil) (repeat string))
+  :group 'aws-logs)
+
 (defcustom aws-logs-default-follow nil
   "Default value for `aws-logs-follow`."
   :type 'boolean
@@ -97,6 +120,18 @@ Prefer `aws-logs-default-log-group`."
 
 (defvar aws-logs-query aws-logs-default-query
   "Selected CloudWatch Logs Insights query string for this Emacs session, or nil when disabled.")
+
+(defvar aws-logs-summary-timestamp-field aws-logs-default-summary-timestamp-field
+  "Optional field/path used for Insights summary timestamp in this session.")
+
+(defvar aws-logs-summary-level-field aws-logs-default-summary-level-field
+  "Optional field/path used for Insights summary level in this session.")
+
+(defvar aws-logs-summary-message-field aws-logs-default-summary-message-field
+  "Optional field/path used for Insights summary message in this session.")
+
+(defvar aws-logs-summary-extra-fields aws-logs-default-summary-extra-fields
+  "Optional list of extra field/paths for Insights summary in this session.")
 
 (defvar aws-logs-follow aws-logs-default-follow
   "Non-nil means follow (tail) logs for this Emacs session.")
@@ -278,6 +313,110 @@ Each entry is (NAME . QUERY)."
               val))
   :argument "--since=")
 
+(transient-define-infix aws-logs-infix-summary-timestamp-field ()
+  :description "Timestamp field"
+  :class 'transient-option
+  :allow-empty t
+  :init-value (lambda (obj) (transient-infix-set obj aws-logs-summary-timestamp-field))
+  :reader (lambda (_prompt initial _hist)
+            (let ((input (string-trim (read-string "Timestamp field (empty=auto): "
+                                                   (or initial "")))))
+              (setq aws-logs-summary-timestamp-field
+                    (unless (string-empty-p input) input))
+              aws-logs-summary-timestamp-field))
+  :argument "--summary-timestamp=")
+
+(transient-define-infix aws-logs-infix-summary-level-field ()
+  :description "Level field"
+  :class 'transient-option
+  :allow-empty t
+  :init-value (lambda (obj) (transient-infix-set obj aws-logs-summary-level-field))
+  :reader (lambda (_prompt initial _hist)
+            (let ((input (string-trim (read-string "Level field (empty=auto): "
+                                                   (or initial "")))))
+              (setq aws-logs-summary-level-field
+                    (unless (string-empty-p input) input))
+              aws-logs-summary-level-field))
+  :argument "--summary-level=")
+
+(transient-define-infix aws-logs-infix-summary-message-field ()
+  :description "Message field"
+  :class 'transient-option
+  :allow-empty t
+  :init-value (lambda (obj) (transient-infix-set obj aws-logs-summary-message-field))
+  :reader (lambda (_prompt initial _hist)
+            (let ((input (string-trim (read-string "Message field (empty=auto): "
+                                                   (or initial "")))))
+              (setq aws-logs-summary-message-field
+                    (unless (string-empty-p input) input))
+              aws-logs-summary-message-field))
+  :argument "--summary-message=")
+
+(defun aws-logs--formatting-reprompt ()
+  "Refresh the formatting transient."
+  (transient-quit-one)
+  (transient-setup 'aws-logs-formatting-transient))
+
+(defun aws-logs--formatting-extra-summary ()
+  "Return one-line summary of currently configured extra fields."
+  (if aws-logs-summary-extra-fields
+      (string-join aws-logs-summary-extra-fields ", ")
+    "none"))
+
+(transient-define-suffix aws-logs-formatting-extra-add ()
+  "Add one extra summary field/path."
+  :transient t
+  (interactive)
+  (let ((input (string-trim (read-string "Add extra field: "))))
+    (when (string-empty-p input)
+      (user-error "Field cannot be empty"))
+    (unless (member input aws-logs-summary-extra-fields)
+      (setq aws-logs-summary-extra-fields
+            (append aws-logs-summary-extra-fields (list input))))
+    (aws-logs--formatting-reprompt)))
+
+(transient-define-suffix aws-logs-formatting-extra-delete ()
+  "Delete one extra summary field/path."
+  :transient t
+  (interactive)
+  (unless aws-logs-summary-extra-fields
+    (user-error "No extra fields to delete"))
+  (let ((selection (completing-read "Delete extra field: "
+                                    aws-logs-summary-extra-fields nil t)))
+    (setq aws-logs-summary-extra-fields
+          (delete selection (copy-sequence aws-logs-summary-extra-fields)))
+    (aws-logs--formatting-reprompt)))
+
+(transient-define-suffix aws-logs-formatting-done ()
+  "Return from formatting transient to the main transient."
+  :transient nil
+  (interactive)
+  (transient-quit-one)
+  (transient-setup 'aws-logs-transient))
+
+(transient-define-prefix aws-logs-formatting-transient ()
+  "Formatting options for Insights summary rendering."
+  :remember-value 'exit
+  [["Fields"
+    ("t" "Timestamp field" aws-logs-infix-summary-timestamp-field)
+    ("l" "Level field" aws-logs-infix-summary-level-field)
+    ("m" "Message field" aws-logs-infix-summary-message-field)]
+
+   [4 :description (lambda () (format "Extras: %s" (aws-logs--formatting-extra-summary)))
+      ("a" "Add extra field" aws-logs-formatting-extra-add)
+      ("d" "Delete extra field" aws-logs-formatting-extra-delete)]]
+
+  [["Done"
+    ("RET" "Back to main" aws-logs-formatting-done)]]
+  (interactive)
+  (transient-setup 'aws-logs-formatting-transient))
+
+(transient-define-suffix aws-logs-open-formatting ()
+  "Open formatting transient."
+  :transient nil
+  (interactive)
+  (transient-setup 'aws-logs-formatting-transient))
+
 
 (defun aws-logs--getopt (name args)
   "Get value for option prefix NAME (e.g. \"--since=\") from ARGS."
@@ -361,7 +500,8 @@ Use the Tail action to stream logs with current selections."
    [4 :description (lambda () (format "Query: %s" (aws-logs--query)))
       ("-q" "Edit query…" aws-logs-query-edit)
       ("Q" "Preset…" aws-logs-query-preset)
-      ("X" "Clear query" aws-logs-query-clear)]]
+      ("X" "Clear query" aws-logs-query-clear)
+      ("f" "Formatting…" aws-logs-open-formatting)]]
 
   [["Actions"
     ("RET" aws-logs-dwim)
