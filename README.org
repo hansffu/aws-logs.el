@@ -1,0 +1,89 @@
+#+title: aws-logs.el
+
+~aws-logs.el~ provides an Emacs transient UI for AWS CloudWatch Logs tailing and Logs Insights queries.
+
+* Features
+
+- Tail CloudWatch logs with profile/region/log-group controls.
+- Run Logs Insights queries and view foldable, formatted results.
+- Configure summary formatting (timestamp/level/message + optional extra fields).
+- Save reusable query snippets ("saved queries").
+- Define full option presets and apply them from the transient.
+
+* Installation
+
+Place ~aws-logs.el~, ~aws-logs-insights.el~, and ~aws-logs-query.el~ in your ~load-path~.
+
+* use-package Example
+
+#+begin_src emacs-lisp
+(use-package aws-logs
+  :load-path "~/dev/emacs/aws-logs.el"
+  :commands (aws-logs)
+  :custom
+  (aws-logs-cli "aws")
+  (aws-logs-region "us-east-1")
+  (aws-logs-default-profile "engineering")
+  (aws-logs-default-log-group "/aws/ecs/payments-api")
+  (aws-logs-default-follow t)
+  (aws-logs-default-since "20m")
+  (aws-logs-default-summary-level-field "event.level")
+  (aws-logs-default-summary-message-field "event.message")
+  (aws-logs-default-summary-extra-fields '("event.service" "event.logger"))
+  :config
+  ;; Saved queries (used by transient key: Q)
+  (setq aws-logs-insights-saved-queries
+        '(("Recent Errors"
+           . "fields @timestamp, @message | filter event.level = \"ERROR\" | sort @timestamp desc | limit 200")
+          ("Slow Requests"
+           . "fields @timestamp, latencyMs, route | filter latencyMs > 1000 | sort @timestamp desc | limit 100")))
+
+  ;; Option presets (used by transient key: @)
+  (aws-logs-make-preset
+   "prod-errors"
+   :profile "prod-observability"
+   :log-group "/aws/lambda/orders-prod-handler"
+   :since "45m"
+   :follow nil
+   :query "fields @timestamp, @message | filter event.level = \"ERROR\" | sort @timestamp desc"
+   :summary-timestamp-field "@timestamp"
+   :summary-level-field "event.level"
+   :summary-message-field "event.message"
+   :summary-extra-fields '("event.service" "event.logger")))
+#+end_src
+
+* Presets
+
+~aws-logs-make-preset~ stores a named preset in ~aws-logs-presets~.
+
+Supported keys:
+
+- ~:log-group~
+- ~:since~
+- ~:custom-time-range~ (cons cell: ~(FROM . TO)~)
+- ~:follow~
+- ~:profile~
+- ~:query~
+- ~:summary-timestamp-field~
+- ~:summary-level-field~
+- ~:summary-message-field~
+- ~:summary-extra-fields~
+
+Apply behavior:
+
+- Key missing: keep current value.
+- Key present with ~nil~: clear value.
+- Key present with non-~nil~: set value.
+
+If you define a preset with the same name again, it replaces the previous one.
+
+* Usage
+
+Run ~M-x aws-logs~.
+
+- ~@~ apply an options preset
+- ~Q~ apply a saved query
+- ~f~ open formatting transient
+- ~t~ tail logs
+- ~l~ run Logs Insights
+- ~RET~ run DWIM (tail or insights depending on query)
