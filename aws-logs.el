@@ -177,6 +177,11 @@ a property list as accepted by `aws-logs-make-preset`.")
   (transient-quit-one)
   (transient-setup 'aws-logs-transient))
 
+(defun aws-logs--query-transient-reprompt ()
+  "Refresh query transient so UI reflects current backing fields."
+  (transient-quit-one)
+  (transient-setup 'aws-logs-query-transient))
+
 
 (declare-function aws-logs--insights-query-edit "aws-logs-query" (initial))
 (declare-function aws-logs-insights-query-mode "aws-logs-query")
@@ -195,6 +200,12 @@ a property list as accepted by `aws-logs-make-preset`.")
         (if (> (length s) 80)
             (concat (substring s 0 77) "…")
           s))
+    "— (none)"))
+
+(defun aws-logs--query-full ()
+  "Return full multi-line `aws-logs-query` for query transient display."
+  (if (and aws-logs-query (not (string-empty-p aws-logs-query)))
+      aws-logs-query
     "— (none)"))
 
 (defun aws-logs-quit-process-and-window ()
@@ -266,7 +277,7 @@ a property list as accepted by `aws-logs-make-preset`.")
   :argument "--log-group=")
 
 ;; Infix for showing current Logs Insights query status. Editing is done via
-;; suffix commands (see `aws-logs-query-edit`, `aws-logs-query-clear`, etc.).
+;; the query transient (see `aws-logs-query-transient`).
 (transient-define-infix aws-logs-infix-query ()
   :description "Query (Logs Insights)"
   :class 'transient-option
@@ -290,7 +301,7 @@ a property list as accepted by `aws-logs-make-preset`.")
   (let ((edited (aws-logs--insights-query-edit aws-logs-query)))
     (when edited
       (setq aws-logs-query (if (string-empty-p edited) nil edited))
-      (aws-logs--transient-reprompt))))
+      (aws-logs--query-transient-reprompt))))
 
 (transient-define-suffix aws-logs-query-clear ()
   "Disable the Logs Insights query (unset `aws-logs-query`)."
@@ -299,23 +310,105 @@ a property list as accepted by `aws-logs-make-preset`.")
   (setq aws-logs-query nil)
   (aws-logs--transient-reprompt))
 
-(defcustom aws-logs-insights-saved-queries nil
-  "Alist of named saved Logs Insights queries.
+(defcustom aws-logs-insights-saved-queries-directory
+  (expand-file-name "aws-logs/insights-queries/" user-emacs-directory)
+  "Directory where saved Logs Insights query files are stored.
 
-Each entry is (NAME . QUERY)."
-  :type '(alist :key-type string :value-type string)
+Each regular file in this directory is treated as a saved query, and the file
+name is the key shown in transient prompts. Customize this path if you use a
+different layout (for example with `no-littering`)."
+  :type 'directory
   :group 'aws-logs)
 
-(transient-define-suffix aws-logs-query-apply-saved ()
-  "Select a saved Logs Insights query and store it in the backing field."
+(defun aws-logs--insights-saved-query-dir ()
+  "Return normalized saved-query directory path."
+  (file-name-as-directory
+   (expand-file-name aws-logs-insights-saved-queries-directory)))
+
+(defun aws-logs--insights-saved-query-key (raw)
+  "Validate and normalize saved query key from RAW."
+  (let ((key (string-trim (or raw ""))))
+    (when (string-empty-p key)
+      (user-error "Saved query key cannot be empty"))
+    (when (member key '("." ".."))
+      (user-error "Invalid saved query key: %s" key))
+    (when (string-match-p "[/\\]" key)
+      (user-error "Saved query key must be a file name, not a path: %s" key))
+    key))
+
+(defun aws-logs--insights-saved-query-path (key)
+  "Return absolute saved-query file path for KEY."
+  (expand-file-name (aws-logs--insights-saved-query-key key)
+                    (aws-logs--insights-saved-query-dir)))
+
+(defun aws-logs--insights-saved-query-files ()
+  "Return alist of (KEY . PATH) for saved query files."
+  (let ((dir (aws-logs--insights-saved-query-dir)))
+    (if (file-directory-p dir)
+        (sort
+         (delq nil
+               (mapcar
+                (lambda (name)
+                  (let ((path (expand-file-name name dir)))
+                    (when (file-regular-p path)
+                      (cons name path))))
+                (directory-files dir nil directory-files-no-dot-files-regexp)))
+         (lambda (a b) (string-lessp (car a) (car b))))
+      nil)))
+
+(defun aws-logs--insights-read-saved-query (path)
+  "Return saved query text from PATH."
+  (with-temp-buffer
+    (insert-file-contents path)
+    (string-trim-right (buffer-string))))
+
+(defun aws-logs--insights-write-saved-query (path query)
+  "Write QUERY to PATH."
+  (make-directory (file-name-directory path) t)
+  (with-temp-file path
+    (insert (string-trim-right query))
+    (insert "\n")))
+
+(defun aws-logs--insights-choose-saved-query (prompt)
+  "Prompt with PROMPT and return selected (KEY . PATH)."
+  (let ((candidates (aws-logs--insights-saved-query-files)))
+    (unless candidates
+      (user-error "No saved queries found in %s"
+                  (aws-logs--insights-saved-query-dir)))
+    (let* ((key (completing-read prompt (mapcar #'car candidates) nil t))
+           (pair (assoc key candidates)))
+      (unless pair
+        (user-error "Saved query not found: %s" key))
+      pair)))
+
+(transient-define-suffix aws-logs-query-load-saved ()
+  "Load a saved Logs Insights query file into the active query."
   :transient t
   (interactive)
-  (unless aws-logs-insights-saved-queries
-    (user-error "No saved queries configured in `aws-logs-insights-saved-queries`"))
-  (let* ((name (completing-read "Saved query: " (mapcar #'car aws-logs-insights-saved-queries) nil t))
-         (query (cdr (assoc name aws-logs-insights-saved-queries))))
-    (setq aws-logs-query query)
-    (aws-logs--transient-reprompt)))
+  (let* ((pair (aws-logs--insights-choose-saved-query "Saved query: "))
+         (path (cdr pair))
+         (query (aws-logs--insights-read-saved-query path)))
+    (setq aws-logs-query (unless (string-empty-p query) query))
+    (aws-logs--query-transient-reprompt)))
+
+(transient-define-suffix aws-logs-query-save ()
+  "Save current Logs Insights query to a query file."
+  :transient t
+  (interactive)
+  (unless (and aws-logs-query (not (string-empty-p aws-logs-query)))
+    (user-error "Set a Logs Insights query first"))
+  (let* ((dir (aws-logs--insights-saved-query-dir))
+         (_ (make-directory dir t))
+         (key (aws-logs--insights-saved-query-key
+               (file-name-nondirectory
+                (read-file-name "Save query file: " dir nil nil))))
+         (path (aws-logs--insights-saved-query-path key)))
+    (when (and (file-exists-p path)
+               (not (y-or-n-p (format "Overwrite saved query `%s`? " key))))
+      (user-error "Canceled"))
+    (aws-logs--insights-write-saved-query path aws-logs-query)
+    (message "Saved query `%s`" key)
+    (aws-logs--query-transient-reprompt)))
 
 (defconst aws-logs--preset-keys
   '(:log-group :since :follow :profile :query
@@ -579,6 +672,31 @@ Returns a cons cell (FROM . TO), where both values are ISO-like strings."
   (interactive)
   (transient-setup 'aws-logs-formatting-transient))
 
+(transient-define-suffix aws-logs-query-done ()
+  "Return from query transient to the main transient."
+  :transient nil
+  (interactive)
+  (transient-quit-one)
+  (transient-setup 'aws-logs-transient))
+
+(transient-define-prefix aws-logs-query-transient ()
+  "Query options for Logs Insights."
+  :remember-value 'exit
+  [[4 :description (lambda () (format "Active query:\n%s" (aws-logs--query-full)))
+      ("e" "Edit active query" aws-logs-query-edit)
+      ("s" "Save active query" aws-logs-query-save)
+      ("l" "Load saved query" aws-logs-query-load-saved)]]
+  [["Done"
+    ("RET" "Back to main" aws-logs-query-done)]]
+  (interactive)
+  (transient-setup 'aws-logs-query-transient))
+
+(transient-define-suffix aws-logs-open-query-transient ()
+  "Open query transient."
+  :transient nil
+  (interactive)
+  (transient-setup 'aws-logs-query-transient))
+
 
 (defun aws-logs--getopt (name args)
   "Get value for option prefix NAME (e.g. \"--since=\") from ARGS."
@@ -666,9 +784,8 @@ Use the Tail action to stream logs with current selections."
     ("-p" "Profile" aws-logs-infix-profile)]
 
    [4 :description (lambda () (format "Query: %s" (aws-logs--query)))
-      ("-q" "Edit query…" aws-logs-query-edit)
-      ("Q" "Apply saved query…" aws-logs-query-apply-saved)
-      ("X" "Clear query" aws-logs-query-clear)
+      ("q" "Query…" aws-logs-open-query-transient)
+      ("x" "Clear query" aws-logs-query-clear)
       ("f" "Formatting…" aws-logs-open-formatting)]]
 
   [["Actions"
