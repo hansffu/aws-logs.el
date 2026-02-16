@@ -24,6 +24,8 @@
 (defvar aws-logs-summary-level-field)
 (defvar aws-logs-summary-message-field)
 (defvar aws-logs-summary-extra-fields)
+(defvar aws-logs-insights-live-narrow-max-rows)
+(defvar aws-logs-insights-live-narrow-debounce)
 
 (defface aws-logs-insights-timestamp-face
   '((t :inherit shadow))
@@ -50,6 +52,21 @@
   "Face for keys in expanded Insights result details."
   :group 'aws-logs)
 
+(defface aws-logs-insights-header-key-face
+  '((t :inherit font-lock-keyword-face :weight bold))
+  "Face for header keys in Insights buffers."
+  :group 'aws-logs)
+
+(defface aws-logs-insights-header-value-face
+  '((t :inherit default))
+  "Face for header values in Insights buffers."
+  :group 'aws-logs)
+
+(defface aws-logs-insights-keybinding-face
+  '((t :inherit font-lock-constant-face :weight bold))
+  "Face for keybinding tokens in Insights header."
+  :group 'aws-logs)
+
 (defvar-local aws-logs--insights-overlays nil
   "Fold overlays in the current Insights results buffer.")
 
@@ -67,6 +84,15 @@
 
 (defvar-local aws-logs--insights-current-line-overlay nil
   "Overlay used to highlight current entry in Insights results buffers.")
+
+(defvar-local aws-logs--insights-header-query-id nil
+  "Query id currently shown in the Insights header.")
+
+(defvar-local aws-logs--insights-header-start-time nil
+  "Start epoch currently shown in the Insights header.")
+
+(defvar-local aws-logs--insights-header-end-time nil
+  "End epoch currently shown in the Insights header.")
 
 (defun aws-logs--insights-global-args ()
   "Build common AWS CLI arguments from current backing fields."
@@ -266,27 +292,147 @@ Returns nil when TIME-RANGE cannot be parsed."
                        'aws-logs-insights-filter
                      nil)))))
 
-(defun aws-logs-insights-narrow ()
-  "Hide entries whose fields do not contain a minibuffer substring."
-  (interactive)
-  (let ((needle (string-trim
-                 (read-string "Narrow Insights to string: "
-                              (or aws-logs--insights-filter-string "")))))
-    (when (string-empty-p needle)
-      (user-error "Narrow string cannot be empty"))
-    (setq aws-logs--insights-filter-string needle)
+(defun aws-logs--insights-entry-count ()
+  "Return number of rendered Insights rows in current buffer."
+  (length aws-logs--insights-entry-overlays))
+
+(defun aws-logs--insights-visible-entry-count ()
+  "Return number of visible Insights rows in current buffer."
+  (let ((visible 0))
+    (dolist (entry-overlay aws-logs--insights-entry-overlays)
+      (unless (overlay-get entry-overlay 'invisible)
+        (setq visible (1+ visible))))
+    visible))
+
+(defun aws-logs--insights-set-filter (needle)
+  "Set Insights filter to NEEDLE and apply it."
+  (let ((normalized (string-trim (or needle ""))))
+    (setq aws-logs--insights-filter-string
+          (unless (string-empty-p normalized) normalized))
     (aws-logs--insights-apply-filter)
-    (let ((visible 0))
-      (dolist (entry-overlay aws-logs--insights-entry-overlays)
-        (unless (overlay-get entry-overlay 'invisible)
-          (setq visible (1+ visible))))
-      (message "Insights narrowed to \"%s\" (%d visible row(s))" needle visible))))
+    (aws-logs--insights-highlight-current-line)))
+
+(defun aws-logs--insights-live-preview-filter (buffer needle)
+  "Apply preview NEEDLE in Insights results BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (aws-logs--insights-set-filter needle))))
+
+(defun aws-logs--insights-filter-summary ()
+  "Return a display string for the active Insights narrowing filter."
+  (if (and aws-logs--insights-filter-string
+           (not (string-empty-p aws-logs--insights-filter-string)))
+      (format "\"%s\"" aws-logs--insights-filter-string)
+    "(none)"))
+
+(defun aws-logs--insights-header-line (key value)
+  "Return one formatted header line from KEY and VALUE."
+  (concat
+   (propertize (format "%-12s" (concat key ":"))
+               'face 'aws-logs-insights-header-key-face)
+   " "
+   (propertize value 'face 'aws-logs-insights-header-value-face)))
+
+(defun aws-logs--insights-keybinding-fragment (key action)
+  "Return formatted keybinding text for KEY and ACTION."
+  (concat
+   (propertize key 'face 'aws-logs-insights-keybinding-face)
+   (propertize (format " %s" action) 'face 'aws-logs-insights-header-value-face)))
+
+(defun aws-logs--insights-insert-header (row-count)
+  "Insert formatted Insights header using ROW-COUNT."
+  (insert (aws-logs--insights-header-line
+           "Query ID"
+           (or aws-logs--insights-header-query-id "-"))
+          "\n")
+  (insert (aws-logs--insights-header-line
+           "Log group"
+           (or aws-logs-log-group "-"))
+          "\n")
+  (insert (aws-logs--insights-header-line
+           "Time window"
+           (format "%s -> %s"
+                   (or aws-logs--insights-header-start-time "-")
+                   (or aws-logs--insights-header-end-time "-")))
+          "\n")
+  (insert (aws-logs--insights-header-line
+           "Messages"
+           (number-to-string row-count))
+          "\n")
+  (insert (aws-logs--insights-header-line
+           "Narrow filter"
+           (aws-logs--insights-filter-summary))
+          "\n")
+  (insert (propertize "Keys:        " 'face 'aws-logs-insights-header-key-face))
+  (insert
+   (string-join
+    (list (aws-logs--insights-keybinding-fragment "TAB" "toggle entry")
+          (aws-logs--insights-keybinding-fragment "S-TAB" "toggle all")
+          (aws-logs--insights-keybinding-fragment "C-c C-r" "refresh")
+          (aws-logs--insights-keybinding-fragment "C-c C-n" "narrow")
+          (aws-logs--insights-keybinding-fragment "C-c C-w" "widen")
+          (aws-logs--insights-keybinding-fragment "q" "quit"))
+    (propertize "  |  " 'face 'aws-logs-insights-header-value-face)))
+  (insert "\n\n"))
+
+(defun aws-logs-insights-narrow ()
+  "Hide entries whose fields do not contain a minibuffer substring.
+
+When result size allows it, updates are previewed live while typing."
+  (interactive)
+  (let* ((results-buffer (current-buffer))
+         (original-filter aws-logs--insights-filter-string)
+         (row-count (aws-logs--insights-entry-count))
+         (live-enabled (or (null aws-logs-insights-live-narrow-max-rows)
+                           (<= row-count aws-logs-insights-live-narrow-max-rows)))
+         (debounce (max 0 (or aws-logs-insights-live-narrow-debounce 0)))
+         (committed nil)
+         (timer nil)
+         (prompt (if live-enabled
+                     "Narrow Insights to string: "
+                   (format "Narrow Insights to string (live disabled above %d rows): "
+                           aws-logs-insights-live-narrow-max-rows))))
+    (unwind-protect
+        (let ((needle
+               (minibuffer-with-setup-hook
+                   (lambda ()
+                     (when live-enabled
+                       (add-hook
+                        'post-command-hook
+                        (lambda ()
+                          (let ((input (string-trim (minibuffer-contents-no-properties))))
+                            (if (<= debounce 0)
+                                (aws-logs--insights-live-preview-filter results-buffer input)
+                              (when timer
+                                (cancel-timer timer))
+                              (setq timer
+                                    (run-with-idle-timer
+                                     debounce nil
+                                     #'aws-logs--insights-live-preview-filter
+                                     results-buffer input)))))
+                        nil t)))
+                 (read-string prompt (or original-filter "")))))
+          (setq needle (string-trim needle))
+          (when (string-empty-p needle)
+            (aws-logs--insights-set-filter original-filter)
+            (user-error "Narrow string cannot be empty"))
+          (aws-logs--insights-set-filter needle)
+          (aws-logs--insights-refresh-header)
+          (setq committed t)
+          (message "Insights narrowed to \"%s\" (%d visible row(s))"
+                   needle
+                   (aws-logs--insights-visible-entry-count)))
+      (when timer
+        (cancel-timer timer))
+      (unless committed
+        (aws-logs--insights-set-filter original-filter)))))
 
 (defun aws-logs-insights-widen ()
   "Clear Insights entry filter and show all rows."
   (interactive)
   (setq aws-logs--insights-filter-string nil)
   (aws-logs--insights-apply-filter)
+  (aws-logs--insights-refresh-header)
   (message "Insights narrowing cleared"))
 
 (defvar-keymap aws-logs-insights-results-mode-map
@@ -301,6 +447,7 @@ Returns nil when TIME-RANGE cannot be parsed."
 (define-derived-mode aws-logs-insights-results-mode special-mode "AWS-Insights"
   "Major mode for formatted AWS Logs Insights query results."
   :group 'aws-logs
+  (buffer-disable-undo)
   (setq-local truncate-lines t)
   (setq-local line-move-ignore-invisible t)
   (setq-local buffer-invisibility-spec '(t))
@@ -554,6 +701,16 @@ Returns `asc` or `desc`. Defaults to `asc` when it cannot be inferred."
         (point)
       (point-min))))
 
+(defun aws-logs--insights-refresh-header ()
+  "Re-render header in current Insights buffer."
+  (let ((inhibit-read-only t))
+    (save-excursion
+      (let ((header-end (aws-logs--insights-header-end-position))
+            (row-count (aws-logs--insights-entry-count)))
+        (goto-char (point-min))
+        (delete-region (point-min) header-end)
+        (aws-logs--insights-insert-header row-count)))))
+
 (defun aws-logs--insights-insert-new-rows (rows)
   "Insert ROWS into current buffer in latest-first order."
   (let ((inhibit-read-only t))
@@ -577,22 +734,22 @@ Returns `asc` or `desc`. Defaults to `asc` when it cannot be inferred."
          (results (aws-logs--wait-for-insights-results query-id)))
     (cons query-id results)))
 
-(defun aws-logs--render-insights-results (buffer query-id start-time end-time payload refresh-context)
+(defun aws-logs--render-insights-results (buffer query-id start-time end-time payload refresh-context &optional preserve-filter)
   "Render Insights query PAYLOAD into BUFFER."
   (with-current-buffer buffer
-    (let ((active-filter aws-logs--insights-filter-string)
+    (let ((active-filter (and preserve-filter aws-logs--insights-filter-string))
           (inhibit-read-only t)
           (rows (aws-logs--insights-sort-latest-first
                  (append (alist-get 'results payload) nil))))
       (aws-logs-insights-results-mode)
       (setq aws-logs--insights-filter-string active-filter)
+      (setq aws-logs--insights-header-query-id query-id)
+      (setq aws-logs--insights-header-start-time start-time)
+      (setq aws-logs--insights-header-end-time end-time)
       (aws-logs--insights-clear-overlays)
       (setq aws-logs--insights-seen-rows (make-hash-table :test 'equal))
       (erase-buffer)
-      (insert (format "Insights query id: %s\n" query-id))
-      (insert (format "Log group: %s\n" aws-logs-log-group))
-      (insert (format "Time window: %s -> %s\n" start-time end-time))
-      (insert "TAB: toggle entry  S-TAB: toggle all  C-c C-r: refresh  C-c C-n: narrow  C-c C-w: widen  q: quit\n\n")
+      (aws-logs--insights-insert-header (length rows))
       (if (or (null rows) (= (length rows) 0))
           (insert "No results.\n")
         (mapc #'aws-logs--insights-insert-entry rows))
@@ -640,7 +797,10 @@ For explicit from/to ranges, reload the full fixed range."
          (let ((new-context (copy-sequence aws-logs--insights-refresh-context)))
            (setq new-context (plist-put new-context :last-end end-time))
            (setq new-context (plist-put new-context :last-query-id query-id))
-           (setq aws-logs--insights-refresh-context new-context))))
+           (setq aws-logs--insights-refresh-context new-context))
+         (setq aws-logs--insights-header-query-id query-id)
+         (setq aws-logs--insights-header-end-time end-time)
+         (aws-logs--insights-refresh-header)))
       ('custom-range
        (let* ((start-time (plist-get aws-logs--insights-refresh-context :start))
               (end-time (plist-get aws-logs--insights-refresh-context :end))
@@ -648,7 +808,7 @@ For explicit from/to ranges, reload the full fixed range."
               (query-id (car result))
               (payload (cdr result)))
          (aws-logs--render-insights-results
-          (current-buffer) query-id start-time end-time payload aws-logs--insights-refresh-context)
+          (current-buffer) query-id start-time end-time payload aws-logs--insights-refresh-context t)
          (message "Insights refresh: reloaded fixed time range")))
       (_
        (user-error "Unknown refresh mode: %S" mode)))))
