@@ -141,7 +141,8 @@ Prefer `aws-logs-default-log-group`."
   "Selected CloudWatch log group for this Emacs session.")
 
 (defvar aws-logs-query aws-logs-default-query
-  "Selected CloudWatch Logs Insights query string for this Emacs session, or nil when disabled.")
+  "Selected CloudWatch Logs Insights query string for this Emacs session,
+or nil when disabled.")
 
 (defvar aws-logs-summary-timestamp-field aws-logs-default-summary-timestamp-field
   "Optional field/path used for Insights summary timestamp in this session.")
@@ -159,7 +160,8 @@ Prefer `aws-logs-default-log-group`."
   "Non-nil means follow (tail) logs for this Emacs session.")
 
 (defvar aws-logs-time-range aws-logs-default-since
-  "Selected time range (e.g. 10m) for this Emacs session. Used as --since for `aws logs tail`.")
+  "Selected time range (e.g. 10m) for this Emacs session.
+Used as --since for `aws logs tail`.")
 
 (defvar aws-logs-custom-time-range aws-logs-default-custom-time-range
   "Selected explicit from/to range for this Emacs session.
@@ -185,6 +187,7 @@ a property list as accepted by `aws-logs-make-preset`.")
 
 (declare-function aws-logs--insights-query-edit "aws-logs-query" (initial))
 (declare-function aws-logs-insights-query-mode "aws-logs-query")
+(declare-function aws-logs-insights-query-fontify-string "aws-logs-query" (query))
 (declare-function org-read-date "org"
                   (&optional with-time to-time from-string prompt default-time default-input))
 (defvar aws-logs-mode-map
@@ -196,7 +199,13 @@ a property list as accepted by `aws-logs-make-preset`.")
 (defun aws-logs--query ()
   "Return a one-line summary of `aws-logs-query` for display in transient."
   (if (and aws-logs-query (not (string-empty-p aws-logs-query)))
-      (let ((s (replace-regexp-in-string "[\n\t ]+" " " aws-logs-query)))
+      (let* ((fontified (aws-logs-insights-query-fontify-string aws-logs-query))
+             (s (with-temp-buffer
+                  (insert fontified)
+                  (goto-char (point-min))
+                  (while (re-search-forward "[\n\t ]+" nil t)
+                    (replace-match " "))
+                  (buffer-string))))
         (if (> (length s) 80)
             (concat (substring s 0 77) "…")
           s))
@@ -205,7 +214,7 @@ a property list as accepted by `aws-logs-make-preset`.")
 (defun aws-logs--query-full ()
   "Return full multi-line `aws-logs-query` for query transient display."
   (if (and aws-logs-query (not (string-empty-p aws-logs-query)))
-      aws-logs-query
+      (aws-logs-insights-query-fontify-string aws-logs-query)
     "— (none)"))
 
 (defun aws-logs-quit-process-and-window ()
@@ -412,9 +421,9 @@ different layout (for example with `no-littering`)."
 
 (defconst aws-logs--preset-keys
   '(:log-group :since :follow :profile :query
-    :custom-time-range
-    :summary-timestamp-field :summary-level-field :summary-message-field
-    :summary-extra-fields)
+               :custom-time-range
+               :summary-timestamp-field :summary-level-field :summary-message-field
+               :summary-extra-fields)
   "Allowed keys for aws-logs presets.")
 
 (defun aws-logs--preset-plist-valid-p (plist)

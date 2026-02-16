@@ -99,6 +99,18 @@ Supports basic syntax highlighting and #-style comments."
   (font-lock-mode 1)
   (font-lock-flush))
 
+(defun aws-logs-insights-query-fontify-string (query)
+  "Return QUERY with Logs Insights syntax highlighting text properties.
+
+Existing text properties in QUERY are stripped before fontification."
+  (if (or (null query) (string-empty-p query))
+      query
+    (with-temp-buffer
+      (insert (substring-no-properties query))
+      (aws-logs-insights-query-mode)
+      (font-lock-ensure (point-min) (point-max))
+      (buffer-string))))
+
 (defvar aws-logs--insights-query-edit-buffer "*AWS Logs Insights Query*"
   "Buffer name used for editing Logs Insights queries.")
 
@@ -112,7 +124,9 @@ Supports basic syntax highlighting and #-style comments."
   "Finish editing the Logs Insights query and close the editor." 
   (interactive)
   (setq aws-logs--insights-query-edit-canceled nil)
-  (setq aws-logs--insights-query-edit-result (string-trim-right (buffer-string)))
+  (setq aws-logs--insights-query-edit-result
+        (string-trim-right
+         (buffer-substring-no-properties (point-min) (point-max))))
   (exit-recursive-edit))
 
 (defun aws-logs-insights-query-edit-cancel ()
@@ -141,7 +155,7 @@ Returns the edited query string, or nil if canceled."
       ;; This lets you reopen the editor and keep/modify existing text.
       (unless (eq (current-buffer) (window-buffer (selected-window)))
         (erase-buffer)
-        (when initial (insert initial)))
+        (when initial (insert (substring-no-properties initial))))
       (goto-char (point-min))
       ;; Enable query mode + editor keybindings.
       (aws-logs-insights-query-mode)
