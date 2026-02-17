@@ -1,0 +1,100 @@
+#+TITLE: json-log-viewer
+
+~json-log-viewer~ is a generic, foldable JSON log viewer for Emacs.
+
+It is callback-driven, keeps runtime state buffer-local, and supports:
+- non-streaming mode (replace full dataset on refresh)
+- streaming mode (append new lines with ~json-log-viewer-push~)
+
+* Quick API
+
+- ~json-log-viewer-make-buffer BUFFER-NAME &key ...~ -> returns buffer
+- ~json-log-viewer-push BUFFER-OR-NAME LOG-LINES~ -> append in streaming buffers
+- ~json-log-viewer-get-buffer BUFFER-OR-NAME~ -> validated viewer buffer
+
+* Constructor
+
+#+begin_src emacs-lisp
+(json-log-viewer-make-buffer
+ "*My Logs*"
+ :log-lines '("{\"timestamp\":\"2026-02-17T10:00:00Z\",\"level\":\"info\",\"msg\":\"started\"}")
+ :timestamp-path "timestamp"
+ :level-path "level"
+ :message-path "msg"
+ :extra-paths '("meta.service" "meta.env")
+ :refresh-function (lambda (old-log-lines) old-log-lines)
+ :streaming nil
+ :direction 'newest-first
+ :header-lines-function (lambda (_state) (list (cons "Source" "demo"))))
+#+end_src
+
+Notes:
+- ~:log-lines~ is a list of JSON strings.
+- ~:refresh-function~ gets old lines and must return the new full list.
+- ~:streaming~ controls append semantics:
+  - ~nil~: non-streaming order follows ~:direction~
+  - non-nil: pushes append to the bottom
+- The package does not call ~display-buffer~; caller controls display.
+
+* Example: Non-Streaming
+
+#+begin_src emacs-lisp
+(let* ((all-lines
+        '("{\"timestamp\":\"2026-02-17T10:00:00Z\",\"level\":\"info\",\"msg\":\"a\"}"
+          "{\"timestamp\":\"2026-02-17T10:00:01Z\",\"level\":\"warn\",\"msg\":\"b\"}"))
+       (buf
+        (json-log-viewer-make-buffer
+         "*JSON Logs (Non-Streaming)*"
+         :log-lines all-lines
+         :timestamp-path "timestamp"
+         :level-path "level"
+         :message-path "msg"
+         :streaming nil
+         :direction 'newest-first
+         :refresh-function
+         (lambda (_old-lines)
+           ;; Replace with newly fetched full dataset.
+           (setq all-lines
+                 (append all-lines
+                         '("{\"timestamp\":\"2026-02-17T10:00:02Z\",\"level\":\"info\",\"msg\":\"c\"}")))
+           all-lines)
+         :header-lines-function
+         (lambda (_state)
+           (list (cons "Mode" "non-streaming demo"))))))
+  (display-buffer buf))
+
+;; In the viewer: C-c C-r to refresh.
+#+end_src
+
+* Example: Streaming
+
+#+begin_src emacs-lisp
+(let ((buf
+       (json-log-viewer-make-buffer
+        "*JSON Logs (Streaming)*"
+        :log-lines '("{\"timestamp\":\"2026-02-17T10:00:00Z\",\"level\":\"info\",\"msg\":\"first\"}")
+        :timestamp-path "timestamp"
+        :level-path "level"
+        :message-path "msg"
+        :streaming t
+        :header-lines-function
+        (lambda (_state)
+          (list (cons "Mode" "streaming demo"))))))
+  (display-buffer buf)
+
+  ;; Later, append new lines to the same buffer:
+  (json-log-viewer-push
+   buf
+   '("{\"timestamp\":\"2026-02-17T10:00:01Z\",\"level\":\"warn\",\"msg\":\"second\"}"
+     "{\"timestamp\":\"2026-02-17T10:00:02Z\",\"level\":\"info\",\"msg\":\"third\"}")))
+#+end_src
+
+* Keybindings
+
+Inside ~json-log-viewer-mode~:
+- ~TAB~: toggle current entry
+- ~S-TAB~: toggle all entries
+- ~C-c C-r~: refresh (when ~:refresh-function~ is configured)
+- ~C-c C-n~: narrow by substring
+- ~C-c C-w~: clear narrowing
+- ~q~: quit window
