@@ -1,8 +1,9 @@
 #+title: aws-logs.el repository
 
-This repository contains two related Emacs Lisp packages:
+This repository contains three related Emacs Lisp packages:
 
 - ~aws-logs~: transient-driven CloudWatch Logs tooling (tail + Logs Insights).
+- ~kube-logs~: transient-driven Kubernetes logs tooling (pods/deployments via ~kubectl~).
 - ~json-log-viewer~: generic foldable JSON log viewer used by ~aws-logs~ and usable standalone.
 
 * Package: aws-logs
@@ -224,3 +225,90 @@ Inside ~json-log-viewer-mode~:
 - ~C-c C-n~: narrow by substring
 - ~C-c C-w~: clear narrowing
 - ~q~: quit window
+
+* Package: kube-logs
+
+~kube-logs~ provides a transient UI for ~kubectl logs~, rendered in ~json-log-viewer~.
+
+** Features
+
+- Switch context.
+- Set namespace for log commands.
+- Select target kind (~pod~ or ~deployment~) and target name.
+- Toggle follow mode.
+- Configure log limits with ~--tail~ and/or ~--since~.
+- Create and apply named presets (similar to ~aws-logs~ presets).
+- Render logs in ~json-log-viewer~ for fold/narrow/filter workflows.
+
+** File
+
+- ~kube-logs.el~
+
+** Installation
+
+Put ~kube-logs.el~ and ~json-log-viewer.el~ on your ~load-path~.
+
+** use-package example
+
+#+begin_src emacs-lisp
+(use-package kube-logs
+  :load-path "~/dev/emacs/aws-logs.el"
+  :commands (kube-logs)
+  :custom
+  (kube-logs-kubectl "kubectl")
+  (kube-logs-default-context "dev-cluster")
+  (kube-logs-default-namespace "payments")
+  (kube-logs-default-target-kind "deployment")
+  (kube-logs-default-namespace-enabled t)
+  (kube-logs-default-follow t)
+  (kube-logs-default-tail-lines 300)
+  :config
+  (kube-logs-make-preset
+   "prod-api"
+   :context "prod-cluster"
+   :namespace "payments"
+   :namespace-enabled t
+   :target-kind "deployment"
+   :target "payments-api"
+   :follow t
+   :tail-lines 500
+   :since "20m"))
+#+end_src
+
+** Presets
+
+~kube-logs-make-preset~ stores named presets in ~kube-logs-presets~.
+
+Supported keys:
+
+- ~:context~
+- ~:namespace~
+- ~:namespace-enabled~ (non-nil means pass explicit namespace)
+- ~:target-kind~ (\"pod\" or \"deployment\")
+- ~:target~
+- ~:follow~
+- ~:tail-lines~
+- ~:since~
+
+Apply behavior:
+
+- Key missing: keep current value.
+- Key present with ~nil~: clear value.
+- Key present with non-~nil~: set value.
+
+** Usage
+
+Run ~M-x kube-logs~.
+
+Main transient keys:
+
+- ~@~ apply preset
+- ~c~ context
+- ~n~ set namespace (also enables namespace override)
+- ~-n~ set namespace (same behavior as ~n~)
+- ~p~ select pod target
+- ~d~ select deployment target
+- ~-m~ tail lines
+- ~-s~ since
+- ~-f~ toggle follow
+- ~RET~ run logs
