@@ -431,12 +431,16 @@ Returns cons cell (ENTRIES . NEXT-ID)."
   (unless (functionp json-log-viewer--json-refresh-log-lines-function)
     (user-error "No JSON-line refresh function configured"))
   (let* ((old-lines (append json-log-viewer--raw-log-lines nil))
-         (new-lines (json-log-viewer--ensure-log-lines
-                     (funcall json-log-viewer--json-refresh-log-lines-function old-lines)
-                     "json-log-viewer refresh-function return value"))
-         (entries (mapcar json-log-viewer--line-to-entry-function new-lines)))
-    (setq json-log-viewer--raw-log-lines new-lines)
-    (list :entries entries :replace t)))
+         (refresh-value (funcall json-log-viewer--json-refresh-log-lines-function old-lines)))
+    (if (eq refresh-value :async)
+        ;; Async refresh function will mutate the buffer later.
+        (list :entries nil :replace nil)
+      (let* ((new-lines (json-log-viewer--ensure-log-lines
+                         refresh-value
+                         "json-log-viewer refresh-function return value"))
+             (entries (mapcar json-log-viewer--line-to-entry-function new-lines)))
+        (setq json-log-viewer--raw-log-lines new-lines)
+        (list :entries entries :replace t)))))
 
 (defun json-log-viewer--entry-signature (entry)
   "Return stable signature for ENTRY."

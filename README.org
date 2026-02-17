@@ -1,20 +1,44 @@
-#+title: aws-logs.el
+#+title: aws-logs.el repository
 
-~aws-logs.el~ provides an Emacs transient UI for AWS CloudWatch Logs tailing and Logs Insights queries.
+This repository contains two related Emacs Lisp packages:
 
-* Features
+- ~aws-logs~: transient-driven CloudWatch Logs tooling (tail + Logs Insights).
+- ~json-log-viewer~: generic foldable JSON log viewer used by ~aws-logs~ and usable standalone.
+
+* Package: aws-logs
+
+~aws-logs~ provides an Emacs transient UI for AWS CloudWatch Logs tailing and Logs Insights queries.
+
+** Features
 
 - Tail CloudWatch logs with profile/region/log-group controls.
 - Run Logs Insights queries and view foldable, formatted results.
 - Configure summary formatting (timestamp/level/message + optional extra fields).
-- Save reusable query snippets ("saved queries").
-- Define full option presets and apply them from the transient.
+- Save/load reusable query files from disk.
+- Define option presets and apply them from transient.
+- Non-blocking runtime paths for EXWM-friendly usage:
+  - Logs Insights run/refresh is asynchronous.
+  - ECS one-shot tail fetch is asynchronous.
+  - ECS follow mode batches UI pushes to reduce redraw churn.
 
-* Installation
+** Files
 
-Place ~aws-logs.el~, ~aws-logs-tail.el~, ~aws-logs-insights.el~, and ~aws-logs-query.el~ in your ~load-path~.
+- ~aws-logs.el~: transient UI, session state, presets, saved-query management.
+- ~aws-logs-query.el~: Logs Insights query major mode + popup editor.
+- ~aws-logs-insights.el~: asynchronous Insights execution and rendering.
+- ~aws-logs-tail.el~: tail execution (comint + ECS/json-log-viewer integration).
 
-* use-package Example
+** Installation
+
+Put these files on your ~load-path~:
+
+- ~aws-logs.el~
+- ~aws-logs-query.el~
+- ~aws-logs-insights.el~
+- ~aws-logs-tail.el~
+- ~json-log-viewer.el~
+
+** use-package example
 
 #+begin_src emacs-lisp
 (use-package aws-logs
@@ -32,8 +56,10 @@ Place ~aws-logs.el~, ~aws-logs-tail.el~, ~aws-logs-insights.el~, and ~aws-logs-q
   (aws-logs-default-summary-level-field "event.level")
   (aws-logs-default-summary-message-field "event.message")
   (aws-logs-default-summary-extra-fields '("event.service" "event.logger"))
+  ;; ECS follow batching (optional tuning for high-volume streams):
+  (aws-logs-tail-ecs-batch-flush-interval 0.08)
+  (aws-logs-tail-ecs-batch-max-lines 200)
   :config
-  ;; Option presets (used by transient key: @)
   (aws-logs-make-preset
    "prod-errors"
    :profile "prod-observability"
@@ -47,9 +73,9 @@ Place ~aws-logs.el~, ~aws-logs-tail.el~, ~aws-logs-insights.el~, and ~aws-logs-q
    :summary-extra-fields '("event.service" "event.logger")))
 #+end_src
 
-* Presets
+** Presets
 
-~aws-logs-make-preset~ stores a named preset in ~aws-logs-presets~.
+~aws-logs-make-preset~ stores named presets in ~aws-logs-presets~.
 
 Supported keys:
 
@@ -71,17 +97,130 @@ Apply behavior:
 - Key present with ~nil~: clear value.
 - Key present with non-~nil~: set value.
 
-If you define a preset with the same name again, it replaces the previous one.
+** Saved queries
 
-* Usage
+Saved queries are file-based. Use ~aws-logs-insights-saved-queries-directory~ to choose the directory.
+
+From transient:
+
+- ~q~ opens query submenu.
+- ~e~ edits active query.
+- ~s~ saves active query to file.
+- ~l~ loads a saved query file.
+
+** Usage
 
 Run ~M-x aws-logs~.
 
+Main transient keys:
+
 - ~@~ apply an options preset
 - ~q~ open query submenu
-- In query submenu: ~e~ edit active query, ~s~ save active query file, ~l~ load saved query file
-- ~f~ open formatting transient
-- ~t~ tail logs
+- ~f~ open formatting submenu
+- ~t~ run tail
 - ~l~ run Logs Insights
-- ~RET~ run DWIM (tail or insights depending on query)
+- ~RET~ DWIM (tail if no query, Insights when query is set)
 - ~-e~ toggle ECS JSON viewer for tail
+
+* Package: json-log-viewer
+
+~json-log-viewer~ is a generic, foldable JSON log viewer for Emacs.
+
+It is callback-driven, keeps runtime state buffer-local, and supports:
+
+- non-streaming mode (replace full dataset)
+- streaming mode (append new lines)
+
+** Quick API
+
+- ~json-log-viewer-make-buffer BUFFER-NAME &key ...~ -> create/initialize a viewer buffer.
+- ~json-log-viewer-get-buffer BUFFER-OR-NAME~ -> validate and return viewer buffer.
+- ~json-log-viewer-push BUFFER-OR-NAME LOG-LINES~ -> append JSON lines in streaming mode.
+- ~json-log-viewer-current-log-lines BUFFER-OR-NAME~ -> get current raw log lines.
+- ~json-log-viewer-replace-log-lines BUFFER-OR-NAME LOG-LINES &optional PRESERVE-FILTER~ -> replace full dataset.
+
+** Constructor
+
+#+begin_src emacs-lisp
+(json-log-viewer-make-buffer
+ "*My Logs*"
+ :log-lines '("{\"timestamp\":\"2026-02-17T10:00:00Z\",\"level\":\"info\",\"msg\":\"started\"}")
+ :timestamp-path "timestamp"
+ :level-path "level"
+ :message-path "msg"
+ :extra-paths '("meta.service" "meta.env")
+ :refresh-function (lambda (old-log-lines) old-log-lines)
+ :streaming nil
+ :direction 'newest-first
+ :header-lines-function (lambda (_state) (list (cons "Source" "demo"))))
+#+end_src
+
+Notes:
+
+- ~:log-lines~ is a list of JSON strings.
+- ~:refresh-function~ receives old raw lines and may return:
+  - a new full list of JSON strings (synchronous refresh), or
+  - the symbol ~:async~ (caller will update later via ~json-log-viewer-replace-log-lines~ or ~json-log-viewer-push~).
+- ~:streaming~ controls append semantics:
+  - ~nil~: non-streaming order follows ~:direction~.
+  - non-~nil~: pushes append to bottom.
+- The package does not call ~display-buffer~; caller controls window behavior.
+
+** Example: non-streaming
+
+#+begin_src emacs-lisp
+(let* ((all-lines
+        '("{\"timestamp\":\"2026-02-17T10:00:00Z\",\"level\":\"info\",\"msg\":\"a\"}"
+          "{\"timestamp\":\"2026-02-17T10:00:01Z\",\"level\":\"warn\",\"msg\":\"b\"}"))
+       (buf
+        (json-log-viewer-make-buffer
+         "*JSON Logs (Non-Streaming)*"
+         :log-lines all-lines
+         :timestamp-path "timestamp"
+         :level-path "level"
+         :message-path "msg"
+         :streaming nil
+         :direction 'newest-first
+         :refresh-function
+         (lambda (_old-lines)
+           (setq all-lines
+                 (append all-lines
+                         '("{\"timestamp\":\"2026-02-17T10:00:02Z\",\"level\":\"info\",\"msg\":\"c\"}")))
+           all-lines)
+         :header-lines-function
+         (lambda (_state)
+           (list (cons "Mode" "non-streaming demo"))))))
+  (display-buffer buf))
+#+end_src
+
+** Example: streaming
+
+#+begin_src emacs-lisp
+(let ((buf
+       (json-log-viewer-make-buffer
+        "*JSON Logs (Streaming)*"
+        :log-lines '("{\"timestamp\":\"2026-02-17T10:00:00Z\",\"level\":\"info\",\"msg\":\"first\"}")
+        :timestamp-path "timestamp"
+        :level-path "level"
+        :message-path "msg"
+        :streaming t
+        :header-lines-function
+        (lambda (_state)
+          (list (cons "Mode" "streaming demo"))))))
+  (display-buffer buf)
+  (json-log-viewer-push
+   buf
+   '("{\"timestamp\":\"2026-02-17T10:00:01Z\",\"level\":\"warn\",\"msg\":\"second\"}"
+     "{\"timestamp\":\"2026-02-17T10:00:02Z\",\"level\":\"info\",\"msg\":\"third\"}")))
+#+end_src
+
+** Keybindings
+
+Inside ~json-log-viewer-mode~:
+
+- ~TAB~: toggle current entry
+- ~S-TAB~: toggle all entries
+- ~C-c C-r~: refresh (when ~:refresh-function~ is configured)
+- ~C-c C-n~: narrow by substring
+- ~C-c C-w~: clear narrowing
+- ~q~: quit window

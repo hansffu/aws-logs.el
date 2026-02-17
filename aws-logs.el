@@ -103,6 +103,14 @@ Set to nil to always allow live updates."
   :type 'number
   :group 'aws-logs)
 
+(defcustom aws-logs-insights-refresh-overlap-seconds 2
+  "Seconds of overlap used for incremental Insights refresh windows.
+
+Using a small overlap helps catch late-ingested events. Duplicate rows are
+filtered by signature before rendering."
+  :type 'integer
+  :group 'aws-logs)
+
 (defcustom aws-logs-default-follow nil
   "Default value for `aws-logs-follow`."
   :type 'boolean
