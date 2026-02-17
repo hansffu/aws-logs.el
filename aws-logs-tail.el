@@ -26,6 +26,8 @@
 (defvar aws-logs-ecs)
 (defvar aws-logs-time-range)
 (defvar aws-logs-custom-time-range)
+(defvar aws-logs-tail-ecs-batch-flush-interval)
+(defvar aws-logs-tail-ecs-batch-max-lines)
 (defvar aws-logs-mode-hook)
 
 (declare-function aws-logs--list-log-groups "aws-logs" ())
@@ -38,6 +40,18 @@
 
 (defvar-local aws-logs--tail-pending-json-lines nil
   "Accumulated multiline JSON payload lines for ECS streaming buffers.")
+
+(defvar-local aws-logs--tail-pending-viewer-lines nil
+  "Queued normalized ECS lines waiting to be pushed into json-log-viewer.")
+
+(defvar-local aws-logs--tail-pending-viewer-count 0
+  "Count of queued lines waiting to be pushed into json-log-viewer.")
+
+(defvar-local aws-logs--tail-flush-timer nil
+  "Timer used to batch ECS viewer pushes for streaming buffers.")
+
+(defvar-local aws-logs--tail-once-output-buffer nil
+  "Temporary process output buffer used by async ECS one-shot tail.")
 
 (defvar aws-logs-mode-map
   (let ((map (make-sparse-keymap)))
@@ -55,12 +69,8 @@
 (defun aws-logs-tail-quit-process-and-window ()
   "Stop the current tail process (if any) and close the window."
   (interactive)
-  (let ((proc (or aws-logs--tail-process
-                  (get-buffer-process (current-buffer)))))
-    (when (process-live-p proc)
-      (delete-process proc))
-    (setq aws-logs--tail-process nil)
-    (quit-window t)))
+  (aws-logs--tail-kill-buffer-process (current-buffer))
+  (quit-window t))
 
 (defun aws-logs--tail-global-args ()
   "Build common AWS CLI arguments from current backing fields."
@@ -241,13 +251,19 @@ Returns (NORMALIZED-LINES . NEW-PENDING)."
   "Stop live process associated with BUFFER, if any."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
+      (aws-logs--tail-ecs-cancel-flush-timer)
       (let ((proc (or aws-logs--tail-process
                       (get-buffer-process buffer))))
         (when (process-live-p proc)
           (delete-process proc))
         (setq aws-logs--tail-process nil)
         (setq aws-logs--tail-pending-fragment "")
-        (setq aws-logs--tail-pending-json-lines nil)))))
+        (setq aws-logs--tail-pending-json-lines nil)
+        (setq aws-logs--tail-pending-viewer-lines nil)
+        (setq aws-logs--tail-pending-viewer-count 0)
+        (when (buffer-live-p aws-logs--tail-once-output-buffer)
+          (kill-buffer aws-logs--tail-once-output-buffer))
+        (setq aws-logs--tail-once-output-buffer nil)))))
 
 (defun aws-logs--tail-make-ecs-buffer (initial-lines streaming)
   "Create ECS viewer buffer from INITIAL-LINES.
@@ -272,6 +288,10 @@ When STREAMING is non-nil, buffer is configured for incremental pushes."
       (setq-local aws-logs--tail-process nil)
       (setq-local aws-logs--tail-pending-fragment "")
       (setq-local aws-logs--tail-pending-json-lines nil)
+      (setq-local aws-logs--tail-pending-viewer-lines nil)
+      (setq-local aws-logs--tail-pending-viewer-count 0)
+      (setq-local aws-logs--tail-flush-timer nil)
+      (setq-local aws-logs--tail-once-output-buffer nil)
       (aws-logs--tail-install-viewer-keymap))
     buffer))
 
@@ -285,6 +305,52 @@ When STREAMING is non-nil, buffer is configured for incremental pushes."
     (setq aws-logs--tail-pending-fragment (or rest ""))
     complete-lines))
 
+(defun aws-logs--tail-ecs-cancel-flush-timer ()
+  "Cancel pending ECS batch flush timer in current buffer."
+  (when (timerp aws-logs--tail-flush-timer)
+    (cancel-timer aws-logs--tail-flush-timer))
+  (setq aws-logs--tail-flush-timer nil))
+
+(defun aws-logs--tail-ecs-flush-queued-lines ()
+  "Flush queued ECS lines to json-log-viewer in one batch."
+  (when (> aws-logs--tail-pending-viewer-count 0)
+    (let ((lines (prog1 aws-logs--tail-pending-viewer-lines
+                   (setq aws-logs--tail-pending-viewer-lines nil)
+                   (setq aws-logs--tail-pending-viewer-count 0))))
+      (when lines
+        (json-log-viewer-push (current-buffer) lines)))))
+
+(defun aws-logs--tail-ecs-schedule-flush ()
+  "Schedule delayed ECS queue flush for current buffer."
+  (unless (timerp aws-logs--tail-flush-timer)
+    (let ((buffer (current-buffer))
+          (delay (max 0 (or aws-logs-tail-ecs-batch-flush-interval 0))))
+      (setq aws-logs--tail-flush-timer
+            (run-at-time
+             delay nil
+             (lambda ()
+               (when (buffer-live-p buffer)
+                 (with-current-buffer buffer
+                   (setq aws-logs--tail-flush-timer nil)
+                   (aws-logs--tail-ecs-flush-queued-lines)))))))))
+
+(defun aws-logs--tail-ecs-enqueue-lines (lines &optional flush-now)
+  "Queue normalized ECS LINES for batch push.
+
+When FLUSH-NOW is non-nil, flush immediately."
+  (when lines
+    (setq aws-logs--tail-pending-viewer-lines
+          (append aws-logs--tail-pending-viewer-lines lines))
+    (setq aws-logs--tail-pending-viewer-count
+          (+ aws-logs--tail-pending-viewer-count (length lines)))
+    (if (or flush-now
+            (>= aws-logs--tail-pending-viewer-count
+                (max 1 (or aws-logs-tail-ecs-batch-max-lines 1))))
+        (progn
+          (aws-logs--tail-ecs-cancel-flush-timer)
+          (aws-logs--tail-ecs-flush-queued-lines))
+      (aws-logs--tail-ecs-schedule-flush))))
+
 (defun aws-logs--tail-ecs-process-filter (process output)
   "Push ECS PROCESS OUTPUT into json-log-viewer incrementally."
   (let ((buffer (process-buffer process)))
@@ -293,7 +359,7 @@ When STREAMING is non-nil, buffer is configured for incremental pushes."
         (let* ((raw-lines (aws-logs--tail-consume-chunk-lines output))
                (lines (aws-logs--tail-ecs-normalize-lines raw-lines)))
           (when lines
-            (json-log-viewer-push buffer lines)))))))
+            (aws-logs--tail-ecs-enqueue-lines lines)))))))
 
 (defun aws-logs--tail-ecs-flush-pending-line ()
   "Flush buffered trailing ECS line in current viewer buffer."
@@ -303,9 +369,11 @@ When STREAMING is non-nil, buffer is configured for incremental pushes."
                   (list aws-logs--tail-pending-fragment))))
       (setq aws-logs--tail-pending-fragment "")
       (when lines
-        (json-log-viewer-push (current-buffer) lines))))
+        (aws-logs--tail-ecs-enqueue-lines lines))))
   (when-let ((pending-json (aws-logs--tail-flush-pending-json-lines)))
-    (json-log-viewer-push (current-buffer) (list pending-json))))
+    (aws-logs--tail-ecs-enqueue-lines (list pending-json)))
+  (aws-logs--tail-ecs-cancel-flush-timer)
+  (aws-logs--tail-ecs-flush-queued-lines))
 
 (defun aws-logs--tail-ecs-process-sentinel (process event)
   "Handle ECS PROCESS lifecycle EVENT updates."
@@ -339,17 +407,53 @@ When STREAMING is non-nil, buffer is configured for incremental pushes."
       (message "Started logs tail for %s" aws-logs-log-group))))
 
 (defun aws-logs--tail-run-ecs-once ()
-  "Run ECS tail once and render in json-log-viewer."
-  (let* ((args (append (aws-logs--tail-global-args) (aws-logs--tail-args)))
-         (raw-lines (aws-logs--tail-collect-output-lines args))
-         (normalized+pending (aws-logs--tail-ecs-normalize-lines-with-pending raw-lines nil))
-         (lines (car normalized+pending)))
-    (when-let ((pending (cdr normalized+pending))
-               (joined (and pending (string-join pending "\n"))))
-      (setq lines (append lines (list joined))))
-    (let ((buffer (aws-logs--tail-make-ecs-buffer lines nil)))
-      (display-buffer buffer)
-      (message "Fetched logs tail for %s" aws-logs-log-group))))
+  "Run ECS tail once asynchronously and render in json-log-viewer."
+  (let* ((buffer (aws-logs--tail-make-ecs-buffer nil nil))
+         (args (append (aws-logs--tail-global-args) (aws-logs--tail-args)))
+         (output-buffer (generate-new-buffer " *aws-logs-tail-once*"))
+         (log-group aws-logs-log-group))
+    (with-current-buffer buffer
+      (setq-local aws-logs--tail-once-output-buffer output-buffer))
+    (display-buffer buffer)
+    (message "Fetching logs tail for %s..." log-group)
+    (let ((process
+           (make-process
+            :name (aws-logs--tail-process-name)
+            :buffer output-buffer
+            :command (cons aws-logs-cli args)
+            :noquery t
+            :connection-type 'pipe
+            :sentinel
+            (lambda (proc event)
+              (when (memq (process-status proc) '(exit signal))
+                (let ((exit-code (process-exit-status proc))
+                      (output (with-current-buffer output-buffer (buffer-string))))
+                  (unwind-protect
+                      (when (buffer-live-p buffer)
+                        (with-current-buffer buffer
+                          (when (eq aws-logs--tail-process proc)
+                            (setq aws-logs--tail-process nil))
+                          (when (eq aws-logs--tail-once-output-buffer output-buffer)
+                            (setq aws-logs--tail-once-output-buffer nil))
+                          (if (zerop exit-code)
+                              (let* ((raw-lines (split-string output "\n" t))
+                                     (normalized+pending
+                                      (aws-logs--tail-ecs-normalize-lines-with-pending raw-lines nil))
+                                     (lines (car normalized+pending)))
+                                (when-let ((pending (cdr normalized+pending))
+                                           (joined (and pending (string-join pending "\n"))))
+                                  (setq lines (append lines (list joined))))
+                                (json-log-viewer-replace-log-lines buffer lines nil)
+                                (message "Fetched logs tail for %s" log-group))
+                            (message "AWS logs tail failed (%s): %s"
+                                     exit-code
+                                     (if (string-empty-p (string-trim output))
+                                         (string-trim event)
+                                       (string-trim output))))))
+                    (kill-buffer output-buffer))))))))
+      (set-process-query-on-exit-flag process nil)
+      (with-current-buffer buffer
+        (setq-local aws-logs--tail-process process)))))
 
 (defun aws-logs--tail-run-ecs-stream ()
   "Run ECS tail in follow mode and stream lines into json-log-viewer."
@@ -361,6 +465,9 @@ When STREAMING is non-nil, buffer is configured for incremental pushes."
       (setq-local aws-logs--tail-process process)
       (setq-local aws-logs--tail-pending-fragment "")
       (setq-local aws-logs--tail-pending-json-lines nil)
+      (setq-local aws-logs--tail-pending-viewer-lines nil)
+      (setq-local aws-logs--tail-pending-viewer-count 0)
+      (setq-local aws-logs--tail-flush-timer nil)
       (display-buffer buffer))
     (set-process-filter process #'aws-logs--tail-ecs-process-filter)
     (set-process-sentinel process #'aws-logs--tail-ecs-process-sentinel)

@@ -72,6 +72,24 @@
 (defvar-local aws-logs--insights-extra-paths nil
   "Synthetic extra summary paths used by the viewer for this buffer.")
 
+(defvar-local aws-logs--insights-active-request-id 0
+  "Monotonic request id for current buffer's async Insights lifecycle.")
+
+(defvar-local aws-logs--insights-request-in-flight nil
+  "Non-nil when an async Insights request is running for this buffer.")
+
+(defvar-local aws-logs--insights-active-process nil
+  "Current active AWS CLI process for this buffer's async Insights request.")
+
+(defvar-local aws-logs--insights-active-timer nil
+  "Current poll timer for this buffer's async Insights request.")
+
+(defconst aws-logs--insights-max-polls 120
+  "Maximum number of async poll attempts for one Insights query.")
+
+(defconst aws-logs--insights-poll-delay 1
+  "Seconds between async poll attempts for one Insights query.")
+
 (defun aws-logs--insights-global-args ()
   "Build common AWS CLI arguments from current backing fields."
   (delq nil
@@ -133,56 +151,144 @@ Returns nil when TIME-RANGE cannot be parsed."
             :end end
             :last-end end))))
 
-(defun aws-logs--insights-call-cli-json (&rest args)
-  "Run AWS CLI with ARGS and parse JSON result."
-  (with-temp-buffer
-    (let ((exit-code (apply #'call-process aws-logs-cli nil t nil args))
-          (output (string-trim (buffer-string))))
-      (unless (zerop exit-code)
-        (user-error "AWS CLI failed (%s): %s" exit-code output))
-      (condition-case _err
-          (json-parse-string output :object-type 'alist)
+(defun aws-logs--insights-cancel-active-request ()
+  "Cancel active async request state in the current buffer."
+  (when (timerp aws-logs--insights-active-timer)
+    (cancel-timer aws-logs--insights-active-timer))
+  (setq aws-logs--insights-active-timer nil)
+  (when (process-live-p aws-logs--insights-active-process)
+    (delete-process aws-logs--insights-active-process))
+  (setq aws-logs--insights-active-process nil)
+  (setq aws-logs--insights-request-in-flight nil))
+
+(defun aws-logs--insights-begin-request ()
+  "Start a new async Insights request in the current buffer.
+
+Returns the new request id."
+  (aws-logs--insights-cancel-active-request)
+  (setq aws-logs--insights-active-request-id (1+ aws-logs--insights-active-request-id))
+  (setq aws-logs--insights-request-in-flight t)
+  aws-logs--insights-active-request-id)
+
+(defun aws-logs--insights-finish-request (request-id)
+  "Mark REQUEST-ID as finished in the current buffer."
+  (when (= request-id aws-logs--insights-active-request-id)
+    (when (timerp aws-logs--insights-active-timer)
+      (cancel-timer aws-logs--insights-active-timer))
+    (setq aws-logs--insights-active-timer nil)
+    (setq aws-logs--insights-active-process nil)
+    (setq aws-logs--insights-request-in-flight nil)))
+
+(defun aws-logs--insights-call-cli-json-async (buffer request-id args on-success on-error)
+  "Run AWS CLI ARGS asynchronously and parse JSON into ON-SUCCESS.
+
+BUFFER scopes request ownership. REQUEST-ID must match current buffer request.
+ON-ERROR is called with one string argument."
+  (when (buffer-live-p buffer)
+    (let ((output-buffer (generate-new-buffer " *aws-logs-insights-cli*")))
+      (condition-case err
+          (let ((process
+                 (make-process
+                  :name (format "aws-logs-insights:%d" request-id)
+                  :buffer output-buffer
+                  :command (cons aws-logs-cli args)
+                  :noquery t
+                  :connection-type 'pipe
+                  :sentinel
+                  (lambda (proc _event)
+                    (when (memq (process-status proc) '(exit signal))
+                      (let ((exit-code (process-exit-status proc))
+                            (output (with-current-buffer output-buffer
+                                      (string-trim (buffer-string)))))
+                        (unwind-protect
+                            (when (buffer-live-p buffer)
+                              (with-current-buffer buffer
+                                (when (and (= request-id aws-logs--insights-active-request-id)
+                                           (eq proc aws-logs--insights-active-process))
+                                  (setq aws-logs--insights-active-process nil))
+                                (when (and aws-logs--insights-request-in-flight
+                                           (= request-id aws-logs--insights-active-request-id))
+                                  (if (zerop exit-code)
+                                      (condition-case _parse-err
+                                          (funcall on-success
+                                                   (json-parse-string output :object-type 'alist))
+                                        (error
+                                         (funcall on-error
+                                                  (format "Failed to parse AWS CLI JSON output: %s"
+                                                          (if (string-empty-p output)
+                                                              "empty output"
+                                                            output)))))
+                                    (funcall on-error
+                                             (format "AWS CLI failed (%s): %s"
+                                                     exit-code
+                                                     (if (string-empty-p output)
+                                                         "no output"
+                                                       output)))))))
+                          (kill-buffer output-buffer))))))))
+            (set-process-query-on-exit-flag process nil)
+            (with-current-buffer buffer
+              (when (= request-id aws-logs--insights-active-request-id)
+                (setq aws-logs--insights-active-process process)))
+            process)
         (error
-         (user-error "Failed to parse AWS CLI JSON output: %s" output))))))
+         (kill-buffer output-buffer)
+         (funcall on-error
+                  (format "Failed to start AWS CLI process: %s"
+                          (error-message-string err))))))))
 
-(defun aws-logs--wait-for-insights-results (query-id)
-  "Poll get-query-results for QUERY-ID until complete."
-  (let ((max-polls 120)
-        (poll-delay 1)
-        (poll-count 0)
-        payload
-        status)
-    (while (< poll-count max-polls)
-      (setq payload (apply #'aws-logs--insights-call-cli-json
-                           (append (aws-logs--insights-global-args)
-                                   (list "logs" "get-query-results"
-                                         "--query-id" query-id))))
-      (setq status (alist-get 'status payload))
-      (cond
-       ((string= status "Complete")
-        (setq poll-count max-polls))
-       ((member status '("Scheduled" "Running" "Unknown"))
-        (setq poll-count (1+ poll-count))
-        (sleep-for poll-delay))
-       (t
-        (user-error "Insights query did not complete: %s" status))))
-    (if (string= status "Complete")
-        payload
-      (user-error "Timed out waiting for Insights query results"))))
+(defun aws-logs--insights-poll-query-results-async (buffer request-id query-id poll-count on-success on-error)
+  "Poll get-query-results for QUERY-ID asynchronously."
+  (if (>= poll-count aws-logs--insights-max-polls)
+      (funcall on-error "Timed out waiting for Insights query results")
+    (aws-logs--insights-call-cli-json-async
+     buffer request-id
+     (append (aws-logs--insights-global-args)
+             (list "logs" "get-query-results" "--query-id" query-id))
+     (lambda (payload)
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (when (and aws-logs--insights-request-in-flight
+                      (= request-id aws-logs--insights-active-request-id))
+             (let ((status (alist-get 'status payload)))
+               (cond
+                ((string= status "Complete")
+                 (funcall on-success query-id payload))
+                ((member status '("Scheduled" "Running" "Unknown"))
+                 (setq aws-logs--insights-active-timer
+                       (run-at-time
+                        aws-logs--insights-poll-delay nil
+                        (lambda ()
+                          (when (buffer-live-p buffer)
+                            (with-current-buffer buffer
+                              (when (= request-id aws-logs--insights-active-request-id)
+                                (setq aws-logs--insights-active-timer nil)
+                                (aws-logs--insights-poll-query-results-async
+                                 buffer request-id query-id (1+ poll-count) on-success on-error))))))))
+                (t
+                 (funcall on-error
+                          (format "Insights query did not complete: %s" status)))))))))
+     on-error)))
 
-(defun aws-logs--insights-run-query-window (start-time end-time)
-  "Run Insights query for START-TIME..END-TIME and return (QUERY-ID . PAYLOAD)."
-  (let* ((start-payload (apply #'aws-logs--insights-call-cli-json
-                               (append
-                                (aws-logs--insights-global-args)
-                                (list "logs" "start-query"
-                                      "--log-group-name" aws-logs-log-group
-                                      "--start-time" (number-to-string start-time)
-                                      "--end-time" (number-to-string end-time)
-                                      "--query-string" aws-logs-query))))
-         (query-id (alist-get 'queryId start-payload))
-         (results (aws-logs--wait-for-insights-results query-id)))
-    (cons query-id results)))
+(defun aws-logs--insights-run-query-window-async (buffer request-id start-time end-time on-success on-error)
+  "Run async Insights query for START-TIME..END-TIME.
+
+ON-SUCCESS is called with (QUERY-ID PAYLOAD)."
+  (aws-logs--insights-call-cli-json-async
+   buffer request-id
+   (append (aws-logs--insights-global-args)
+           (list "logs" "start-query"
+                 "--log-group-name" aws-logs-log-group
+                 "--start-time" (number-to-string start-time)
+                 "--end-time" (number-to-string end-time)
+                 "--query-string" aws-logs-query))
+   (lambda (start-payload)
+     (let ((query-id (alist-get 'queryId start-payload)))
+       (if (and query-id (stringp query-id))
+           (aws-logs--insights-poll-query-results-async
+            buffer request-id query-id 0 on-success on-error)
+         (funcall on-error
+                  (format "Missing queryId from start-query response: %S" start-payload)))))
+   on-error))
 
 (defconst aws-logs--insights-timestamp-candidates
   '("@timestamp" "timestamp" "time" "ts"
@@ -421,52 +527,110 @@ Returns nil when TIME-RANGE cannot be parsed."
                       (or aws-logs--insights-start-time "-")
                       (or aws-logs--insights-end-time "-")))))
 
-(defun aws-logs--insights-refresh-log-lines (old-log-lines)
-  "Refresh callback for the Insights viewer.
+(defun aws-logs--insights-rows->viewer-lines (rows)
+  "Convert Insights ROWS into viewer JSON lines for current buffer."
+  (mapcar #'aws-logs--insights-row->viewer-line rows))
 
-OLD-LOG-LINES is the current list of raw viewer lines."
-  (unless aws-logs--insights-refresh-context
-    (user-error "Missing Insights refresh context in buffer"))
+(defun aws-logs--insights-reset-seen-signatures (rows)
+  "Reset row signature cache from ROWS in current buffer."
+  (setq aws-logs--insights-seen-signatures (make-hash-table :test 'equal))
+  (dolist (row rows)
+    (puthash (aws-logs--insights-row-signature row) t aws-logs--insights-seen-signatures)))
+
+(defun aws-logs--insights-apply-replace-result (query-id start-time end-time payload)
+  "Replace viewer content from PAYLOAD and update header metadata."
+  (let* ((rows (append (alist-get 'results payload) nil))
+         (lines (aws-logs--insights-rows->viewer-lines rows)))
+    (setq aws-logs--insights-query-id query-id)
+    (setq aws-logs--insights-start-time start-time)
+    (setq aws-logs--insights-end-time end-time)
+    (aws-logs--insights-reset-seen-signatures rows)
+    (json-log-viewer-replace-log-lines (current-buffer) lines t)))
+
+(defun aws-logs--insights-apply-since-result (query-id refresh-end payload)
+  "Append unseen rows from PAYLOAD and advance since-window to REFRESH-END."
   (unless aws-logs--insights-seen-signatures
     (setq aws-logs--insights-seen-signatures (make-hash-table :test 'equal)))
-  (pcase (plist-get aws-logs--insights-refresh-context :mode)
-    ('since
-     (let* ((refresh-start (plist-get aws-logs--insights-refresh-context :last-end))
-            (refresh-end (floor (float-time)))
-            (refresh-result (aws-logs--insights-run-query-window refresh-start refresh-end))
-            (refresh-query-id (car refresh-result))
-            (refresh-payload (cdr refresh-result))
-            (refresh-rows (append (alist-get 'results refresh-payload) nil))
-            unseen-rows)
-       (dolist (row refresh-rows)
-         (let ((sig (aws-logs--insights-row-signature row)))
-           (unless (gethash sig aws-logs--insights-seen-signatures)
-             (puthash sig t aws-logs--insights-seen-signatures)
-             (push row unseen-rows))))
-       (setq unseen-rows (nreverse unseen-rows))
-       (setq aws-logs--insights-query-id refresh-query-id)
-       (setq aws-logs--insights-end-time refresh-end)
-       (setq aws-logs--insights-refresh-context
-             (plist-put (copy-sequence aws-logs--insights-refresh-context)
-                        :last-end refresh-end))
-       (append old-log-lines (mapcar #'aws-logs--insights-row->viewer-line unseen-rows))))
-    ('custom-range
-     (let* ((refresh-start (plist-get aws-logs--insights-refresh-context :start))
-            (refresh-end (plist-get aws-logs--insights-refresh-context :end))
-            (refresh-result (aws-logs--insights-run-query-window refresh-start refresh-end))
-            (refresh-query-id (car refresh-result))
-            (refresh-payload (cdr refresh-result))
-            (refresh-rows (append (alist-get 'results refresh-payload) nil)))
-       (setq aws-logs--insights-query-id refresh-query-id)
-       (setq aws-logs--insights-start-time refresh-start)
-       (setq aws-logs--insights-end-time refresh-end)
-       (clrhash aws-logs--insights-seen-signatures)
-       (dolist (row refresh-rows)
-         (puthash (aws-logs--insights-row-signature row) t aws-logs--insights-seen-signatures))
-       (mapcar #'aws-logs--insights-row->viewer-line refresh-rows)))
-    (_
-     (user-error "Unknown refresh mode: %S"
-                 (plist-get aws-logs--insights-refresh-context :mode)))))
+  (let* ((rows (append (alist-get 'results payload) nil))
+         unseen-rows)
+    (dolist (row rows)
+      (let ((sig (aws-logs--insights-row-signature row)))
+        (unless (gethash sig aws-logs--insights-seen-signatures)
+          (puthash sig t aws-logs--insights-seen-signatures)
+          (push row unseen-rows))))
+    (setq unseen-rows (nreverse unseen-rows))
+    (setq aws-logs--insights-query-id query-id)
+    (setq aws-logs--insights-end-time refresh-end)
+    (setq aws-logs--insights-refresh-context
+          (plist-put (copy-sequence aws-logs--insights-refresh-context)
+                     :last-end refresh-end))
+    (if unseen-rows
+        (let* ((new-lines (aws-logs--insights-rows->viewer-lines unseen-rows))
+               (old-lines (json-log-viewer-current-log-lines (current-buffer))))
+          (json-log-viewer-replace-log-lines
+           (current-buffer)
+           (append old-lines new-lines)
+           t))
+      ;; Keep header metadata in sync when no rows were appended.
+      (json-log-viewer--refresh-header))))
+
+(defun aws-logs--insights-run-window-async (buffer start-time end-time on-success)
+  "Run async Insights query in BUFFER for START-TIME..END-TIME."
+  (with-current-buffer buffer
+    (let* ((request-id (aws-logs--insights-begin-request))
+           (log-group aws-logs--insights-log-group))
+      (aws-logs--insights-run-query-window-async
+       buffer request-id start-time end-time
+       (lambda (query-id payload)
+         (when (buffer-live-p buffer)
+           (with-current-buffer buffer
+             (when (= request-id aws-logs--insights-active-request-id)
+               (funcall on-success query-id payload)
+               (aws-logs--insights-finish-request request-id)
+               (message "Insights query completed for %s" log-group)))))
+       (lambda (err-msg)
+         (when (buffer-live-p buffer)
+           (with-current-buffer buffer
+             (when (= request-id aws-logs--insights-active-request-id)
+               (aws-logs--insights-finish-request request-id)
+               (message "Insights query failed for %s: %s" log-group err-msg)))))))))
+
+(defun aws-logs--insights-start-refresh-async (buffer)
+  "Start async refresh flow for existing Insights BUFFER."
+  (with-current-buffer buffer
+    (unless aws-logs--insights-refresh-context
+      (user-error "Missing Insights refresh context in buffer"))
+    (when aws-logs--insights-request-in-flight
+      (message "Insights refresh already in progress for %s" aws-logs--insights-log-group))
+    (unless aws-logs--insights-request-in-flight
+      (pcase (plist-get aws-logs--insights-refresh-context :mode)
+        ('since
+         (let* ((refresh-start (plist-get aws-logs--insights-refresh-context :last-end))
+                (refresh-end (floor (float-time))))
+           (if (<= refresh-end refresh-start)
+               (message "Insights refresh skipped for %s (no new time window)"
+                        aws-logs--insights-log-group)
+             (aws-logs--insights-run-window-async
+              buffer refresh-start refresh-end
+              (lambda (query-id payload)
+                (aws-logs--insights-apply-since-result query-id refresh-end payload))))))
+        ('custom-range
+         (let* ((refresh-start (plist-get aws-logs--insights-refresh-context :start))
+                (refresh-end (plist-get aws-logs--insights-refresh-context :end)))
+           (aws-logs--insights-run-window-async
+            buffer refresh-start refresh-end
+            (lambda (query-id payload)
+              (aws-logs--insights-apply-replace-result
+               query-id refresh-start refresh-end payload)))))
+        (_
+         (user-error "Unknown refresh mode: %S"
+                     (plist-get aws-logs--insights-refresh-context :mode)))))))
+
+(defun aws-logs--insights-refresh-dispatch (_state)
+  "Kick off async Insights refresh from json-log-viewer callback."
+  (aws-logs--insights-start-refresh-async (current-buffer))
+  ;; No synchronous data mutation; async callback updates the buffer when ready.
+  (list :entries nil :replace nil))
 
 (defun aws-logs-insights-refresh ()
   "Refresh current Insights viewer buffer."
@@ -474,7 +638,7 @@ OLD-LOG-LINES is the current list of raw viewer lines."
   (json-log-viewer-refresh))
 
 (defun aws-logs-insights-run ()
-  "Run Logs Insights query and display formatted results."
+  "Run Logs Insights query asynchronously and display formatted results."
   (unless (and aws-logs-log-group (not (string-empty-p aws-logs-log-group)))
     (user-error "Select a log group first"))
   (unless (and aws-logs-query (not (string-empty-p aws-logs-query)))
@@ -482,45 +646,43 @@ OLD-LOG-LINES is the current list of raw viewer lines."
   (let* ((refresh-context (aws-logs--insights-window-context))
          (start-time (plist-get refresh-context :start))
          (end-time (plist-get refresh-context :end))
-         (result (aws-logs--insights-run-query-window start-time end-time))
-         (query-id (car result))
-         (payload (cdr result))
-         (rows (append (alist-get 'results payload) nil))
          (extra-fields (append aws-logs-summary-extra-fields nil))
          (extra-paths (aws-logs--insights-extra-summary-paths extra-fields))
-         (initial-lines (mapcar (lambda (row)
-                                  (aws-logs--insights-row->json-line row extra-fields extra-paths))
-                                rows))
          (buffer-name (format "*AWS insights - %s*" aws-logs-log-group))
          (buffer
           (json-log-viewer-make-buffer
            buffer-name
-           :log-lines initial-lines
+           :log-lines nil
            :timestamp-path "__summary_timestamp"
            :level-path "__summary_level"
            :message-path "__summary_message"
            :extra-paths extra-paths
-           :refresh-function #'aws-logs--insights-refresh-log-lines
+           :refresh-function #'aws-logs--insights-refresh-dispatch
            :streaming nil
            :direction 'newest-first
            :header-lines-function #'aws-logs--insights-header-lines
            :live-narrow-max-rows aws-logs-insights-live-narrow-max-rows
            :live-narrow-debounce aws-logs-insights-live-narrow-debounce)))
     (with-current-buffer buffer
+      (add-hook 'kill-buffer-hook #'aws-logs--insights-cancel-active-request nil t)
+      (aws-logs--insights-cancel-active-request)
       (setq-local aws-logs--insights-refresh-context (copy-sequence refresh-context))
-      (setq-local aws-logs--insights-query-id query-id)
+      (setq-local aws-logs--insights-query-id nil)
       (setq-local aws-logs--insights-start-time start-time)
       (setq-local aws-logs--insights-end-time end-time)
       (setq-local aws-logs--insights-log-group aws-logs-log-group)
       (setq-local aws-logs--insights-extra-fields extra-fields)
       (setq-local aws-logs--insights-extra-paths extra-paths)
       (setq-local aws-logs--insights-seen-signatures (make-hash-table :test 'equal))
-      (dolist (row rows)
-        (puthash (aws-logs--insights-row-signature row) t aws-logs--insights-seen-signatures))
       ;; Refresh header now that buffer-local header state is initialized.
       (json-log-viewer--refresh-header))
     (display-buffer buffer)
-    (message "Insights query completed for %s" aws-logs-log-group)))
+    (message "Insights query started for %s" aws-logs-log-group)
+    (aws-logs--insights-run-window-async
+     buffer start-time end-time
+     (lambda (query-id payload)
+       (with-current-buffer buffer
+         (aws-logs--insights-apply-replace-result query-id start-time end-time payload))))))
 
 (provide 'aws-logs-insights)
 ;;; aws-logs-insights.el ends here

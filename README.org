@@ -27,17 +27,12 @@ Place ~aws-logs.el~, ~aws-logs-tail.el~, ~aws-logs-insights.el~, and ~aws-logs-q
   (aws-logs-default-log-group "/aws/ecs/payments-api")
   (aws-logs-default-follow t)
   (aws-logs-default-since "20m")
+  (aws-logs-insights-saved-queries-directory
+   (expand-file-name "aws-logs/insights-queries/" user-emacs-directory))
   (aws-logs-default-summary-level-field "event.level")
   (aws-logs-default-summary-message-field "event.message")
   (aws-logs-default-summary-extra-fields '("event.service" "event.logger"))
   :config
-  ;; Saved queries (used by transient key: Q)
-  (setq aws-logs-insights-saved-queries
-        '(("Recent Errors"
-           . "fields @timestamp, @message | filter event.level = \"ERROR\" | sort @timestamp desc | limit 200")
-          ("Slow Requests"
-           . "fields @timestamp, latencyMs, route | filter latencyMs > 1000 | sort @timestamp desc | limit 100")))
-
   ;; Option presets (used by transient key: @)
   (aws-logs-make-preset
    "prod-errors"
@@ -83,7 +78,8 @@ If you define a preset with the same name again, it replaces the previous one.
 Run ~M-x aws-logs~.
 
 - ~@~ apply an options preset
-- ~Q~ apply a saved query
+- ~q~ open query submenu
+- In query submenu: ~e~ edit active query, ~s~ save active query file, ~l~ load saved query file
 - ~f~ open formatting transient
 - ~t~ tail logs
 - ~l~ run Logs Insights

@@ -987,5 +987,35 @@ BUFFER-OR-NAME must identify a live `json-log-viewer-mode` buffer created by
               (append json-log-viewer--raw-log-lines normalized-lines))
         (json-log-viewer-append-entries entries)))))
 
+(defun json-log-viewer-current-log-lines (buffer-or-name)
+  "Return a copy of current raw log lines from BUFFER-OR-NAME."
+  (let ((target (json-log-viewer-get-buffer buffer-or-name)))
+    (with-current-buffer target
+      (append json-log-viewer--raw-log-lines nil))))
+
+(defun json-log-viewer-replace-log-lines (buffer-or-name log-lines &optional preserve-filter)
+  "Replace raw LOG-LINES in BUFFER-OR-NAME.
+
+When PRESERVE-FILTER is non-nil, keep the current active filter."
+  (let ((target (json-log-viewer-get-buffer buffer-or-name)))
+    (with-current-buffer target
+      (unless (functionp json-log-viewer--line-to-entry-function)
+        (user-error "Replace is only supported for buffers created by json-log-viewer-make-buffer"))
+      (let* ((normalized-lines (json-log-viewer--ensure-log-lines
+                                log-lines "json-log-viewer-replace-log-lines"))
+             (entries+next
+              (if (eq json-log-viewer--line-to-entry-function #'json-log-viewer--json-line->entry)
+                  (json-log-viewer--json-lines->entries
+                   normalized-lines json-log-viewer--timestamp-path 0)
+                (let (entries)
+                  (dolist (line normalized-lines)
+                    (push (funcall json-log-viewer--line-to-entry-function line) entries))
+                  (cons (nreverse entries) json-log-viewer--next-entry-id))))
+             (entries (car entries+next))
+             (next-id (cdr entries+next)))
+        (setq json-log-viewer--raw-log-lines normalized-lines)
+        (setq json-log-viewer--next-entry-id next-id)
+        (json-log-viewer-replace-entries entries preserve-filter)))))
+
 (provide 'json-log-viewer)
 ;;; json-log-viewer.el ends here

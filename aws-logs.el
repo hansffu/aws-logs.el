@@ -20,6 +20,7 @@
 
 (require 'subr-x)
 (require 'transient)
+(require 'json)
 
 (require 'aws-logs-query)
 (require 'aws-logs-insights)
@@ -110,6 +111,16 @@ Set to nil to always allow live updates."
 (defcustom aws-logs-default-ecs nil
   "Default value for `aws-logs-ecs`."
   :type 'boolean
+  :group 'aws-logs)
+
+(defcustom aws-logs-tail-ecs-batch-flush-interval 0.08
+  "Idle seconds before flushing queued ECS follow lines to the viewer."
+  :type 'number
+  :group 'aws-logs)
+
+(defcustom aws-logs-tail-ecs-batch-max-lines 200
+  "Maximum queued ECS follow lines before forcing an immediate flush."
+  :type 'integer
   :group 'aws-logs)
 
 (defcustom aws-logs-default-since aws-logs-since
@@ -221,26 +232,38 @@ a property list as accepted by `aws-logs-make-preset`.")
       (aws-logs-insights-query-fontify-string aws-logs-query)
     "— (none)"))
 
-(defun aws-logs--command (&rest args)
-  "Build cli command with endpoint, region and ARGS."
-  (let ((endpoint (if aws-logs-endpoint (format "--endpoint-url=%s" aws-logs-endpoint) ""))
-        (region (format "--region=%s" aws-logs-region))
-        (profile (when aws-logs-profile (format "--profile=%s" aws-logs-profile))))
-    (string-join (delq nil (append (list aws-logs-cli endpoint region profile) args)) " ")))
+(defun aws-logs--global-args ()
+  "Build common AWS CLI global arguments from current backing fields."
+  (delq nil
+        (list
+         (when aws-logs-endpoint (format "--endpoint-url=%s" aws-logs-endpoint))
+         (format "--region=%s" aws-logs-region)
+         (when aws-logs-profile (format "--profile=%s" aws-logs-profile)))))
 
 (defun aws-logs--list-log-groups ()
-  "Return log group name for all log groups."
-  (let* ((result (with-temp-buffer
-                   (list :exit-status
-                         (call-process-shell-command (aws-logs--command "logs" "describe-log-groups") nil t)
-                         :output
-                         (buffer-string))))
-         (output (plist-get result :output))
-         (log-groups (alist-get 'logGroups (json-parse-string output :object-type 'alist) ))
-         )
-    (mapcar (lambda (log-group) (alist-get 'logGroupName log-group)) log-groups)
-    )
-  )
+  "Return list of CloudWatch log group names."
+  (with-temp-buffer
+    (let* ((args (append (aws-logs--global-args)
+                         (list "logs" "describe-log-groups")))
+           (exit-status (apply #'call-process aws-logs-cli nil t nil args))
+           (output (string-trim (buffer-string))))
+      (unless (zerop exit-status)
+        (user-error "AWS CLI failed (%s): %s"
+                    exit-status
+                    (if (string-empty-p output) "no output" output)))
+      (let* ((payload (condition-case _err
+                          (json-parse-string output :object-type 'alist)
+                        (error
+                         (user-error "Failed to parse `describe-log-groups` JSON output: %s"
+                                     (if (string-empty-p output) "empty output" output)))))
+             (log-groups (or (alist-get 'logGroups payload) nil)))
+        (unless (listp log-groups)
+          (user-error "Unexpected `describe-log-groups` response: missing `logGroups` list"))
+        (delq nil
+              (mapcar (lambda (log-group)
+                        (let ((name (alist-get 'logGroupName log-group)))
+                          (and (stringp name) name)))
+                      log-groups))))))
 
 (transient-define-infix aws-logs-infix-log-group ()
   :description "Log group"
@@ -528,7 +551,9 @@ Also persists the toggle by updating `aws-logs-default-ecs`."
   :class 'transient-option
   :init-value (lambda (obj) (transient-infix-set obj aws-logs-time-range))
   :reader (lambda (prompt initial hist)
-            (let ((val (read-string prompt initial hist)))
+            (let ((val (string-trim (read-string prompt initial hist))))
+              (when (string-empty-p val)
+                (user-error "Since / time range cannot be empty"))
               (setq aws-logs-time-range val)
               (setq aws-logs-custom-time-range nil)
               (aws-logs--transient-reprompt)
