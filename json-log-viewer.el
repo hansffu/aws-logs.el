@@ -240,24 +240,62 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
 
 (defun json-log-viewer--json-object-fields (parsed raw-line)
   "Build detail fields alist from PARSED JSON and RAW-LINE."
-  (cond
-   ((hash-table-p parsed)
-    (let (fields)
-      (maphash (lambda (key value)
-                 (push (cons (json-log-viewer--value->string key)
-                             (or (json-log-viewer--value->string value) ""))
-                       fields))
-               parsed)
-      (nreverse fields)))
-   ((json-log-viewer--alist-like-p parsed)
-    (mapcar (lambda (pair)
-              (cons (json-log-viewer--value->string (car pair))
-                    (or (json-log-viewer--value->string (cdr pair)) "")))
-            parsed))
-   (parsed
-    (list (cons "value" (or (json-log-viewer--value->string parsed) ""))))
-   (t
-    (list (cons "raw" (or raw-line ""))))))
+  (cl-labels
+      ((join-path (prefix part)
+         (if (and prefix (not (string-empty-p prefix)))
+             (concat prefix "." part)
+           part))
+       (flatten (node &optional prefix)
+         (cond
+          ((hash-table-p node)
+           (let (fields keys)
+             (maphash (lambda (key _value)
+                        (let ((k (json-log-viewer--value->string key)))
+                          (when k
+                            (push k keys))))
+                      node)
+             (setq keys (sort keys #'string-lessp))
+             (if (null keys)
+                 (when prefix (list (cons prefix "")))
+               (dolist (key keys)
+                 (setq fields
+                       (append fields
+                               (flatten (or (gethash key node)
+                                            (when-let ((sym (intern-soft key)))
+                                              (gethash sym node)))
+                                        (join-path prefix key)))))
+               fields)))
+          ((json-log-viewer--alist-like-p node)
+           (if (null node)
+               (when prefix (list (cons prefix "")))
+             (let (fields)
+               (dolist (pair node)
+                 (when (consp pair)
+                   (let ((k (json-log-viewer--value->string (car pair))))
+                     (when k
+                       (setq fields
+                             (append fields
+                                     (flatten (cdr pair) (join-path prefix k))))))))
+               fields)))
+          ((listp node)
+           (let ((base (or prefix "value")))
+             (if (null node)
+                 (list (cons base "[]"))
+               (let ((idx 0)
+                     fields)
+                 (dolist (item node)
+                   (setq fields
+                         (append fields
+                                 (flatten item (format "%s[%d]" base idx))))
+                   (setq idx (1+ idx)))
+                 fields))))
+          (t
+           (list (cons (or prefix "value")
+                       (or (json-log-viewer--value->string node) "")))))))
+    (let ((fields (and parsed (flatten parsed nil))))
+      (if fields
+          fields
+        (list (cons "raw" (or raw-line "")))))))
 
 (defun json-log-viewer--parse-time (value)
   "Return epoch seconds parsed from VALUE, or nil."
