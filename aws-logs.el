@@ -19,11 +19,11 @@
 ;;; Code:
 
 (require 'subr-x)
-(require 'comint)
 (require 'transient)
 
 (require 'aws-logs-query)
 (require 'aws-logs-insights)
+(require 'aws-logs-tail)
 
 (defcustom aws-logs-cli "aws"
   "The cli command for aws cli."
@@ -107,6 +107,11 @@ Set to nil to always allow live updates."
   :type 'boolean
   :group 'aws-logs)
 
+(defcustom aws-logs-default-ecs nil
+  "Default value for `aws-logs-ecs`."
+  :type 'boolean
+  :group 'aws-logs)
+
 (defcustom aws-logs-default-since aws-logs-since
   "Default time range used to initialize `aws-logs-time-range`."
   :type 'string
@@ -159,6 +164,9 @@ or nil when disabled.")
 (defvar aws-logs-follow aws-logs-default-follow
   "Non-nil means follow (tail) logs for this Emacs session.")
 
+(defvar aws-logs-ecs aws-logs-default-ecs
+  "Non-nil means render tail logs as ECS JSON in `json-log-viewer`.")
+
 (defvar aws-logs-time-range aws-logs-default-since
   "Selected time range (e.g. 10m) for this Emacs session.
 Used as --since for `aws logs tail`.")
@@ -175,7 +183,7 @@ Each element has the form (NAME . PLIST), where NAME is a string and PLIST is
 a property list as accepted by `aws-logs-make-preset`.")
 
 (defun aws-logs--transient-reprompt ()
-  "Refresh transient so UI reflects current backing fields." 
+  "Refresh transient so UI reflects current backing fields."
   (transient-quit-one)
   (transient-setup 'aws-logs-transient))
 
@@ -188,13 +196,9 @@ a property list as accepted by `aws-logs-make-preset`.")
 (declare-function aws-logs--insights-query-edit "aws-logs-query" (initial))
 (declare-function aws-logs-insights-query-mode "aws-logs-query")
 (declare-function aws-logs-insights-query-fontify-string "aws-logs-query" (query))
+(declare-function aws-logs-tail-run "aws-logs-tail" ())
 (declare-function org-read-date "org"
                   (&optional with-time to-time from-string prompt default-time default-input))
-(defvar aws-logs-mode-map
-  (let ((map (make-keymap)))
-    (define-key map "q" #'aws-logs-quit-process-and-window)
-    map)
-  "Keymap for aws-logs-mode.")
 
 (defun aws-logs--query ()
   "Return a one-line summary of `aws-logs-query` for display in transient."
@@ -217,15 +221,6 @@ a property list as accepted by `aws-logs-make-preset`.")
       (aws-logs-insights-query-fontify-string aws-logs-query)
     "— (none)"))
 
-(defun aws-logs-quit-process-and-window ()
-  "Quit current process and window."
-  (interactive)
-  (let ((proc (get-buffer-process (current-buffer))))
-    (when (process-live-p proc)
-      (delete-process proc))
-    (quit-window t)))
-
-
 (defun aws-logs--command (&rest args)
   "Build cli command with endpoint, region and ARGS."
   (let ((endpoint (if aws-logs-endpoint (format "--endpoint-url=%s" aws-logs-endpoint) ""))
@@ -246,30 +241,6 @@ a property list as accepted by `aws-logs-make-preset`.")
     (mapcar (lambda (log-group) (alist-get 'logGroupName log-group)) log-groups)
     )
   )
-
-(define-derived-mode aws-logs-mode comint-mode "AWS-LOGS"
-  "Displays logs fetched by aws-logs command."
-  :interactive nil
-  :group 'aws-logs
-  (read-only-mode 1)
-  )
-
-(defun aws-logs-simple ()
-  "Select a stream to tail."
-  (interactive)
-  (let* ((log-group (completing-read "Log group: " (aws-logs--list-log-groups)))
-         (process (start-process-shell-command "aws-cli"
-                                               (format "*AWS logs - %s*" log-group)
-                                               (aws-logs--command "logs tail" log-group
-                                                                  "--follow"
-                                                                  "--format" aws-logs-format
-                                                                  "--since" aws-logs-since))))
-    (with-current-buffer (process-buffer process)
-      (display-buffer (current-buffer))
-      (aws-logs-mode)
-      (set-process-filter process 'comint-output-filter)
-      )
-    ))
 
 (transient-define-infix aws-logs-infix-log-group ()
   :description "Log group"
@@ -420,7 +391,7 @@ different layout (for example with `no-littering`)."
     (aws-logs--query-transient-reprompt)))
 
 (defconst aws-logs--preset-keys
-  '(:log-group :since :follow :profile :query
+  '(:log-group :since :follow :ecs :profile :query
                :custom-time-range
                :summary-timestamp-field :summary-level-field :summary-message-field
                :summary-extra-fields)
@@ -450,6 +421,7 @@ with any subset of these keys:
 - `:since` string or nil
 - `:custom-time-range` cons cell (FROM . TO) or nil
 - `:follow` boolean or nil
+- `:ecs` boolean or nil
 - `:profile` string or nil
 - `:query` string or nil
 - `:summary-timestamp-field` string or nil
@@ -479,6 +451,7 @@ If a preset with NAME already exists, it is replaced."
                    (:since . aws-logs-time-range)
                    (:custom-time-range . aws-logs-custom-time-range)
                    (:follow . aws-logs-follow)
+                   (:ecs . aws-logs-ecs)
                    (:profile . aws-logs-profile)
                    (:query . aws-logs-query)
                    (:summary-timestamp-field . aws-logs-summary-timestamp-field)
@@ -510,14 +483,33 @@ If a preset with NAME already exists, it is replaced."
     (aws-logs--apply-preset-plist (cdr preset))
     (aws-logs--transient-reprompt)))
 
-(transient-define-infix aws-logs-infix-follow ()
-  :description "Follow (tail)"
-  :class 'transient-switch
-  :argument "--follow"
-  :init-value (lambda (obj) (transient-infix-set obj aws-logs-follow))
-  :reader (lambda (_prompt initial _hist)
-            (setq aws-logs-follow (not initial))
-            aws-logs-follow))
+(transient-define-suffix aws-logs-toggle-follow ()
+  "Toggle follow mode for tail."
+  :description (lambda ()
+                 (format "Follow (tail): %s"
+                         (if aws-logs-follow "on" "off")))
+  :transient t
+  (interactive)
+  (setq aws-logs-follow (not aws-logs-follow))
+  (aws-logs--transient-reprompt))
+
+(transient-define-suffix aws-logs-toggle-ecs ()
+  "Toggle ECS JSON viewer mode for tail.
+
+Also persists the toggle by updating `aws-logs-default-ecs`."
+  :description (lambda ()
+                 (format "ECS JSON viewer: %s"
+                         (if aws-logs-ecs "on" "off")))
+  :transient t
+  (interactive)
+  (setq aws-logs-ecs (not aws-logs-ecs))
+  (setq aws-logs-default-ecs aws-logs-ecs)
+  (condition-case err
+      (customize-save-variable 'aws-logs-default-ecs aws-logs-default-ecs)
+    (error
+     (message "Could not persist `aws-logs-default-ecs`: %s"
+              (error-message-string err))))
+  (aws-logs--transient-reprompt))
 
 (transient-define-infix aws-logs-infix-profile ()
   :description "Profile"
@@ -712,46 +704,11 @@ Returns a cons cell (FROM . TO), where both values are ISO-like strings."
   (when-let ((s (seq-find (lambda (a) (string-prefix-p name a)) args)))
     (substring s (length name))))
 
-(defun aws-logs--tail-args ()
-  "Build argument list for `aws logs tail` using current backing fields."
-  (append
-   (list "logs" "tail" aws-logs-log-group
-         "--format" aws-logs-format)
-   (when aws-logs-follow
-     (list "--follow"))
-   (cond
-    ((and aws-logs-custom-time-range (car aws-logs-custom-time-range))
-     ;; `aws logs tail` does not support end-time; use custom FROM as --since.
-     (list "--since" (car aws-logs-custom-time-range)))
-    ((and aws-logs-time-range (not (string-empty-p aws-logs-time-range)))
-     (list "--since" aws-logs-time-range)))))
-
-(defun aws-logs--global-args ()
-  "Build common AWS CLI arguments from current backing fields."
-  (delq nil
-        (list
-         (when aws-logs-endpoint (format "--endpoint-url=%s" aws-logs-endpoint))
-         (format "--region=%s" aws-logs-region)
-         (when aws-logs-profile (format "--profile=%s" aws-logs-profile)))))
-
 (transient-define-suffix aws-logs-tail ()
   "Start streaming logs in a dedicated buffer using current transient selections."
   :transient nil
   (interactive)
-  (unless (and aws-logs-log-group (not (string-empty-p aws-logs-log-group)))
-    (user-error "Select a log group first"))
-  (let* ((buffer (get-buffer-create (format "*AWS logs - %s*" aws-logs-log-group)))
-         (process-name (format "aws-logs-tail:%s" aws-logs-log-group))
-         (args (append (aws-logs--global-args) (aws-logs--tail-args)))
-         (process (apply #'start-process process-name buffer aws-logs-cli args)))
-    (with-current-buffer buffer
-      (let ((inhibit-read-only t))
-        (erase-buffer))
-      (display-buffer buffer)
-      (aws-logs-mode)
-      (set-process-filter process #'comint-output-filter))
-    (set-process-query-on-exit-flag process nil)
-    (message "Started logs tail for %s" aws-logs-log-group)))
+  (aws-logs-tail-run))
 
 (transient-define-suffix aws-logs-insights ()
   "Run Logs Insights query and show results in a dedicated buffer."
@@ -789,7 +746,8 @@ Use the Tail action to stream logs with current selections."
     ("-g" aws-logs-infix-log-group)
     ("-s" "Since" aws-logs-infix-since)
     ("-t" "Time Range" aws-logs-infix-custom-time-range)
-    ("-f" "Follow (tail)" aws-logs-infix-follow)
+    ("-f" aws-logs-toggle-follow)
+    ("-e" aws-logs-toggle-ecs)
     ("-p" "Profile" aws-logs-infix-profile)]
 
    [4 :description (lambda () (format "Query: %s" (aws-logs--query)))

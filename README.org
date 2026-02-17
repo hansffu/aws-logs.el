@@ -12,7 +12,7 @@
 
 * Installation
 
-Place ~aws-logs.el~, ~aws-logs-insights.el~, and ~aws-logs-query.el~ in your ~load-path~.
+Place ~aws-logs.el~, ~aws-logs-tail.el~, ~aws-logs-insights.el~, and ~aws-logs-query.el~ in your ~load-path~.
 
 * use-package Example
 
@@ -62,6 +62,7 @@ Supported keys:
 - ~:since~
 - ~:custom-time-range~ (cons cell: ~(FROM . TO)~)
 - ~:follow~
+- ~:ecs~
 - ~:profile~
 - ~:query~
 - ~:summary-timestamp-field~
@@ -87,3 +88,4 @@ Run ~M-x aws-logs~.
 - ~t~ tail logs
 - ~l~ run Logs Insights
 - ~RET~ run DWIM (tail or insights depending on query)
+- ~-e~ toggle ECS JSON viewer for tail
