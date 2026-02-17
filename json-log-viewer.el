@@ -134,6 +134,15 @@
 (defvar-local json-log-viewer--json-header-lines-function nil
   "Optional callback: (STATE) -> additional header lines for JSON-line buffers.")
 
+(defvar-local json-log-viewer--auto-follow nil
+  "Non-nil means keep point at newest entry while streaming.")
+
+(defvar-local json-log-viewer--auto-follow-point-before-command nil
+  "Point value captured in `pre-command-hook' for follow disabling logic.")
+
+(defvar-local json-log-viewer--auto-follow-internal-move nil
+  "Non-nil while viewer code moves point for auto-follow housekeeping.")
+
 (defun json-log-viewer-get-buffer (buffer-name)
   "Return validated json-log-viewer buffer from BUFFER-NAME.
 
@@ -422,7 +431,8 @@ Returns cons cell (ENTRIES . NEXT-ID)."
   "Return header lines for current JSON-line buffer and STATE."
   (append
    (list (cons "Mode" (if (plist-get state :streaming) "streaming" "non-streaming"))
-         (cons "Direction" (symbol-name (plist-get state :direction))))
+         (cons "Direction" (symbol-name (plist-get state :direction)))
+         (cons "Auto follow" (if (plist-get state :auto-follow) "on" "off")))
    (when (functionp json-log-viewer--json-header-lines-function)
      (or (funcall json-log-viewer--json-header-lines-function state) nil))))
 
@@ -482,9 +492,36 @@ Returns cons cell (ENTRIES . NEXT-ID)."
         :metadata json-log-viewer--metadata
         :streaming json-log-viewer--streaming
         :direction json-log-viewer--direction
+        :auto-follow json-log-viewer--auto-follow
         :filter json-log-viewer--filter-string
         :row-count (length json-log-viewer--entry-overlays)
         :visible-row-count (json-log-viewer--visible-entry-count)))
+
+(defun json-log-viewer--set-point-to-latest-entry ()
+  "Move point and all visible windows for current buffer to latest entry."
+  (let ((target (point-max)))
+    (setq json-log-viewer--auto-follow-internal-move t)
+    (unwind-protect
+        (progn
+          (goto-char target)
+          (dolist (window (get-buffer-window-list (current-buffer) nil t))
+            (set-window-point window target)))
+      (setq json-log-viewer--auto-follow-internal-move nil))))
+
+(defun json-log-viewer--remember-point-before-command ()
+  "Record current point for auto-follow cursor-move detection."
+  (setq json-log-viewer--auto-follow-point-before-command (point)))
+
+(defun json-log-viewer--maybe-disable-auto-follow-after-command ()
+  "Disable auto-follow when cursor moved by user command."
+  (when (and json-log-viewer--auto-follow
+             (not json-log-viewer--auto-follow-internal-move)
+             (integer-or-marker-p json-log-viewer--auto-follow-point-before-command)
+             (/= (point) json-log-viewer--auto-follow-point-before-command)
+             (not (eq this-command 'json-log-viewer-toggle-auto-follow)))
+    (setq json-log-viewer--auto-follow nil)
+    (json-log-viewer--refresh-header)
+    (message "Auto-follow disabled (cursor moved)")))
 
 (defun json-log-viewer--clear-overlays ()
   "Remove all fold and entry overlays in the current buffer."
@@ -646,6 +683,7 @@ Returns cons cell (ENTRIES . NEXT-ID)."
      ("S-TAB" . "toggle all")
      ("C-c C-n" . "narrow")
      ("C-c C-w" . "widen")
+     ("C-c C-f" . "toggle follow")
      ("q" . "quit"))
    (when json-log-viewer--refresh-function
      '(("C-c C-r" . "refresh")))))
@@ -737,6 +775,15 @@ When result size allows it, updates are previewed live while typing."
   (json-log-viewer--apply-filter)
   (json-log-viewer--refresh-header)
   (message "Narrowing cleared"))
+
+(defun json-log-viewer-toggle-auto-follow ()
+  "Toggle automatic scrolling to newest entries."
+  (interactive)
+  (setq json-log-viewer--auto-follow (not json-log-viewer--auto-follow))
+  (when json-log-viewer--auto-follow
+    (json-log-viewer--set-point-to-latest-entry))
+  (json-log-viewer--refresh-header)
+  (message "Auto-follow %s" (if json-log-viewer--auto-follow "enabled" "disabled")))
 
 (defun json-log-viewer--header-end-position ()
   "Return position where entries start (after header block)."
@@ -835,7 +882,9 @@ When PRESERVE-FILTER is non-nil, keep the current active filter."
       (mapc #'json-log-viewer--insert-entry ordered))
     (json-log-viewer--mark-seen-entries ordered)
     (json-log-viewer--apply-filter)
-    (goto-char (point-min))
+    (if json-log-viewer--auto-follow
+        (json-log-viewer--set-point-to-latest-entry)
+      (goto-char (point-min)))
     (json-log-viewer--highlight-current-line)))
 
 (defun json-log-viewer-append-entries (entries)
@@ -858,6 +907,8 @@ In non-streaming mode the append position follows configured direction."
       (json-log-viewer--mark-seen-entries ordered)
       (json-log-viewer--apply-filter)
       (json-log-viewer--refresh-header)
+      (when (and json-log-viewer--auto-follow append-at-bottom)
+        (json-log-viewer--set-point-to-latest-entry))
       (json-log-viewer--highlight-current-line))
     ordered))
 
@@ -890,6 +941,7 @@ In non-streaming mode the append position follows configured direction."
   "<backtab>" #'json-log-viewer-toggle-all
   "C-c C-r" #'json-log-viewer-refresh
   "C-c C-n" #'json-log-viewer-narrow
+  "C-c C-f" #'json-log-viewer-toggle-auto-follow
   "C-c C-w" #'json-log-viewer-widen)
 
 (define-derived-mode json-log-viewer-mode special-mode "JsonLogs"
@@ -900,7 +952,9 @@ In non-streaming mode the append position follows configured direction."
   (setq-local line-move-ignore-invisible t)
   (setq-local buffer-invisibility-spec '(t))
   (add-to-invisibility-spec 'json-log-viewer-filter)
-  (add-hook 'post-command-hook #'json-log-viewer--highlight-current-line nil t))
+  (add-hook 'pre-command-hook #'json-log-viewer--remember-point-before-command nil t)
+  (add-hook 'post-command-hook #'json-log-viewer--maybe-disable-auto-follow-after-command nil t)
+  (add-hook 'post-command-hook #'json-log-viewer--highlight-current-line t t))
 
 (cl-defun json-log-viewer-make-buffer (buffer-name
                                        &key

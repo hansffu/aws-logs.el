@@ -128,5 +128,50 @@
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
+(ert-deftest json-log-viewer-stream-push-respects-auto-follow-test ()
+  (let* ((buf (json-log-viewer-make-buffer
+               "*json-log-viewer-follow-test*"
+               :log-lines '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"a\"}")
+               :timestamp-path "timestamp"
+               :level-path "level"
+               :message-path "msg"
+               :streaming t)))
+    (unwind-protect
+        (with-current-buffer buf
+          (goto-char (point-min))
+          (setq-local json-log-viewer--auto-follow nil)
+          (json-log-viewer-push
+           buf
+           '("{\"timestamp\":\"2026-01-01T00:00:01Z\",\"msg\":\"b\"}"))
+          (should (< (point) (point-max)))
+          (goto-char (point-min))
+          (setq-local json-log-viewer--auto-follow t)
+          (json-log-viewer-push
+           buf
+           '("{\"timestamp\":\"2026-01-01T00:00:02Z\",\"msg\":\"c\"}"))
+          (should (= (point) (point-max))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest json-log-viewer-cursor-move-disables-auto-follow-test ()
+  (let* ((buf (json-log-viewer-make-buffer
+               "*json-log-viewer-follow-disable-test*"
+               :log-lines '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"a\"}")
+               :timestamp-path "timestamp"
+               :level-path "level"
+               :message-path "msg"
+               :streaming t)))
+    (unwind-protect
+        (with-current-buffer buf
+          (setq-local json-log-viewer--auto-follow t)
+          (goto-char (point-min))
+          (setq-local json-log-viewer--auto-follow-point-before-command (point))
+          (goto-char (point-max))
+          (let ((this-command 'next-line))
+            (json-log-viewer--maybe-disable-auto-follow-after-command))
+          (should-not json-log-viewer--auto-follow))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
 (provide 'aws-logs-core-test)
 ;;; aws-logs-core-test.el ends here

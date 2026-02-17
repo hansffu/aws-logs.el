@@ -224,6 +224,7 @@ Inside ~json-log-viewer-mode~:
 - ~C-c C-r~: refresh (when ~:refresh-function~ is configured)
 - ~C-c C-n~: narrow by substring
 - ~C-c C-w~: clear narrowing
+- ~C-c C-f~: toggle auto-follow (auto-disables when cursor moves)
 - ~q~: quit window
 
 * Package: kube-logs
