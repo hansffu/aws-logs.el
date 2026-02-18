@@ -133,7 +133,7 @@
           (setq result (json-log-viewer--json-refresh nil))
           (should (equal (plist-get result :entries) nil))
           (should (eq (plist-get result :replace) nil))
-          (should (= (length json-log-viewer--raw-log-lines) 1)))
+          (should (= (length (json-log-viewer-current-log-lines buf)) 1)))
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
@@ -159,6 +159,31 @@
            buf
            '("{\"timestamp\":\"2026-01-01T00:00:02Z\",\"msg\":\"c\"}"))
           (should (= (point) (point-max))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest json-log-viewer-stream-evicts-in-chunks-test ()
+  (let* ((json-log-viewer-stream-chunk-size 100)
+         (lines (let (acc)
+                  (dotimes (i 1001)
+                    (push (format "{\"timestamp\":\"2026-01-01T00:00:%02dZ\",\"msg\":\"m-%d\"}"
+                                  (mod i 60) i)
+                          acc))
+                  (nreverse acc)))
+         (buf (json-log-viewer-make-buffer
+               "*json-log-viewer-chunk-evict-test*"
+               :log-lines nil
+               :timestamp-path "timestamp"
+               :level-path "level"
+               :message-path "msg"
+               :streaming t
+               :max-entries 1000)))
+    (unwind-protect
+        (with-current-buffer buf
+          (json-log-viewer-push buf lines)
+          (should (= json-log-viewer--entry-count 901))
+          (should (= json-log-viewer--raw-log-lines-count 901))
+          (should (= (length json-log-viewer--raw-log-line-chunks) 10)))
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 

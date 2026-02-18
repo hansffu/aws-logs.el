@@ -68,6 +68,11 @@ When nil, streaming buffers are unbounded."
   :type '(choice (const :tag "Unbounded" nil) integer)
   :group 'json-log-viewer)
 
+(defcustom json-log-viewer-stream-chunk-size 100
+  "Chunk size used for streaming storage and batch eviction."
+  :type 'integer
+  :group 'json-log-viewer)
+
 (defvar-local json-log-viewer--fold-overlays nil
   "Fold overlays in the current viewer buffer.")
 
@@ -120,7 +125,10 @@ When nil, streaming buffers are unbounded."
   "Idle seconds before applying live narrowing updates.")
 
 (defvar-local json-log-viewer--raw-log-lines nil
-  "Current raw JSON log lines shown in this buffer.")
+  "Current raw JSON log line chunks shown in this buffer.")
+
+(defvar-local json-log-viewer--raw-log-line-chunks nil
+  "Current raw JSON log lines stored as chunks (oldest chunk first).")
 
 (defvar-local json-log-viewer--raw-log-lines-count 0
   "Cached count of `json-log-viewer--raw-log-lines'.")
@@ -478,7 +486,7 @@ Returns cons cell (ENTRIES . NEXT-ID)."
   "Refresh callback used for JSON-line buffers."
   (unless (functionp json-log-viewer--json-refresh-log-lines-function)
     (user-error "No JSON-line refresh function configured"))
-  (let* ((old-lines (append json-log-viewer--raw-log-lines nil))
+  (let* ((old-lines (json-log-viewer--raw-lines-list))
          (refresh-value (funcall json-log-viewer--json-refresh-log-lines-function old-lines)))
     (if (eq refresh-value :async)
         ;; Async refresh function will mutate the buffer later.
@@ -487,8 +495,7 @@ Returns cons cell (ENTRIES . NEXT-ID)."
                          refresh-value
                          "json-log-viewer refresh-function return value"))
              (entries (mapcar json-log-viewer--line-to-entry-function new-lines)))
-        (setq json-log-viewer--raw-log-lines new-lines)
-        (setq json-log-viewer--raw-log-lines-count (length new-lines))
+        (json-log-viewer--raw-lines-set new-lines)
         (list :entries entries :replace t)))))
 
 (defun json-log-viewer--entry-signature (entry)
@@ -715,16 +722,92 @@ Returns cons cell (ENTRIES . NEXT-ID)."
       (format "\"%s\"" json-log-viewer--filter-string)
     "(none)"))
 
+(defun json-log-viewer--stream-chunk-size ()
+  "Return normalized streaming chunk size."
+  (max 1 (or json-log-viewer-stream-chunk-size 1)))
+
+(defun json-log-viewer--stream-eviction-drop-count (over-limit)
+  "Return chunk-rounded drop count for OVER-LIMIT rows."
+  (let* ((chunk-size (json-log-viewer--stream-chunk-size))
+         (chunks (/ (+ over-limit chunk-size -1) chunk-size)))
+    (* chunks chunk-size)))
+
+(defun json-log-viewer--chunk-lines (lines)
+  "Split LINES into chunk-sized lists."
+  (let ((chunk-size (json-log-viewer--stream-chunk-size))
+        (remaining (append lines nil))
+        chunks)
+    (while remaining
+      (let ((chunk nil)
+            (n 0))
+        (while (and remaining (< n chunk-size))
+          (push (pop remaining) chunk)
+          (setq n (1+ n)))
+        (push (nreverse chunk) chunks)))
+    (nreverse chunks)))
+
+(defun json-log-viewer--raw-lines-set (lines)
+  "Replace raw line storage with LINES."
+  (setq json-log-viewer--raw-log-line-chunks
+        (json-log-viewer--chunk-lines lines))
+  (setq json-log-viewer--raw-log-lines json-log-viewer--raw-log-line-chunks)
+  (setq json-log-viewer--raw-log-lines-count (length lines)))
+
+(defun json-log-viewer--raw-lines-list ()
+  "Return flattened copy of raw lines from chunk storage."
+  (apply #'append
+         (mapcar (lambda (chunk) (append chunk nil))
+                 json-log-viewer--raw-log-line-chunks)))
+
+(defun json-log-viewer--raw-lines-append (lines)
+  "Append LINES into chunked raw storage."
+  (let ((remaining (append lines nil))
+        (chunk-size (json-log-viewer--stream-chunk-size)))
+    (when remaining
+      (if json-log-viewer--raw-log-line-chunks
+          (let* ((tail-cell (last json-log-viewer--raw-log-line-chunks))
+                 (tail (car tail-cell))
+                 (space (- chunk-size (length tail))))
+            (when (> space 0)
+              (let ((addition nil)
+                    (n 0))
+                (while (and remaining (< n space))
+                  (push (pop remaining) addition)
+                  (setq n (1+ n)))
+                (setcar tail-cell (nconc tail (nreverse addition))))))
+        (setq json-log-viewer--raw-log-line-chunks nil))
+      (while remaining
+        (let ((chunk nil)
+              (n 0))
+          (while (and remaining (< n chunk-size))
+            (push (pop remaining) chunk)
+            (setq n (1+ n)))
+          (setq chunk (nreverse chunk))
+          (if json-log-viewer--raw-log-line-chunks
+              (setcdr (last json-log-viewer--raw-log-line-chunks) (list chunk))
+            (setq json-log-viewer--raw-log-line-chunks (list chunk)))))))
+  (setq json-log-viewer--raw-log-lines json-log-viewer--raw-log-line-chunks)
+  (setq json-log-viewer--raw-log-lines-count
+        (+ json-log-viewer--raw-log-lines-count (length lines))))
+
 (defun json-log-viewer--trim-raw-log-lines-if-needed ()
-  "Trim oldest raw lines in streaming buffers when retention is configured."
+  "Trim oldest raw line chunks in streaming buffers when retention is configured."
   (let ((max-entries json-log-viewer--stream-max-entries))
     (when (and json-log-viewer--streaming
                (integerp max-entries)
                (> max-entries 0)
                (> json-log-viewer--raw-log-lines-count max-entries))
-      (let ((drop (- json-log-viewer--raw-log-lines-count max-entries)))
-        (setq json-log-viewer--raw-log-lines (nthcdr drop json-log-viewer--raw-log-lines))
-        (setq json-log-viewer--raw-log-lines-count max-entries)))))
+      (let* ((over (- json-log-viewer--raw-log-lines-count max-entries))
+             (drop-target (json-log-viewer--stream-eviction-drop-count over))
+             (dropped 0))
+        (while (and json-log-viewer--raw-log-line-chunks
+                    (< dropped drop-target))
+          (setq dropped (+ dropped (length (car json-log-viewer--raw-log-line-chunks))))
+          (setq json-log-viewer--raw-log-line-chunks
+                (cdr json-log-viewer--raw-log-line-chunks)))
+        (setq json-log-viewer--raw-log-lines json-log-viewer--raw-log-line-chunks)
+        (setq json-log-viewer--raw-log-lines-count
+              (max 0 (- json-log-viewer--raw-log-lines-count dropped)))))))
 
 (defun json-log-viewer--info-line (key value)
   "Return formatted popup info line from KEY and VALUE."
@@ -977,7 +1060,9 @@ When result size allows it, updates are previewed live while typing."
                (integerp max-entries)
                (> max-entries 0)
                (> json-log-viewer--entry-count max-entries))
-      (let* ((drop (- json-log-viewer--entry-count max-entries))
+      (let* ((over (- json-log-viewer--entry-count max-entries))
+             (drop (min json-log-viewer--entry-count
+                        (json-log-viewer--stream-eviction-drop-count over)))
              (keep (- json-log-viewer--entry-count drop))
              (kept (cl-subseq json-log-viewer--entry-overlays 0 keep))
              (victims (nthcdr keep json-log-viewer--entry-overlays))
@@ -1184,8 +1269,9 @@ Returns the created buffer."
       (setq-local json-log-viewer--metadata nil)
       (setq-local json-log-viewer--live-narrow-max-rows live-narrow-max-rows)
       (setq-local json-log-viewer--live-narrow-debounce live-narrow-debounce)
-      (setq-local json-log-viewer--raw-log-lines (append normalized-lines nil))
-      (setq-local json-log-viewer--raw-log-lines-count (length normalized-lines))
+      (setq-local json-log-viewer--raw-log-lines nil)
+      (setq-local json-log-viewer--raw-log-line-chunks nil)
+      (setq-local json-log-viewer--raw-log-lines-count 0)
       (setq-local json-log-viewer--entry-count (length initial-entries))
       (setq-local json-log-viewer--stream-assume-ordered streaming)
       (setq-local json-log-viewer--stream-max-entries max-entries)
@@ -1198,6 +1284,7 @@ Returns the created buffer."
       (setq-local json-log-viewer--json-refresh-log-lines-function refresh-function)
       (setq-local json-log-viewer--json-header-lines-function header-lines-function)
       (setq-local json-log-viewer--seen-signatures (make-hash-table :test 'equal))
+      (json-log-viewer--raw-lines-set normalized-lines)
       (json-log-viewer-replace-entries initial-entries nil))
     target))
 
@@ -1215,11 +1302,7 @@ BUFFER-OR-NAME must identify a live `json-log-viewer-mode` buffer created by
       (let* ((normalized-lines (json-log-viewer--ensure-log-lines
                                 log-lines "json-log-viewer-push"))
              (entries (mapcar json-log-viewer--line-to-entry-function normalized-lines)))
-        (if json-log-viewer--raw-log-lines
-            (nconc json-log-viewer--raw-log-lines (append normalized-lines nil))
-          (setq json-log-viewer--raw-log-lines (append normalized-lines nil)))
-        (setq json-log-viewer--raw-log-lines-count
-              (+ json-log-viewer--raw-log-lines-count (length normalized-lines)))
+        (json-log-viewer--raw-lines-append normalized-lines)
         (json-log-viewer--trim-raw-log-lines-if-needed)
         (json-log-viewer-append-entries entries)))))
 
@@ -1227,7 +1310,7 @@ BUFFER-OR-NAME must identify a live `json-log-viewer-mode` buffer created by
   "Return a copy of current raw log lines from BUFFER-OR-NAME."
   (let ((target (json-log-viewer-get-buffer buffer-or-name)))
     (with-current-buffer target
-      (append json-log-viewer--raw-log-lines nil))))
+      (json-log-viewer--raw-lines-list))))
 
 (defun json-log-viewer-replace-log-lines (buffer-or-name log-lines &optional preserve-filter)
   "Replace raw LOG-LINES in BUFFER-OR-NAME.
@@ -1249,8 +1332,7 @@ When PRESERVE-FILTER is non-nil, keep the current active filter."
                   (cons (nreverse entries) json-log-viewer--next-entry-id))))
              (entries (car entries+next))
              (next-id (cdr entries+next)))
-        (setq json-log-viewer--raw-log-lines normalized-lines)
-        (setq json-log-viewer--raw-log-lines-count (length normalized-lines))
+        (json-log-viewer--raw-lines-set normalized-lines)
         (setq json-log-viewer--next-entry-id next-id)
         (json-log-viewer-replace-entries entries preserve-filter)))))
 
