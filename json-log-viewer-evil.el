@@ -9,9 +9,6 @@
 ;;; Code:
 
 
-(declare-function evil-define-key "evil-core" (state keymap &rest bindings))
-
-
 (defun json-log-viewer--evil-popup-keybindings ()
   "Return Evil keybindings for `json-log-viewer-show-info` popup."
   (append
@@ -31,12 +28,15 @@ Safe to call multiple times."
   (interactive)
   (unless (fboundp 'evil-define-key)
     (user-error "Evil is not available"))
-  (evil-define-key '(motion normal visual) json-log-viewer-mode-map
-    (kbd "?") #'json-log-viewer-show-info
-    (kbd "zn") #'json-log-viewer-narrow
-    (kbd "zw") #'json-log-viewer-widen
-    (kbd "gr") #'json-log-viewer-refresh
-    (kbd "zf") #'json-log-viewer-toggle-auto-follow)
+  ;; `evil-define-key` is a macro. Evaluate this form at runtime so
+  ;; byte-compilation does not hard-wire a direct macro call.
+  (eval
+   '(evil-define-key '(motion normal visual) json-log-viewer-mode-map
+      (kbd "?") #'json-log-viewer-show-info
+      (kbd "zn") #'json-log-viewer-narrow
+      (kbd "zw") #'json-log-viewer-widen
+      (kbd "gr") #'json-log-viewer-refresh
+      (kbd "zf") #'json-log-viewer-toggle-auto-follow))
   (setq json-log-viewer--keybindings-function #'json-log-viewer--evil-popup-keybindings)
   )
 
