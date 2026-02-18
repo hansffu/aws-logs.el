@@ -61,6 +61,13 @@
   :type 'boolean
   :group 'json-log-viewer)
 
+(defcustom json-log-viewer-stream-max-entries 20000
+  "Maximum entries retained in streaming buffers.
+
+When nil, streaming buffers are unbounded."
+  :type '(choice (const :tag "Unbounded" nil) integer)
+  :group 'json-log-viewer)
+
 (defvar-local json-log-viewer--fold-overlays nil
   "Fold overlays in the current viewer buffer.")
 
@@ -114,6 +121,18 @@
 
 (defvar-local json-log-viewer--raw-log-lines nil
   "Current raw JSON log lines shown in this buffer.")
+
+(defvar-local json-log-viewer--raw-log-lines-count 0
+  "Cached count of `json-log-viewer--raw-log-lines'.")
+
+(defvar-local json-log-viewer--entry-count 0
+  "Cached count of rendered entry overlays.")
+
+(defvar-local json-log-viewer--stream-assume-ordered nil
+  "Non-nil means streaming entries are assumed to arrive in order.")
+
+(defvar-local json-log-viewer--stream-max-entries nil
+  "Maximum rendered entries retained for this buffer, or nil for unbounded.")
 
 (defvar-local json-log-viewer--line-to-entry-function nil
   "Buffer-local callback that converts one raw line into one entry object.")
@@ -469,6 +488,7 @@ Returns cons cell (ENTRIES . NEXT-ID)."
                          "json-log-viewer refresh-function return value"))
              (entries (mapcar json-log-viewer--line-to-entry-function new-lines)))
         (setq json-log-viewer--raw-log-lines new-lines)
+        (setq json-log-viewer--raw-log-lines-count (length new-lines))
         (list :entries entries :replace t)))))
 
 (defun json-log-viewer--entry-signature (entry)
@@ -513,7 +533,7 @@ Returns cons cell (ENTRIES . NEXT-ID)."
         :direction json-log-viewer--direction
         :auto-follow json-log-viewer--auto-follow
         :filter json-log-viewer--filter-string
-        :row-count (length json-log-viewer--entry-overlays)
+        :row-count json-log-viewer--entry-count
         :visible-row-count (json-log-viewer--visible-entry-count)))
 
 (defun json-log-viewer--set-point-to-latest-entry ()
@@ -550,6 +570,7 @@ Returns cons cell (ENTRIES . NEXT-ID)."
     (delete-overlay json-log-viewer--current-line-overlay))
   (setq json-log-viewer--fold-overlays nil)
   (setq json-log-viewer--entry-overlays nil)
+  (setq json-log-viewer--entry-count 0)
   (setq json-log-viewer--current-line-overlay nil))
 
 (defun json-log-viewer--fold-overlay-at-point ()
@@ -652,6 +673,19 @@ Returns cons cell (ENTRIES . NEXT-ID)."
                        'json-log-viewer-filter
                      nil)))))
 
+(defun json-log-viewer--apply-filter-to-overlays (overlays)
+  "Apply current filter to OVERLAYS only."
+  (let* ((needle (and json-log-viewer--filter-string
+                      (string-trim json-log-viewer--filter-string)))
+         (normalized (and needle (downcase needle)))
+         (active (and normalized (not (string-empty-p normalized)))))
+    (dolist (entry-overlay overlays)
+      (overlay-put entry-overlay 'invisible
+                   (if (and active
+                            (not (json-log-viewer--filter-match-p entry-overlay normalized)))
+                       'json-log-viewer-filter
+                     nil)))))
+
 (defun json-log-viewer--set-filter (needle)
   "Set viewer filter to NEEDLE and apply it."
   (let ((normalized (string-trim (or needle ""))))
@@ -680,6 +714,17 @@ Returns cons cell (ENTRIES . NEXT-ID)."
            (not (string-empty-p json-log-viewer--filter-string)))
       (format "\"%s\"" json-log-viewer--filter-string)
     "(none)"))
+
+(defun json-log-viewer--trim-raw-log-lines-if-needed ()
+  "Trim oldest raw lines in streaming buffers when retention is configured."
+  (let ((max-entries json-log-viewer--stream-max-entries))
+    (when (and json-log-viewer--streaming
+               (integerp max-entries)
+               (> max-entries 0)
+               (> json-log-viewer--raw-log-lines-count max-entries))
+      (let ((drop (- json-log-viewer--raw-log-lines-count max-entries)))
+        (setq json-log-viewer--raw-log-lines (nthcdr drop json-log-viewer--raw-log-lines))
+        (setq json-log-viewer--raw-log-lines-count max-entries)))))
 
 (defun json-log-viewer--info-line (key value)
   "Return formatted popup info line from KEY and VALUE."
@@ -729,10 +774,10 @@ Returns cons cell (ENTRIES . NEXT-ID)."
               (funcall json-log-viewer--header-function state))
          nil)
      (list
-      (cons "Messages"
-            (number-to-string
-             (or row-count
-                 (length json-log-viewer--entry-overlays))))
+     (cons "Messages"
+           (number-to-string
+            (or row-count
+                 json-log-viewer--entry-count)))
       (cons "Narrow filter"
             (json-log-viewer--filter-summary))))))
 
@@ -794,7 +839,7 @@ When result size allows it, updates are previewed live while typing."
   (interactive)
   (let* ((results-buffer (current-buffer))
          (original-filter json-log-viewer--filter-string)
-         (row-count (length json-log-viewer--entry-overlays))
+         (row-count json-log-viewer--entry-count)
          (live-enabled (or (null json-log-viewer--live-narrow-max-rows)
                            (<= row-count json-log-viewer--live-narrow-max-rows)))
          (debounce (max 0 (or json-log-viewer--live-narrow-debounce 0)))
@@ -880,9 +925,12 @@ When result size allows it, updates are previewed live while typing."
     (overlay-put entry-ov 'json-log-viewer-entry t)
     (overlay-put entry-ov 'json-log-viewer-fold-overlay fold-ov)
     (overlay-put entry-ov 'json-log-viewer-filter-text filter-text)
+    (overlay-put entry-ov 'json-log-viewer-signature
+                 (json-log-viewer--entry-signature entry))
     (push entry-ov json-log-viewer--entry-overlays)
     (put-text-property summary-start (1- details-start)
-                       'json-log-viewer-details-overlay fold-ov)))
+                       'json-log-viewer-details-overlay fold-ov)
+    entry-ov))
 
 (defun json-log-viewer--mark-seen-entries (entries)
   "Mark ENTRIES as seen in current buffer."
@@ -903,6 +951,40 @@ When result size allows it, updates are previewed live while typing."
     (when (looking-at "No results\\.\n")
       (delete-region (match-beginning 0) (match-end 0)))))
 
+(defun json-log-viewer--evict-oldest-entries-if-needed ()
+  "Evict oldest rendered entries when streaming retention cap is exceeded."
+  (let ((max-entries json-log-viewer--stream-max-entries))
+    (when (and json-log-viewer--streaming
+               (integerp max-entries)
+               (> max-entries 0)
+               (> json-log-viewer--entry-count max-entries))
+      (let* ((drop (- json-log-viewer--entry-count max-entries))
+             (keep (- json-log-viewer--entry-count drop))
+             (kept (cl-subseq json-log-viewer--entry-overlays 0 keep))
+             (victims (nthcdr keep json-log-viewer--entry-overlays))
+             (victim-folds nil))
+        (setq json-log-viewer--entry-overlays kept)
+        (setq json-log-viewer--entry-count keep)
+        (dolist (entry-overlay victims)
+          (let ((fold-ov (overlay-get entry-overlay 'json-log-viewer-fold-overlay))
+                (sig (overlay-get entry-overlay 'json-log-viewer-signature)))
+            (when (overlayp fold-ov)
+              (push fold-ov victim-folds))
+            (when sig
+              (remhash sig json-log-viewer--seen-signatures))
+            (when (and (overlay-buffer entry-overlay)
+                       (overlay-start entry-overlay)
+                       (overlay-end entry-overlay))
+              (delete-region (overlay-start entry-overlay)
+                             (overlay-end entry-overlay)))
+            (when (overlay-buffer entry-overlay)
+              (delete-overlay entry-overlay))
+            (when (overlayp fold-ov)
+              (delete-overlay fold-ov))))
+        (setq json-log-viewer--fold-overlays
+              (cl-remove-if (lambda (ov) (memq ov victim-folds))
+                            json-log-viewer--fold-overlays))))))
+
 (defun json-log-viewer-replace-entries (entries &optional preserve-filter)
   "Replace rendered entries with ENTRIES.
 
@@ -917,6 +999,7 @@ When PRESERVE-FILTER is non-nil, keep the current active filter."
     (if (null ordered)
         (insert "No results.\n")
       (mapc #'json-log-viewer--insert-entry ordered))
+    (setq json-log-viewer--entry-count (length ordered))
     (json-log-viewer--mark-seen-entries ordered)
     (json-log-viewer--apply-filter)
     (if json-log-viewer--auto-follow
@@ -929,20 +1012,32 @@ When PRESERVE-FILTER is non-nil, keep the current active filter."
 
 In streaming mode new entries are always appended to the bottom.
 In non-streaming mode the append position follows configured direction."
-  (let* ((candidate-entries (json-log-viewer--unseen-entries entries))
-         (ordered (json-log-viewer--sort-entries candidate-entries))
+  (let* ((skip-sort (and json-log-viewer--streaming
+                         json-log-viewer--stream-assume-ordered))
+         (candidate-entries (if skip-sort
+                                entries
+                              (json-log-viewer--unseen-entries entries)))
+         (ordered (if skip-sort
+                      candidate-entries
+                    (json-log-viewer--sort-entries candidate-entries)))
          (append-at-bottom (or json-log-viewer--streaming
                                (eq json-log-viewer--direction 'oldest-first)))
-         (inhibit-read-only t))
+         (inhibit-read-only t)
+         (inserted-overlays nil))
     (when ordered
       (save-excursion
         (json-log-viewer--delete-no-results-placeholder)
         (if append-at-bottom
             (goto-char (point-max))
           (goto-char (json-log-viewer--header-end-position)))
-        (mapc #'json-log-viewer--insert-entry ordered))
+        (dolist (entry ordered)
+          (push (json-log-viewer--insert-entry entry) inserted-overlays)))
+      (setq inserted-overlays (nreverse inserted-overlays))
+      (setq json-log-viewer--entry-count
+            (+ json-log-viewer--entry-count (length ordered)))
       (json-log-viewer--mark-seen-entries ordered)
-      (json-log-viewer--apply-filter)
+      (json-log-viewer--evict-oldest-entries-if-needed)
+      (json-log-viewer--apply-filter-to-overlays inserted-overlays)
       (json-log-viewer--refresh-header)
       (when (and json-log-viewer--auto-follow append-at-bottom)
         (json-log-viewer--set-point-to-latest-entry))
@@ -1017,6 +1112,7 @@ In non-streaming mode the append position follows configured direction."
                                        extra-paths
                                        refresh-function
                                        streaming
+                                       (max-entries json-log-viewer-stream-max-entries)
                                        (direction 'newest-first)
                                        header-lines-function
                                        (live-narrow-max-rows 2000)
@@ -1038,6 +1134,8 @@ STREAMING controls append semantics:
 - non-nil: new data is appended to the bottom (use `json-log-viewer-push`)
 - nil: ordering follows DIRECTION
   (`newest-first`/`oldest-first` or `desc`/`asc`)
+
+MAX-ENTRIES caps retained rows in streaming mode. Nil disables capping.
 
 Returns the created buffer."
   (unless (stringp buffer-name)
@@ -1066,7 +1164,11 @@ Returns the created buffer."
       (setq-local json-log-viewer--metadata nil)
       (setq-local json-log-viewer--live-narrow-max-rows live-narrow-max-rows)
       (setq-local json-log-viewer--live-narrow-debounce live-narrow-debounce)
-      (setq-local json-log-viewer--raw-log-lines normalized-lines)
+      (setq-local json-log-viewer--raw-log-lines (append normalized-lines nil))
+      (setq-local json-log-viewer--raw-log-lines-count (length normalized-lines))
+      (setq-local json-log-viewer--entry-count (length initial-entries))
+      (setq-local json-log-viewer--stream-assume-ordered streaming)
+      (setq-local json-log-viewer--stream-max-entries max-entries)
       (setq-local json-log-viewer--line-to-entry-function #'json-log-viewer--json-line->entry)
       (setq-local json-log-viewer--next-entry-id next-id)
       (setq-local json-log-viewer--timestamp-path timestamp-path)
@@ -1093,8 +1195,12 @@ BUFFER-OR-NAME must identify a live `json-log-viewer-mode` buffer created by
       (let* ((normalized-lines (json-log-viewer--ensure-log-lines
                                 log-lines "json-log-viewer-push"))
              (entries (mapcar json-log-viewer--line-to-entry-function normalized-lines)))
-        (setq json-log-viewer--raw-log-lines
-              (append json-log-viewer--raw-log-lines normalized-lines))
+        (if json-log-viewer--raw-log-lines
+            (nconc json-log-viewer--raw-log-lines (append normalized-lines nil))
+          (setq json-log-viewer--raw-log-lines (append normalized-lines nil)))
+        (setq json-log-viewer--raw-log-lines-count
+              (+ json-log-viewer--raw-log-lines-count (length normalized-lines)))
+        (json-log-viewer--trim-raw-log-lines-if-needed)
         (json-log-viewer-append-entries entries)))))
 
 (defun json-log-viewer-current-log-lines (buffer-or-name)
@@ -1124,6 +1230,7 @@ When PRESERVE-FILTER is non-nil, keep the current active filter."
              (entries (car entries+next))
              (next-id (cdr entries+next)))
         (setq json-log-viewer--raw-log-lines normalized-lines)
+        (setq json-log-viewer--raw-log-lines-count (length normalized-lines))
         (setq json-log-viewer--next-entry-id next-id)
         (json-log-viewer-replace-entries entries preserve-filter)))))
 
