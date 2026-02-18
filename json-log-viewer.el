@@ -828,9 +828,28 @@ Returns cons cell (ENTRIES . NEXT-ID)."
   "Return position where entries start (no header is rendered)."
   (point-min))
 
+(defun json-log-viewer--header-line-string ()
+  "Return header-line text for current viewer buffer."
+  (let ((messages (format "Messages: %d" json-log-viewer--entry-count))
+        (follow (format "Follow: %s" (if json-log-viewer--auto-follow "on" "off")))
+        (direction (format "Direction: %s" (symbol-name json-log-viewer--direction)))
+        (needle (and json-log-viewer--filter-string
+                     (string-trim json-log-viewer--filter-string))))
+    (concat
+     " " messages
+     "  |  " follow
+     (if json-log-viewer--streaming
+         ""
+       (concat "  |  " direction))
+     (if (and needle (not (string-empty-p needle)))
+         (format "  |  Narrow: \"%s\"" needle)
+       ""))))
+
 (defun json-log-viewer--refresh-header ()
-  "Compatibility no-op retained for callers that refresh viewer info."
-  nil)
+  "Refresh `header-line-format` for current viewer buffer."
+  (setq-local header-line-format
+              (propertize (json-log-viewer--header-line-string)
+                          'face 'json-log-viewer-header-value-face)))
 
 (defun json-log-viewer-narrow ()
   "Hide entries whose fields do not contain a minibuffer substring.
@@ -1002,6 +1021,7 @@ When PRESERVE-FILTER is non-nil, keep the current active filter."
     (setq json-log-viewer--entry-count (length ordered))
     (json-log-viewer--mark-seen-entries ordered)
     (json-log-viewer--apply-filter)
+    (json-log-viewer--refresh-header)
     (if json-log-viewer--auto-follow
         (json-log-viewer--set-point-to-latest-entry)
       (goto-char (point-min)))
