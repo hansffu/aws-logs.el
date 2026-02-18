@@ -56,6 +56,11 @@
   "Face for bracketed extra segments in summary lines."
   :group 'json-log-viewer)
 
+(defcustom json-log-viewer-enable-evil-bindings t
+  "When non-nil, load optional Evil integration for json-log-viewer."
+  :type 'boolean
+  :group 'json-log-viewer)
+
 (defvar-local json-log-viewer--fold-overlays nil
   "Fold overlays in the current viewer buffer.")
 
@@ -142,6 +147,9 @@
 
 (defvar-local json-log-viewer--auto-follow-internal-move nil
   "Non-nil while viewer code moves point for auto-follow housekeeping.")
+
+(defvar json-log-viewer--keybindings-function nil
+  "Optional callback returning popup keybindings for `json-log-viewer-show-info`.")
 
 (defun json-log-viewer-get-buffer (buffer-name)
   "Return validated json-log-viewer buffer from BUFFER-NAME.
@@ -673,59 +681,111 @@ Returns cons cell (ENTRIES . NEXT-ID)."
       (format "\"%s\"" json-log-viewer--filter-string)
     "(none)"))
 
-(defun json-log-viewer--header-line (key value)
-  "Return formatted header line from KEY and VALUE."
+(defun json-log-viewer--info-line (key value)
+  "Return formatted popup info line from KEY and VALUE."
   (concat
    (propertize (format "%-12s" (concat key ":"))
                'face 'json-log-viewer-header-key-face)
    " "
    (propertize value 'face 'json-log-viewer-header-value-face)))
 
-(defun json-log-viewer--keybinding-fragment (key action)
-  "Return formatted keybinding text for KEY and ACTION."
-  (concat
-   (propertize key 'face 'json-log-viewer-keybinding-face)
-   (propertize (format " %s" action) 'face 'json-log-viewer-header-value-face)))
+(defun json-log-viewer--pad-right (text width)
+  "Return TEXT padded with spaces to WIDTH."
+  (concat text (make-string (max 0 (- width (string-width text))) ? )))
 
-(defun json-log-viewer--keybindings ()
-  "Return list of keybinding fragments to show in header."
+(defun json-log-viewer--binding-line (binding)
+  "Return formatted popup line for one key BINDING."
+  (concat
+   (propertize (format "%-10s" (car binding))
+               'face 'json-log-viewer-keybinding-face)
+   (propertize (format " %s" (cdr binding))
+               'face 'json-log-viewer-header-value-face)))
+
+(defun json-log-viewer--default-keybindings ()
+  "Return default keybindings shown in the viewer info popup."
   (append
    '(("TAB" . "toggle entry")
      ("S-TAB" . "toggle all")
      ("C-c C-n" . "narrow")
      ("C-c C-w" . "widen")
      ("C-c C-f" . "toggle follow")
+     ("?" . "show info")
      ("q" . "quit"))
    (when json-log-viewer--refresh-function
      '(("C-c C-r" . "refresh")))))
 
-(defun json-log-viewer--insert-header (&optional row-count)
-  "Insert formatted buffer header using ROW-COUNT."
+(defun json-log-viewer--keybindings ()
+  "Return keybindings shown in the viewer info popup."
+  (if (functionp json-log-viewer--keybindings-function)
+      (or (funcall json-log-viewer--keybindings-function)
+          (json-log-viewer--default-keybindings))
+    (json-log-viewer--default-keybindings)))
+
+(defun json-log-viewer--info-lines (&optional row-count)
+  "Return viewer info lines for popup display using ROW-COUNT."
   (let ((state (json-log-viewer--state)))
-    (dolist (line (or (and json-log-viewer--header-function
-                           (funcall json-log-viewer--header-function state))
-                      nil))
-      (let ((key (json-log-viewer--value->string (car line)))
-            (value (json-log-viewer--value->string (cdr line))))
-        (when key
-          (insert (json-log-viewer--header-line key (or value "")) "\n"))))
-    (insert (json-log-viewer--header-line
-             "Messages"
-             (number-to-string (or row-count
-                                   (length json-log-viewer--entry-overlays))))
-            "\n")
-    (insert (json-log-viewer--header-line
-             "Narrow filter"
-             (json-log-viewer--filter-summary))
-            "\n")
-    (insert (propertize "Keys:        " 'face 'json-log-viewer-header-key-face))
-    (insert
-     (string-join
-      (mapcar (lambda (binding)
-                (json-log-viewer--keybinding-fragment (car binding) (cdr binding)))
-              (json-log-viewer--keybindings))
-      (propertize "  |  " 'face 'json-log-viewer-header-value-face)))
-    (insert "\n\n")))
+    (append
+     (or (and json-log-viewer--header-function
+              (funcall json-log-viewer--header-function state))
+         nil)
+     (list
+      (cons "Messages"
+            (number-to-string
+             (or row-count
+                 (length json-log-viewer--entry-overlays))))
+      (cons "Narrow filter"
+            (json-log-viewer--filter-summary))))))
+
+(defun json-log-viewer-show-info ()
+  "Show current viewer context and keys in a popup."
+  (interactive)
+  (let ((source-buffer (current-buffer))
+        (lines (json-log-viewer--info-lines))
+        (bindings (json-log-viewer--keybindings)))
+    (let* ((binding-lines (mapcar #'json-log-viewer--binding-line bindings))
+           (info-lines
+            (delq nil
+                  (mapcar
+                   (lambda (line)
+                     (let ((key (json-log-viewer--value->string (car line)))
+                           (value (json-log-viewer--value->string (cdr line))))
+                       (when key
+                         (json-log-viewer--info-line key (or value "")))))
+                   lines)))
+           (column-separator "  |  ")
+           (bindings-title (propertize "Bindings" 'face 'json-log-viewer-header-key-face))
+           (info-title (propertize "Info" 'face 'json-log-viewer-header-key-face))
+           (bindings-width
+            (max (string-width bindings-title)
+                 (if binding-lines
+                     (apply #'max (mapcar #'string-width binding-lines))
+                   0)))
+           (row-count (max (length binding-lines) (length info-lines))))
+      (with-help-window (help-buffer)
+        (princ (format "JSON Log Viewer: %s\n\n" (buffer-name source-buffer)))
+        (princ (json-log-viewer--pad-right bindings-title bindings-width))
+        (princ column-separator)
+        (princ info-title)
+        (princ "\n")
+        (princ (make-string bindings-width ?-))
+        (princ column-separator)
+        (princ "----")
+        (princ "\n")
+        (dotimes (idx row-count)
+          (let ((binding-line (or (nth idx binding-lines) ""))
+                (info-line (or (nth idx info-lines) "")))
+            (princ (json-log-viewer--pad-right binding-line bindings-width))
+            (princ column-separator)
+            (princ info-line)
+            (princ "\n")))))))
+
+(defun json-log-viewer--header-end-position ()
+  "Return position where entries start (no header is rendered)."
+  (point-min))
+
+(defun json-log-viewer--refresh-header ()
+  "Compatibility no-op retained for callers that refresh viewer info."
+  nil)
 
 (defun json-log-viewer-narrow ()
   "Hide entries whose fields do not contain a minibuffer substring.
@@ -796,39 +856,6 @@ When result size allows it, updates are previewed live while typing."
   (json-log-viewer--refresh-header)
   (message "Auto-follow %s" (if json-log-viewer--auto-follow "enabled" "disabled")))
 
-(defun json-log-viewer--header-end-position ()
-  "Return position where entries start (after header block)."
-  (save-excursion
-    (goto-char (point-min))
-    (if (search-forward "\n\n" nil t)
-        (point)
-      (point-min))))
-
-(defun json-log-viewer--refresh-header ()
-  "Re-render header in current viewer buffer."
-  (let ((inhibit-read-only t))
-    (save-excursion
-      (let* ((header-end (json-log-viewer--header-end-position))
-             (row-count (length json-log-viewer--entry-overlays))
-             (snapshots
-              (mapcar (lambda (ov)
-                        (list ov (overlay-start ov) (overlay-end ov)))
-                      (delq nil
-                            (append json-log-viewer--fold-overlays
-                                    json-log-viewer--entry-overlays
-                                    (list json-log-viewer--current-line-overlay)))))
-             (delta 0))
-        (goto-char (point-min))
-        (delete-region (point-min) header-end)
-        (json-log-viewer--insert-header row-count)
-        (setq delta (- (json-log-viewer--header-end-position) header-end))
-        (dolist (snapshot snapshots)
-          (pcase-let ((`(,ov ,start ,end) snapshot))
-            (when (overlay-buffer ov)
-              (move-overlay ov
-                            (if (>= start header-end) (+ start delta) start)
-                            (if (>= end header-end) (+ end delta) end)))))))))
-
 (defun json-log-viewer--insert-entry (entry)
   "Insert one foldable ENTRY."
   (let* ((raw-fields (funcall json-log-viewer--entry-fields-function entry))
@@ -887,7 +914,6 @@ When PRESERVE-FILTER is non-nil, keep the current active filter."
     (json-log-viewer--clear-overlays)
     (setq json-log-viewer--seen-signatures (make-hash-table :test 'equal))
     (erase-buffer)
-    (json-log-viewer--insert-header (length ordered))
     (if (null ordered)
         (insert "No results.\n")
       (mapc #'json-log-viewer--insert-entry ordered))
@@ -950,6 +976,7 @@ In non-streaming mode the append position follows configured direction."
   "TAB" #'json-log-viewer-toggle-entry
   "<tab>" #'json-log-viewer-toggle-entry
   "<backtab>" #'json-log-viewer-toggle-all
+  "?" #'json-log-viewer-show-info
   "C-c C-r" #'json-log-viewer-refresh
   "C-c C-n" #'json-log-viewer-narrow
   "C-c C-f" #'json-log-viewer-toggle-auto-follow
@@ -966,6 +993,20 @@ In non-streaming mode the append position follows configured direction."
   (add-hook 'pre-command-hook #'json-log-viewer--remember-point-before-command nil t)
   (add-hook 'post-command-hook #'json-log-viewer--maybe-disable-auto-follow-after-command nil t)
   (add-hook 'post-command-hook #'json-log-viewer--highlight-current-line t t))
+
+(defun json-log-viewer--maybe-load-evil-bindings ()
+  "Conditionally load and initialize optional Evil bindings."
+  (when (and json-log-viewer-enable-evil-bindings
+             (featurep 'evil)
+             (require 'json-log-viewer-evil nil t)
+             (fboundp 'json-log-viewer-setup-evil))
+    (json-log-viewer-setup-evil)))
+
+(with-eval-after-load 'evil
+  (json-log-viewer--maybe-load-evil-bindings))
+
+(when (featurep 'evil)
+  (json-log-viewer--maybe-load-evil-bindings))
 
 (cl-defun json-log-viewer-make-buffer (buffer-name
                                        &key

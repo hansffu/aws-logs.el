@@ -182,5 +182,60 @@
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
+(ert-deftest json-log-viewer-shows-info-in-popup-instead-of-header-test ()
+  (let* ((buf (json-log-viewer-make-buffer
+               "*json-log-viewer-info-test*"
+               :log-lines '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"hello\"}")
+               :timestamp-path "timestamp"
+               :level-path "level"
+               :message-path "msg"
+               :streaming nil
+               :header-lines-function (lambda (_state)
+                                        (list (cons "Log group" "/aws/demo")))))
+         (help-buffer-name (help-buffer))
+         help-text)
+    (unwind-protect
+        (with-current-buffer buf
+          (let ((buffer-text (buffer-substring-no-properties (point-min) (point-max))))
+            (should (string-match-p "hello" buffer-text))
+            (should-not (string-match-p "^Mode:" buffer-text))
+            (should-not (string-match-p "^Messages:" buffer-text)))
+          (json-log-viewer-show-info)
+          (with-current-buffer help-buffer-name
+            (setq help-text (buffer-substring-no-properties (point-min) (point-max))))
+          (should (string-match-p "Bindings[[:space:]]+|[[:space:]]+Info" help-text))
+          (should (string-match-p "Mode:[[:space:]]+non-streaming" help-text))
+          (should (string-match-p "Log group:[[:space:]]+/aws/demo" help-text))
+          (should (string-match-p "Messages:[[:space:]]+1" help-text))
+          (should (string-match-p "show info" help-text)))
+      (when (buffer-live-p buf)
+        (kill-buffer buf))
+      (when (buffer-live-p (get-buffer help-buffer-name))
+        (kill-buffer help-buffer-name)))))
+
+(ert-deftest json-log-viewer-popup-keybindings-can-replace-defaults-test ()
+  (let* ((buf (json-log-viewer-make-buffer
+               "*json-log-viewer-keys-test*"
+               :log-lines '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"hello\"}")
+               :timestamp-path "timestamp"
+               :level-path "level"
+               :message-path "msg"
+               :streaming nil))
+         (help-buffer-name (help-buffer))
+         help-text)
+    (unwind-protect
+        (with-current-buffer buf
+          (let ((json-log-viewer--keybindings-function
+                 (lambda () '(("zz" . "custom action")))))
+            (json-log-viewer-show-info)
+            (with-current-buffer help-buffer-name
+              (setq help-text (buffer-substring-no-properties (point-min) (point-max)))))
+          (should (string-match-p "zz[[:space:]]+custom action" help-text))
+          (should-not (string-match-p "TAB[[:space:]]+toggle entry" help-text)))
+      (when (buffer-live-p buf)
+        (kill-buffer buf))
+      (when (buffer-live-p (get-buffer help-buffer-name))
+        (kill-buffer help-buffer-name)))))
+
 (provide 'aws-logs-core-test)
 ;;; aws-logs-core-test.el ends here

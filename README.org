@@ -165,6 +165,7 @@ Notes:
 - ~:streaming~ controls append semantics:
   - ~nil~: non-streaming order follows ~:direction~.
   - non-~nil~: pushes append to bottom.
+- ~:header-lines-function~ contributes context lines shown in the ~?~ info popup.
 - The package does not call ~display-buffer~; caller controls window behavior.
 
 ** Example: non-streaming
@@ -225,7 +226,22 @@ Inside ~json-log-viewer-mode~:
 - ~C-c C-n~: narrow by substring
 - ~C-c C-w~: clear narrowing
 - ~C-c C-f~: toggle auto-follow (auto-disables when cursor moves)
+- ~?~: show viewer info popup
 - ~q~: quit window
+
+When Evil is installed and ~json-log-viewer-enable-evil-bindings~ is non-nil
+(default), ~json-log-viewer.el~ will conditionally load
+~json-log-viewer-evil.el~ and call ~json-log-viewer-setup-evil~. This adds:
+
+- ~za~: toggle current entry
+- ~zA~: toggle all entries
+- ~zn~: narrow by substring
+- ~zN~: clear narrowing
+- ~gR~: refresh
+- ~F~: toggle auto-follow
+
+When Evil integration is active, these bindings replace the default list shown
+in the ~?~ info popup.
 
 * Package: kube-logs
 
