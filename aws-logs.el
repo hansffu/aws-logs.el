@@ -121,6 +121,13 @@ filtered by signature before rendering."
   :type 'boolean
   :group 'aws-logs)
 
+(defcustom aws-logs-default-filter nil
+  "Default regex filter for tail output.
+
+When non-nil, tail output is piped through grep with this regex."
+  :type '(choice (const :tag "No filter" nil) string)
+  :group 'aws-logs)
+
 (defcustom aws-logs-tail-ecs-batch-flush-interval 0.08
   "Idle seconds before flushing queued ECS follow lines to the viewer."
   :type 'number
@@ -185,6 +192,9 @@ or nil when disabled.")
 
 (defvar aws-logs-ecs aws-logs-default-ecs
   "Non-nil means render tail logs as ECS JSON in `json-log-viewer`.")
+
+(defvar aws-logs-filter aws-logs-default-filter
+  "Regex filter for tail output in this Emacs session, or nil.")
 
 (defvar aws-logs-time-range aws-logs-default-since
   "Selected time range (e.g. 10m) for this Emacs session.
@@ -423,6 +433,7 @@ different layout (for example with `no-littering`)."
 
 (defconst aws-logs--preset-keys
   '(:log-group :since :follow :ecs :profile :query
+               :filter
                :custom-time-range
                :summary-timestamp-field :summary-level-field :summary-message-field
                :summary-extra-fields)
@@ -455,6 +466,7 @@ with any subset of these keys:
 - `:ecs` boolean or nil
 - `:profile` string or nil
 - `:query` string or nil
+- `:filter` string or nil
 - `:summary-timestamp-field` string or nil
 - `:summary-level-field` string or nil
 - `:summary-message-field` string or nil
@@ -483,6 +495,7 @@ If a preset with NAME already exists, it is replaced."
                    (:custom-time-range . aws-logs-custom-time-range)
                    (:follow . aws-logs-follow)
                    (:ecs . aws-logs-ecs)
+                   (:filter . aws-logs-filter)
                    (:profile . aws-logs-profile)
                    (:query . aws-logs-query)
                    (:summary-timestamp-field . aws-logs-summary-timestamp-field)
@@ -550,23 +563,34 @@ Also persists the toggle by updating `aws-logs-default-ecs`."
   :reader (lambda (prompt initial hist)
             (let ((val (read-string prompt initial hist)))
               (setq aws-logs-profile (if (string-empty-p val) nil val))
-              aws-logs-profile))
+              val))
   :argument "--profile=")
 
 ;; Infix for specifying --since / time-range
 (transient-define-infix aws-logs-infix-since ()
   :description "Since / Time range"
   :class 'transient-option
+  :allow-empty t
   :init-value (lambda (obj) (transient-infix-set obj aws-logs-time-range))
   :reader (lambda (prompt initial hist)
             (let ((val (string-trim (read-string prompt initial hist))))
-              (when (string-empty-p val)
-                (user-error "Since / time range cannot be empty"))
-              (setq aws-logs-time-range val)
+              (setq aws-logs-time-range (unless (string-empty-p val) val))
               (setq aws-logs-custom-time-range nil)
               (aws-logs--transient-reprompt)
               val))
   :argument "--since=")
+
+(transient-define-infix aws-logs-infix-filter ()
+  :description "Filter regex"
+  :class 'transient-option
+  :allow-empty t
+  :init-value (lambda (obj) (transient-infix-set obj aws-logs-filter))
+  :reader (lambda (_prompt initial _hist)
+            (let ((input (string-trim (read-string "Filter regex (empty=none): "
+                                                   (or initial "")))))
+              (setq aws-logs-filter (unless (string-empty-p input) input))
+              input))
+  :argument "--filter=")
 
 (defun aws-logs--custom-time-range-to-string ()
   "Return `aws-logs-custom-time-range` as \"FROM - TO\", or nil."
@@ -612,7 +636,7 @@ Returns a cons cell (FROM . TO), where both values are ISO-like strings."
                                                    (or initial "")))))
               (setq aws-logs-summary-timestamp-field
                     (unless (string-empty-p input) input))
-              aws-logs-summary-timestamp-field))
+              input))
   :argument "--summary-timestamp=")
 
 (transient-define-infix aws-logs-infix-summary-level-field ()
@@ -625,7 +649,7 @@ Returns a cons cell (FROM . TO), where both values are ISO-like strings."
                                                    (or initial "")))))
               (setq aws-logs-summary-level-field
                     (unless (string-empty-p input) input))
-              aws-logs-summary-level-field))
+              input))
   :argument "--summary-level=")
 
 (transient-define-infix aws-logs-infix-summary-message-field ()
@@ -638,7 +662,7 @@ Returns a cons cell (FROM . TO), where both values are ISO-like strings."
                                                    (or initial "")))))
               (setq aws-logs-summary-message-field
                     (unless (string-empty-p input) input))
-              aws-logs-summary-message-field))
+              input))
   :argument "--summary-message=")
 
 (defun aws-logs--formatting-reprompt ()
@@ -737,16 +761,41 @@ Returns a cons cell (FROM . TO), where both values are ISO-like strings."
   (when-let ((s (seq-find (lambda (a) (string-prefix-p name a)) args)))
     (substring s (length name))))
 
+(defun aws-logs--sync-session-from-transient ()
+  "Sync backing session vars from active `aws-logs-transient` infix args."
+  (when (and (boundp 'transient-current-command)
+             (eq transient-current-command 'aws-logs-transient))
+    (let* ((args (transient-args 'aws-logs-transient))
+           (since (transient-arg-value "--since=" args))
+           (time-range (transient-arg-value "--time-range=" args))
+           (filter (transient-arg-value "--filter=" args))
+           (profile (transient-arg-value "--profile=" args))
+           (log-group (transient-arg-value "--log-group=" args)))
+      (setq aws-logs-time-range
+            (unless (or (null since) (string-empty-p since)) since))
+      (when aws-logs-time-range
+        (setq aws-logs-custom-time-range nil))
+      (when (or (null time-range) (string-empty-p time-range))
+        (setq aws-logs-custom-time-range nil))
+      (setq aws-logs-filter
+            (unless (or (null filter) (string-empty-p filter)) filter))
+      (setq aws-logs-profile
+            (unless (or (null profile) (string-empty-p profile)) profile))
+      (setq aws-logs-log-group
+            (unless (or (null log-group) (string-empty-p log-group)) log-group)))))
+
 (transient-define-suffix aws-logs-tail ()
   "Start streaming logs in a dedicated buffer using current transient selections."
   :transient nil
   (interactive)
+  (aws-logs--sync-session-from-transient)
   (aws-logs-tail-run))
 
 (transient-define-suffix aws-logs-insights ()
   "Run Logs Insights query and show results in a dedicated buffer."
   :transient nil
   (interactive)
+  (aws-logs--sync-session-from-transient)
   (aws-logs-insights-run))
 
 (defun aws-logs--dwim-description ()
@@ -778,6 +827,7 @@ Use the Tail action to stream logs with current selections."
   [["Config"
     ("-g" aws-logs-infix-log-group)
     ("-s" "Since" aws-logs-infix-since)
+    ("-F" "Filter" aws-logs-infix-filter)
     ("-t" "Time Range" aws-logs-infix-custom-time-range)
     ("-f" aws-logs-toggle-follow)
     ("-e" aws-logs-toggle-ecs)

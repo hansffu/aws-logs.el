@@ -70,6 +70,13 @@ When nil, kube-logs does not pass --since."
   :type '(choice (const :tag "No --since" nil) string)
   :group 'kube-logs)
 
+(defcustom kube-logs-default-filter nil
+  "Default regex filter for kube logs output.
+
+When non-nil, output is piped through grep with this regex."
+  :type '(choice (const :tag "No filter" nil) string)
+  :group 'kube-logs)
+
 (defgroup kube-logs nil
   "Kubernetes logs transient UI and rendering."
   :group 'tools)
@@ -97,6 +104,9 @@ When nil, kube-logs does not pass --since."
 
 (defvar kube-logs-since kube-logs-default-since
   "Selected --since duration for this Emacs session, or nil.")
+
+(defvar kube-logs-filter kube-logs-default-filter
+  "Regex filter for kubectl logs output in this Emacs session, or nil.")
 
 (defvar kube-logs-presets nil
   "Alist of named kube-logs presets.
@@ -140,7 +150,7 @@ Each element has the form (NAME . PLIST).")
   "Supported Kubernetes target kinds.")
 
 (defconst kube-logs--preset-keys
-  '(:context :namespace :namespace-enabled :target-kind :target :follow :tail-lines :since)
+  '(:context :namespace :namespace-enabled :target-kind :target :follow :tail-lines :since :filter)
   "Allowed keys for kube-logs presets.")
 
 (defun kube-logs--transient-reprompt ()
@@ -274,7 +284,27 @@ Signals `user-error' on failure."
    (cons "Tail" (if kube-logs--viewer-tail
                      (number-to-string kube-logs--viewer-tail)
                    "none"))
-   (cons "Since" (or kube-logs--viewer-since "none"))))
+   (cons "Since" (or kube-logs--viewer-since "none"))
+   (cons "Filter" (or kube-logs-filter "none"))))
+
+(defun kube-logs--command-with-filter (args &optional line-buffered)
+  "Return process command list for kubectl ARGS with optional grep filter.
+
+When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
+  (let ((regex (and kube-logs-filter (not (string-empty-p kube-logs-filter)) kube-logs-filter)))
+    (if (not regex)
+        (cons kube-logs-kubectl args)
+      (let* ((kubectl-cmd (string-join (mapcar #'shell-quote-argument
+                                               (cons kube-logs-kubectl args))
+                                       " "))
+             (grep-cmd (string-join
+                        (append
+                         (list "grep")
+                         (when line-buffered (list "--line-buffered"))
+                         (list "-E" (shell-quote-argument regex)))
+                        " "))
+             (full (format "%s | %s" kubectl-cmd grep-cmd)))
+        (list shell-file-name shell-command-switch full)))))
 
 (defun kube-logs--install-viewer-keymap ()
   "Install buffer-local keymap tweaks for kube logs viewer buffers."
@@ -458,7 +488,9 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
         (kube-logs--flush-pending-fragment)
         (setq kube-logs--process nil)))
     (when (and (memq (process-status process) '(exit signal))
-               (not (zerop (process-exit-status process))))
+               (not (zerop (process-exit-status process)))
+               (not (and kube-logs-filter
+                         (= (process-exit-status process) 1))))
       (message "kubectl logs exited (%s): %s"
                (process-exit-status process)
                (string-trim event)))))
@@ -467,13 +499,14 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
   "Fetch logs once asynchronously and render in json-log-viewer."
   (let* ((buffer (kube-logs--make-viewer-buffer nil nil))
          (args (kube-logs--logs-args))
+         (command (kube-logs--command-with-filter args nil))
          (output-buffer (generate-new-buffer " *kube-logs-once*"))
          (label (kube-logs--target-description))
          (process
           (make-process
            :name (kube-logs--process-name)
            :buffer output-buffer
-           :command (cons kube-logs-kubectl args)
+           :command command
            :noquery t
            :connection-type 'pipe
            :sentinel
@@ -489,7 +522,8 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
                            (setq kube-logs--process nil))
                          (when (eq kube-logs--once-output-buffer output-buffer)
                            (setq kube-logs--once-output-buffer nil))
-                         (if (zerop exit-code)
+                         (if (or (zerop exit-code)
+                                 (and kube-logs-filter (= exit-code 1)))
                              (let* ((raw-lines (split-string output "\n" t))
                                     (json-lines (kube-logs--lines->json-lines raw-lines)))
                                (json-log-viewer-replace-log-lines buffer json-lines nil)
@@ -512,10 +546,11 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
   "Start streaming logs and render them in json-log-viewer."
   (let* ((buffer (kube-logs--make-viewer-buffer nil t))
          (args (kube-logs--logs-args))
+         (command (kube-logs--command-with-filter args t))
          (process (make-process
                    :name (kube-logs--process-name)
                    :buffer buffer
-                   :command (cons kube-logs-kubectl args)
+                   :command command
                    :noquery t
                    :connection-type 'pipe)))
     (with-current-buffer buffer
@@ -575,7 +610,8 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
                    (:target . kube-logs-target)
                    (:follow . kube-logs-follow)
                    (:tail-lines . kube-logs-tail-lines)
-                   (:since . kube-logs-since)))
+                   (:since . kube-logs-since)
+                   (:filter . kube-logs-filter)))
     (let ((key (car entry))
           (var (cdr entry)))
       (when (plist-member plist key)
@@ -709,8 +745,7 @@ This stores one active target; choosing pod/deployment replaces the other."
                         (when (<= n 0)
                           (user-error "Tail lines must be a positive integer"))
                         n)))
-              (when kube-logs-tail-lines
-                (number-to-string kube-logs-tail-lines))))
+              input))
   :argument "--tail=")
 
 (transient-define-infix kube-logs-infix-since ()
@@ -721,14 +756,46 @@ This stores one active target; choosing pod/deployment replaces the other."
   :reader (lambda (_prompt initial _hist)
             (let ((input (string-trim (read-string "Since (e.g. 5m, empty=none): " (or initial "")))))
               (setq kube-logs-since (unless (string-empty-p input) input))
-              kube-logs-since))
+              input))
   :argument "--since=")
+
+(transient-define-infix kube-logs-infix-filter ()
+  :description "Filter regex"
+  :class 'transient-option
+  :allow-empty t
+  :init-value (lambda (obj) (transient-infix-set obj kube-logs-filter))
+  :reader (lambda (_prompt initial _hist)
+            (let ((input (string-trim (read-string "Filter regex (empty=none): "
+                                                   (or initial "")))))
+              (setq kube-logs-filter (unless (string-empty-p input) input))
+              input))
+  :argument "--filter=")
 
 (transient-define-suffix kube-logs-action-run ()
   "Run kube logs with current selections."
   :transient nil
   (interactive)
+  (kube-logs--sync-session-from-transient)
   (kube-logs-run))
+
+(defun kube-logs--sync-session-from-transient ()
+  "Sync backing session vars from active `kube-logs-transient` infix args."
+  (when (and (boundp 'transient-current-command)
+             (eq transient-current-command 'kube-logs-transient))
+    (let* ((args (transient-args 'kube-logs-transient))
+           (tail (transient-arg-value "--tail=" args))
+           (since (transient-arg-value "--since=" args))
+           (filter (transient-arg-value "--filter=" args)))
+      (setq kube-logs-tail-lines
+            (unless (or (null tail) (string-empty-p tail))
+              (let ((n (string-to-number tail)))
+                (when (<= n 0)
+                  (user-error "Tail lines must be a positive integer"))
+                n)))
+      (setq kube-logs-since
+            (unless (or (null since) (string-empty-p since)) since))
+      (setq kube-logs-filter
+            (unless (or (null filter) (string-empty-p filter)) filter)))))
 
 (transient-define-prefix kube-logs-transient ()
   "Transient menu for selecting and running kubectl logs."
@@ -737,6 +804,7 @@ This stores one active target; choosing pod/deployment replaces the other."
   [["Config"
     ("-m" "Tail lines" kube-logs-infix-tail-lines)
     ("-s" "Since" kube-logs-infix-since)
+    ("-F" "Filter" kube-logs-infix-filter)
     ("-f" kube-logs-toggle-follow)]
    ["Target"
     ("c" kube-logs-select-context)

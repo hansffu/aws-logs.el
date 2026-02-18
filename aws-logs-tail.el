@@ -24,6 +24,7 @@
 (defvar aws-logs-log-group)
 (defvar aws-logs-follow)
 (defvar aws-logs-ecs)
+(defvar aws-logs-filter)
 (defvar aws-logs-time-range)
 (defvar aws-logs-custom-time-range)
 (defvar aws-logs-tail-ecs-batch-flush-interval)
@@ -108,7 +109,27 @@
   (list (cons "Log group" (or aws-logs-log-group "-"))
         (cons "Profile" (or aws-logs-profile "-"))
         (cons "Follow" (if aws-logs-follow "yes" "no"))
-        (cons "Since" (aws-logs--tail-since-display))))
+        (cons "Since" (aws-logs--tail-since-display))
+        (cons "Filter" (or aws-logs-filter "-"))))
+
+(defun aws-logs--tail-command-with-filter (args &optional line-buffered)
+  "Return process command list for AWS ARGS with optional grep filter.
+
+When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
+  (let ((regex (and aws-logs-filter (not (string-empty-p aws-logs-filter)) aws-logs-filter)))
+    (if (not regex)
+        (cons aws-logs-cli args)
+      (let* ((aws-cmd (string-join (mapcar #'shell-quote-argument
+                                           (cons aws-logs-cli args))
+                                   " "))
+             (grep-cmd (string-join
+                        (append
+                         (list "grep")
+                         (when line-buffered (list "--line-buffered"))
+                         (list "-E" (shell-quote-argument regex)))
+                        " "))
+             (full (format "%s | %s" aws-cmd grep-cmd)))
+        (list shell-file-name shell-command-switch full)))))
 
 (defun aws-logs--tail-viewer-buffer-name ()
   "Return ECS viewer buffer name for current log group."
@@ -383,7 +404,9 @@ When FLUSH-NOW is non-nil, flush immediately."
         (aws-logs--tail-ecs-flush-pending-line)
         (setq aws-logs--tail-process nil)))
     (when (and (memq (process-status process) '(exit signal))
-               (not (zerop (process-exit-status process))))
+               (not (zerop (process-exit-status process)))
+               (not (and aws-logs-filter
+                         (= (process-exit-status process) 1))))
       (message "AWS logs tail exited (%s): %s"
                (process-exit-status process)
                (string-trim event)))))
@@ -391,14 +414,19 @@ When FLUSH-NOW is non-nil, flush immediately."
 (defun aws-logs--tail-run-comint ()
   "Run tail in a comint buffer."
   (let* ((buffer (get-buffer-create (format "*AWS logs - %s*" aws-logs-log-group)))
-         (args (append (aws-logs--tail-global-args) (aws-logs--tail-args))))
+         (args (append (aws-logs--tail-global-args) (aws-logs--tail-args)))
+         (command (aws-logs--tail-command-with-filter args t)))
     (aws-logs--tail-kill-buffer-process buffer)
     (with-current-buffer buffer
       (let ((inhibit-read-only t))
         (erase-buffer))
       (aws-logs-mode))
-    (let ((process (apply #'start-process (aws-logs--tail-process-name)
-                          buffer aws-logs-cli args)))
+    (let ((process (make-process
+                    :name (aws-logs--tail-process-name)
+                    :buffer buffer
+                    :command command
+                    :noquery t
+                    :connection-type 'pipe)))
       (with-current-buffer buffer
         (setq-local aws-logs--tail-process process)
         (display-buffer buffer)
@@ -410,6 +438,7 @@ When FLUSH-NOW is non-nil, flush immediately."
   "Run ECS tail once asynchronously and render in json-log-viewer."
   (let* ((buffer (aws-logs--tail-make-ecs-buffer nil nil))
          (args (append (aws-logs--tail-global-args) (aws-logs--tail-args)))
+         (command (aws-logs--tail-command-with-filter args nil))
          (output-buffer (generate-new-buffer " *aws-logs-tail-once*"))
          (log-group aws-logs-log-group))
     (with-current-buffer buffer
@@ -420,7 +449,7 @@ When FLUSH-NOW is non-nil, flush immediately."
            (make-process
             :name (aws-logs--tail-process-name)
             :buffer output-buffer
-            :command (cons aws-logs-cli args)
+            :command command
             :noquery t
             :connection-type 'pipe
             :sentinel
@@ -435,7 +464,8 @@ When FLUSH-NOW is non-nil, flush immediately."
                             (setq aws-logs--tail-process nil))
                           (when (eq aws-logs--tail-once-output-buffer output-buffer)
                             (setq aws-logs--tail-once-output-buffer nil))
-                          (if (zerop exit-code)
+                          (if (or (zerop exit-code)
+                                  (and aws-logs-filter (= exit-code 1)))
                               (let* ((raw-lines (split-string output "\n" t))
                                      (normalized+pending
                                       (aws-logs--tail-ecs-normalize-lines-with-pending raw-lines nil))
@@ -459,8 +489,13 @@ When FLUSH-NOW is non-nil, flush immediately."
   "Run ECS tail in follow mode and stream lines into json-log-viewer."
   (let* ((buffer (aws-logs--tail-make-ecs-buffer nil t))
          (args (append (aws-logs--tail-global-args) (aws-logs--tail-args)))
-         (process (apply #'start-process (aws-logs--tail-process-name)
-                         buffer aws-logs-cli args)))
+         (command (aws-logs--tail-command-with-filter args t))
+         (process (make-process
+                   :name (aws-logs--tail-process-name)
+                   :buffer buffer
+                   :command command
+                   :noquery t
+                   :connection-type 'pipe)))
     (with-current-buffer buffer
       (setq-local aws-logs--tail-process process)
       (setq-local aws-logs--tail-pending-fragment "")

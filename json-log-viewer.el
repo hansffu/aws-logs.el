@@ -61,7 +61,7 @@
   :type 'boolean
   :group 'json-log-viewer)
 
-(defcustom json-log-viewer-stream-max-entries 20000
+(defcustom json-log-viewer-stream-max-entries 15000
   "Maximum entries retained in streaming buffers.
 
 When nil, streaming buffers are unbounded."

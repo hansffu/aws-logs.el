@@ -8,7 +8,6 @@
 ;;
 ;;; Code:
 
-(require 'json-log-viewer)
 
 (declare-function evil-define-key "evil-core" (state keymap &rest bindings))
 
