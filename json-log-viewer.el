@@ -311,7 +311,18 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
   (when (and (stringp value) (not (string-empty-p value)))
     (let ((parsed (ignore-errors (date-to-time value))))
       (when parsed
-        (float-time parsed)))))
+        (let* ((base (float-time parsed))
+               (fraction
+                (when (string-match
+                       "[T ][0-9][0-9]:[0-9][0-9]:[0-9][0-9][.,]\\([0-9]+\\)"
+                       value)
+                  (let ((digits (match-string 1 value)))
+                    (/ (string-to-number digits)
+                       (expt 10.0 (length digits)))))))
+          ;; `date-to-time' can ignore sub-second precision in some formats.
+          (if (and fraction (= base (truncate base)))
+              (+ base fraction)
+            base))))))
 
 (defun json-log-viewer--level-face (level)
   "Return face symbol suitable for LEVEL."

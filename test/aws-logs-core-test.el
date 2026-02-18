@@ -109,6 +109,15 @@
     (should (= 10 (plist-get (car entries) :id)))
     (should (= 11 (plist-get (cadr entries) :id)))))
 
+(ert-deftest json-log-viewer-parse-time-preserves-subsecond-order-test ()
+  (let ((t1 (json-log-viewer--parse-time "2026-01-01T00:00:00.123Z"))
+        (t2 (json-log-viewer--parse-time "2026-01-01T00:00:00.124Z")))
+    (should (numberp t1))
+    (should (numberp t2))
+    (should (< t1 t2))
+    (should (> (- t2 t1) 0.0009))
+    (should (< (- t2 t1) 0.0011))))
+
 (ert-deftest json-log-viewer-json-refresh-async-sentinel-test ()
   (let* ((buf (json-log-viewer-make-buffer
                "*json-log-viewer-test*"
