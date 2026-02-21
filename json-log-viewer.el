@@ -12,6 +12,8 @@
 (require 'json)
 (require 'subr-x)
 
+(declare-function json-pretty-print-buffer "json" ())
+
 (defgroup json-log-viewer nil
   "Foldable JSON log viewer buffers."
   :group 'tools)
@@ -71,6 +73,14 @@ When nil, streaming buffers are unbounded."
 (defcustom json-log-viewer-stream-chunk-size 100
   "Chunk size used for streaming storage and batch eviction."
   :type 'integer
+  :group 'json-log-viewer)
+
+(defcustom json-log-viewer-json-syntax-mode 'json-ts-mode
+  "Major mode function used to fontify pretty JSON detail blocks.
+
+When the configured mode is unavailable or fails, json-log-viewer falls back
+to `js-mode`."
+  :type 'symbol
   :group 'json-log-viewer)
 
 (defvar-local json-log-viewer--fold-overlays nil
@@ -159,6 +169,9 @@ When nil, streaming buffers are unbounded."
 
 (defvar-local json-log-viewer--extra-paths nil
   "List of JSON paths used for extra summary segments.")
+
+(defvar-local json-log-viewer--json-paths nil
+  "List of JSON paths rendered as pretty JSON detail blocks.")
 
 (defvar-local json-log-viewer--json-refresh-log-lines-function nil
   "Callback: (OLD-LOG-LINES) -> NEW-LOG-LINES for JSON-line buffers.")
@@ -282,8 +295,68 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
     (json-log-viewer--value->string
      (json-log-viewer--json-get-path parsed path))))
 
-(defun json-log-viewer--json-object-fields (parsed raw-line)
-  "Build detail fields alist from PARSED JSON and RAW-LINE."
+(defun json-log-viewer--normalize-path-list (paths source)
+  "Validate PATHS from SOURCE and return normalized path list."
+  (unless (or (null paths)
+              (and (listp paths)
+                   (cl-every #'stringp paths)))
+    (user-error "%s must be a list of strings, got: %S" source paths))
+  (let (normalized)
+    (dolist (path paths)
+      (let ((trimmed (string-trim path)))
+        (when (not (string-empty-p trimmed))
+          (push trimmed normalized))))
+    (nreverse (delete-dups normalized))))
+
+(defun json-log-viewer--fontify-json-string (value)
+  "Return VALUE with JSON syntax highlighting."
+  (with-temp-buffer
+    (insert value)
+    (delay-mode-hooks
+      (let ((warning-suppress-types (cons '(treesit) warning-suppress-types)))
+        (let* ((mode json-log-viewer-json-syntax-mode)
+               (can-use-mode
+                (cond
+                 ((not (symbolp mode)) nil)
+                 ((not (fboundp mode)) nil)
+                 ((and (eq mode 'json-ts-mode)
+                       (fboundp 'treesit-language-available-p))
+                  (ignore-errors (treesit-language-available-p 'json)))
+                 (t t)))
+               (ok (and can-use-mode
+                        (condition-case nil
+                            (progn (funcall mode) t)
+                          (error nil)))))
+          (unless ok
+            (if (fboundp 'js-mode)
+                (js-mode)
+              (fundamental-mode))))))
+    (if (fboundp 'font-lock-ensure)
+        (font-lock-ensure (point-min) (point-max))
+      (font-lock-fontify-region (point-min) (point-max)))
+    (buffer-substring (point-min) (point-max))))
+
+(defun json-log-viewer--json-value->pretty-string (value)
+  "Render VALUE as pretty, syntax-highlighted JSON text."
+  (let* ((normalized (or (json-log-viewer--json-parse-maybe value) value))
+         (json (condition-case nil
+                   (json-serialize normalized :null-object nil :false-object :false)
+                 (error nil))))
+    (if (not json)
+        (or (json-log-viewer--value->string normalized) "")
+      (let ((pretty (condition-case nil
+                        (with-temp-buffer
+                          (insert json)
+                          (json-pretty-print-buffer)
+                          (buffer-string))
+                      (error json))))
+        (propertize (json-log-viewer--fontify-json-string (string-trim-right pretty))
+                    'json-log-viewer-json-block t)))))
+
+(defun json-log-viewer--json-object-fields (parsed raw-line json-paths)
+  "Build detail fields alist from PARSED JSON and RAW-LINE.
+
+JSON-PATHS is a list of paths to render as JSON blocks instead of flattening."
   (cl-labels
       ((join-path (prefix part)
          (if (and prefix (not (string-empty-p prefix)))
@@ -291,6 +364,8 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
            part))
        (flatten (node &optional prefix)
          (cond
+          ((and prefix (member prefix json-paths))
+           (list (cons prefix (json-log-viewer--json-value->pretty-string node))))
           ((hash-table-p node)
            (let (fields keys)
              (maphash (lambda (key _value)
@@ -402,11 +477,14 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
     (list :id entry-id
           :raw line
           :parsed parsed
-          :fields (json-log-viewer--json-object-fields parsed line)
+          :fields (json-log-viewer--json-object-fields
+                   parsed line json-log-viewer--json-paths)
           :sort-key sort-key)))
 
-(defun json-log-viewer--json-line->entry-with-config (line entry-id timestamp-path)
-  "Convert LINE into an entry plist using ENTRY-ID and TIMESTAMP-PATH."
+(defun json-log-viewer--json-line->entry-with-config (line entry-id timestamp-path &optional json-paths)
+  "Convert LINE into an entry plist using ENTRY-ID and TIMESTAMP-PATH.
+
+When JSON-PATHS is non-nil, selected paths render as pretty JSON blocks."
   (let* ((parsed (json-log-viewer--json-parse-line line))
          (timestamp (json-log-viewer--resolve-path parsed timestamp-path))
          (timestamp-epoch (json-log-viewer--parse-time timestamp))
@@ -414,10 +492,10 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
     (list :id entry-id
           :raw line
           :parsed parsed
-          :fields (json-log-viewer--json-object-fields parsed line)
+          :fields (json-log-viewer--json-object-fields parsed line json-paths)
           :sort-key sort-key)))
 
-(defun json-log-viewer--json-lines->entries (lines timestamp-path start-id)
+(defun json-log-viewer--json-lines->entries (lines timestamp-path start-id &optional json-paths)
   "Convert LINES into entries using TIMESTAMP-PATH, starting at START-ID.
 
 Returns cons cell (ENTRIES . NEXT-ID)."
@@ -425,7 +503,7 @@ Returns cons cell (ENTRIES . NEXT-ID)."
         entries)
     (dolist (line lines)
       (push (json-log-viewer--json-line->entry-with-config
-             line next-id timestamp-path)
+             line next-id timestamp-path json-paths)
             entries)
       (setq next-id (1+ next-id)))
     (cons (nreverse entries) next-id)))
@@ -592,9 +670,23 @@ Returns cons cell (ENTRIES . NEXT-ID)."
 (defun json-log-viewer--insert-entry-details-lines (fields)
   "Insert detail lines for normalized FIELD pairs."
   (dolist (pair fields)
-    (insert "  ")
-    (insert (propertize (car pair) 'face 'json-log-viewer-key-face))
-    (insert ": " (cdr pair) "\n"))
+    (let* ((key (car pair))
+           (value (or (cdr pair) ""))
+           (prefix (format "  %s: " key))
+           (continuation (make-string (length prefix) ?\s))
+           (lines (split-string value "\n" nil)))
+      ;; (insert "  ")
+      (insert (propertize key 'face 'json-log-viewer-key-face))
+      (if (get-text-property 0 'json-log-viewer-json-block value)
+          (progn
+            (insert ":\n")
+            (insert value "\n"))
+        (insert ": ")
+        (if (null lines)
+            (insert "\n")
+          (insert (car lines) "\n")
+          (dolist (line (cdr lines))
+            (insert continuation line "\n"))))))
   (insert "\n"))
 
 (defun json-log-viewer--entry-expand (entry-overlay)
@@ -1256,6 +1348,7 @@ In non-streaming mode the append position follows configured direction."
                                        level-path
                                        message-path
                                        extra-paths
+                                       json-paths
                                        refresh-function
                                        streaming
                                        (max-entries json-log-viewer-stream-max-entries)
@@ -1271,7 +1364,8 @@ LOG-LINES is a list of JSON strings.
 
 TIMESTAMP-PATH, LEVEL-PATH, MESSAGE-PATH are dot-separated JSON paths used for
 summary rendering. EXTRA-PATHS is a list of additional paths rendered as
-bracketed segments.
+bracketed segments. JSON-PATHS is a list of paths rendered as pretty JSON
+blocks in entry details instead of flattened subfields.
 
 REFRESH-FUNCTION, when non-nil, is called with the current old list of raw log
 lines and must return the new full list of raw log lines.
@@ -1286,10 +1380,16 @@ MAX-ENTRIES caps retained rows in streaming mode. Nil disables capping.
 Returns the created buffer."
   (unless (stringp buffer-name)
     (user-error "json-log-viewer-make-buffer requires BUFFER-NAME to be a string"))
-  (let* ((normalized-lines (json-log-viewer--ensure-log-lines
+  (let* ((normalized-extra-paths (json-log-viewer--normalize-path-list
+                                  extra-paths
+                                  "json-log-viewer-make-buffer :extra-paths"))
+         (normalized-json-paths (json-log-viewer--normalize-path-list
+                                 json-paths
+                                 "json-log-viewer-make-buffer :json-paths"))
+         (normalized-lines (json-log-viewer--ensure-log-lines
                             log-lines "json-log-viewer-make-buffer :log-lines"))
          (entries+next (json-log-viewer--json-lines->entries
-                        normalized-lines timestamp-path 0))
+                        normalized-lines timestamp-path 0 normalized-json-paths))
          (initial-entries (car entries+next))
          (next-id (cdr entries+next))
          (normalized-direction (json-log-viewer--normalize-direction direction))
@@ -1321,7 +1421,8 @@ Returns the created buffer."
       (setq-local json-log-viewer--timestamp-path timestamp-path)
       (setq-local json-log-viewer--level-path level-path)
       (setq-local json-log-viewer--message-path message-path)
-      (setq-local json-log-viewer--extra-paths (append extra-paths nil))
+      (setq-local json-log-viewer--extra-paths normalized-extra-paths)
+      (setq-local json-log-viewer--json-paths normalized-json-paths)
       (setq-local json-log-viewer--json-refresh-log-lines-function refresh-function)
       (setq-local json-log-viewer--json-header-lines-function header-lines-function)
       (setq-local json-log-viewer--seen-signatures (make-hash-table :test 'equal))
@@ -1366,7 +1467,8 @@ When PRESERVE-FILTER is non-nil, keep the current active filter."
              (entries+next
               (if (eq json-log-viewer--line-to-entry-function #'json-log-viewer--json-line->entry)
                   (json-log-viewer--json-lines->entries
-                   normalized-lines json-log-viewer--timestamp-path 0)
+                   normalized-lines json-log-viewer--timestamp-path 0
+                   json-log-viewer--json-paths)
                 (let (entries)
                   (dolist (line normalized-lines)
                     (push (funcall json-log-viewer--line-to-entry-function line) entries))

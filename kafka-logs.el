@@ -89,6 +89,14 @@ When nil, keep payloads as-is."
                  (const :tag "JSON" json))
   :group 'kafka-logs)
 
+(defcustom kafka-logs-default-json-paths nil
+  "Default JSON detail paths rendered as formatted blocks.
+
+Values are dot-separated paths understood by json-log-viewer, for example
+`payload` or `payload.log`."
+  :type '(repeat string)
+  :group 'kafka-logs)
+
 (defvar kafka-logs-connection kafka-logs-default-connection
   "Selected Kafka connection name for this Emacs session.")
 
@@ -111,6 +119,9 @@ Value is nil or (FROM . TO), where both are date-time strings.")
 
 (defvar kafka-logs-payload-format kafka-logs-default-payload-format
   "Payload rendering format for this Emacs session, or nil.")
+
+(defvar kafka-logs-json-paths (append kafka-logs-default-json-paths nil)
+  "JSON detail paths rendered as formatted blocks in this Emacs session.")
 
 (defvar kafka-logs-connections nil
   "Alist of named Kafka connections.
@@ -144,6 +155,9 @@ Each element has the form (NAME . PLIST).")
 (defvar-local kafka-logs--viewer-payload-format nil
   "Payload format shown in current viewer buffer header.")
 
+(defvar-local kafka-logs--viewer-json-paths nil
+  "JSON detail paths shown in current viewer buffer header.")
+
 (defconst kafka-logs--connection-keys
   '(:brokers :security-protocol :sasl-mechanisms :username :password
     :auth-source :properties :kcat-args :description)
@@ -153,6 +167,30 @@ Each element has the form (NAME . PLIST).")
   "Refresh transient so UI reflects current backing fields."
   (transient-quit-one)
   (transient-setup 'kafka-logs-transient))
+
+(defun kafka-logs--normalize-json-paths (paths &optional source)
+  "Validate and normalize JSON PATHS.
+
+SOURCE is an optional user-facing origin label."
+  (unless (and (listp paths) (cl-every #'stringp paths))
+    (user-error "%s must be a list of strings, got: %S"
+                (or source "JSON paths")
+                paths))
+  (let ((seen (make-hash-table :test 'equal))
+        normalized)
+    (dolist (path paths)
+      (let ((trimmed (string-trim path)))
+        (unless (or (string-empty-p trimmed)
+                    (gethash trimmed seen))
+          (puthash trimmed t seen)
+          (push trimmed normalized))))
+    (nreverse normalized)))
+
+(defun kafka-logs--json-paths-display (paths)
+  "Return one-line display label for JSON PATHS."
+  (if (and paths (> (length paths) 0))
+      (string-join paths ",")
+    "none"))
 
 (defun kafka-logs--normalize-brokers (brokers)
   "Normalize BROKERS to a comma-separated string."
@@ -463,7 +501,8 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
    (cons "Filter" (or kafka-logs--viewer-filter "none"))
    (cons "Payload format" (if (eq kafka-logs--viewer-payload-format 'json)
                               "json"
-                            "string"))))
+                            "string"))
+   (cons "JSON paths" (kafka-logs--json-paths-display kafka-logs--viewer-json-paths))))
 
 (defun kafka-logs--install-viewer-keymap ()
   "Install buffer-local keymap tweaks for kafka logs viewer buffers."
@@ -573,7 +612,6 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
           (puthash "key" key obj))
         (when display-payload
           (puthash "payload" display-payload obj))
-        (message "%s" (json-serialize obj))
         (json-serialize obj)))))
 
 (defun kafka-logs--lines->json-lines (lines)
@@ -597,6 +635,7 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
            :level-path "level"
            :message-path "message"
            :extra-paths '("connection" "topic" "partition" "offset" "key")
+           :json-paths kafka-logs-json-paths
            :streaming streaming
            :direction 'oldest-first
            :header-lines-function #'kafka-logs--viewer-header-lines))
@@ -610,6 +649,7 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
       (setq-local kafka-logs--viewer-time-range kafka-logs-time-range)
       (setq-local kafka-logs--viewer-filter kafka-logs-filter)
       (setq-local kafka-logs--viewer-payload-format kafka-logs-payload-format)
+      (setq-local kafka-logs--viewer-json-paths kafka-logs-json-paths)
       (add-hook 'kill-buffer-hook
                 (lambda ()
                   (kafka-logs--kill-buffer-process (current-buffer)))
@@ -864,6 +904,26 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
               n)))
     (kafka-logs--transient-reprompt)))
 
+(transient-define-suffix kafka-logs-set-json-paths ()
+  "Set JSON detail paths rendered as formatted blocks."
+  :description (lambda ()
+                 (format "JSON paths: %s"
+                         (kafka-logs--json-paths-display kafka-logs-json-paths)))
+  :transient t
+  (interactive)
+  (let* ((initial (if kafka-logs-json-paths
+                      (string-join kafka-logs-json-paths ",")
+                    ""))
+         (input (string-trim (read-string "JSON paths (comma separated, empty=none): "
+                                          initial))))
+    (setq kafka-logs-json-paths
+          (if (string-empty-p input)
+              nil
+            (kafka-logs--normalize-json-paths
+             (split-string input "," t)
+             "JSON paths")))
+    (kafka-logs--transient-reprompt)))
+
 (transient-define-suffix kafka-logs-toggle-payload-format ()
   "Toggle payload rendering format."
   :description (lambda ()
@@ -891,6 +951,7 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
     ("t" kafka-logs-select-topic)
     ("-f" kafka-logs-toggle-stream)
     ("-F" kafka-logs-set-filter)
+    ("-j" kafka-logs-set-json-paths)
     ("-p" kafka-logs-toggle-payload-format)
     ("-m" kafka-logs-set-max-messages)]
    ["Range (time-span mode)"

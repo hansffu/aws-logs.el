@@ -12,6 +12,7 @@
 (defvar kafka-logs-time-range)
 (defvar kafka-logs-filter)
 (defvar kafka-logs-max-messages)
+(defvar kafka-logs-json-paths)
 (defvar kafka-logs-connections)
 
 (ert-deftest kafka-logs-connection-base-args-with-auth-source-test ()
@@ -103,6 +104,41 @@
     (should (equal (length kafka-logs-connections) 1))
     (should (equal (plist-get (cdr (assoc "dev" kafka-logs-connections)) :brokers)
                    "localhost:9093"))))
+
+(ert-deftest kafka-logs-normalize-json-paths-test ()
+  (should (equal (kafka-logs--normalize-json-paths
+                  '(" payload " "payload.log" "payload"))
+                 '("payload" "payload.log")))
+  (should-error (kafka-logs--normalize-json-paths "payload")
+                :type 'user-error))
+
+(ert-deftest kafka-logs-make-viewer-buffer-passes-json-paths-test ()
+  (let ((kafka-logs-connection "prod")
+        (kafka-logs-topic "orders")
+        (kafka-logs-stream t)
+        (kafka-logs-time-range nil)
+        (kafka-logs-filter nil)
+        (kafka-logs-payload-format nil)
+        (kafka-logs-json-paths '("payload" "payload.log"))
+        captured-args
+        viewer-buffer)
+    (cl-letf (((symbol-function 'json-log-viewer-make-buffer)
+               (lambda (_buffer-name &rest args)
+                 (setq captured-args args)
+                 (setq viewer-buffer (generate-new-buffer "*kafka-logs-viewer-test*"))
+                 (with-current-buffer viewer-buffer
+                   (special-mode))
+                 viewer-buffer)))
+      (unwind-protect
+          (let ((buffer (kafka-logs--make-viewer-buffer nil nil)))
+            (should (eq buffer viewer-buffer))
+            (should (equal (plist-get captured-args :json-paths)
+                           '("payload" "payload.log")))
+            (with-current-buffer buffer
+              (should (equal kafka-logs--viewer-json-paths
+                             '("payload" "payload.log")))))
+        (when (buffer-live-p viewer-buffer)
+          (kill-buffer viewer-buffer))))))
 
 (provide 'kafka-logs-test)
 ;;; kafka-logs-test.el ends here

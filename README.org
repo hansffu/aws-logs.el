@@ -151,6 +151,7 @@ It is callback-driven, keeps runtime state buffer-local, and supports:
  :level-path "level"
  :message-path "msg"
  :extra-paths '("meta.service" "meta.env")
+ :json-paths '("payload" "payload.log")
  :refresh-function (lambda (old-log-lines) old-log-lines)
  :streaming nil
  :direction 'newest-first
@@ -163,6 +164,10 @@ Notes:
 - ~:refresh-function~ receives old raw lines and may return:
   - a new full list of JSON strings (synchronous refresh), or
   - the symbol ~:async~ (caller will update later via ~json-log-viewer-replace-log-lines~ or ~json-log-viewer-push~).
+- ~:json-paths~ renders matching detail paths as pretty JSON blocks with syntax highlighting
+  and suppresses flattened descendant fields for those paths.
+- JSON block highlighting uses ~json-log-viewer-json-syntax-mode~ (default
+  ~json-ts-mode~, with fallback to ~js-mode~ if unavailable).
 - ~:streaming~ controls append semantics:
   - ~nil~: non-streaming order follows ~:direction~.
   - non-~nil~: pushes append to bottom.
@@ -345,6 +350,7 @@ rendered in ~json-log-viewer~.
 - Look up messages in a FROM/TO time span.
 - Optional regex filtering with ~grep~.
 - Optional payload decoding mode for JSON message bodies.
+- Optional JSON-path detail rendering (for example ~payload~ as pretty JSON block).
 
 ** File
 
@@ -366,6 +372,7 @@ Put ~kafka-logs.el~ and ~json-log-viewer.el~ on your ~load-path~.
   (kafka-logs-default-topic "orders.events")
   (kafka-logs-default-stream t)
   (kafka-logs-default-payload-format 'json)
+  (kafka-logs-default-json-paths '("payload"))
   :config
   ;; auth-source lookup (example entry source):
   ;; machine kafka-prod login app-user password s3cr3t port 9093
@@ -401,6 +408,7 @@ Main transient keys:
 - ~a~ set FROM time (time-span mode)
 - ~z~ set TO time (time-span mode)
 - ~-F~ set regex filter
+- ~-j~ set json detail paths (comma-separated, e.g. ~payload,payload.log~)
 - ~-p~ toggle payload format (string/json)
 - ~-m~ set max message count for time-span mode
 - ~RET~ run logs
