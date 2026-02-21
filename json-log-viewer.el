@@ -74,7 +74,7 @@ When nil, streaming buffers are unbounded."
   :group 'json-log-viewer)
 
 (defvar-local json-log-viewer--fold-overlays nil
-  "Fold overlays in the current viewer buffer.")
+  "Detail overlays for expanded entries in the current viewer buffer.")
 
 (defvar-local json-log-viewer--entry-overlays nil
   "Entry overlays in the current viewer buffer.")
@@ -580,31 +580,83 @@ Returns cons cell (ENTRIES . NEXT-ID)."
   (setq json-log-viewer--entry-count 0)
   (setq json-log-viewer--current-line-overlay nil))
 
-(defun json-log-viewer--fold-overlay-at-point ()
-  "Return fold overlay at point, or nil."
-  (or (get-text-property (point) 'json-log-viewer-details-overlay)
-      (get-text-property (line-beginning-position) 'json-log-viewer-details-overlay)
-      (catch 'found
-        (dolist (ov (overlays-at (point)))
-          (when (overlay-get ov 'json-log-viewer-fold)
-            (throw 'found ov)))
-        nil)))
+(defun json-log-viewer--entry-summary-end (entry-overlay)
+  "Return end position of ENTRY-OVERLAY summary line."
+  (save-excursion
+    (goto-char (overlay-start entry-overlay))
+    (end-of-line)
+    (if (< (point) (point-max))
+        (1+ (point))
+      (point))))
+
+(defun json-log-viewer--insert-entry-details-lines (fields)
+  "Insert detail lines for normalized FIELD pairs."
+  (dolist (pair fields)
+    (insert "  ")
+    (insert (propertize (car pair) 'face 'json-log-viewer-key-face))
+    (insert ": " (cdr pair) "\n"))
+  (insert "\n"))
+
+(defun json-log-viewer--entry-expand (entry-overlay)
+  "Insert details for ENTRY-OVERLAY when currently collapsed."
+  (unless (overlay-get entry-overlay 'json-log-viewer-entry-expanded)
+    (let ((inhibit-read-only t))
+      (save-excursion
+        (goto-char (json-log-viewer--entry-summary-end entry-overlay))
+        (let ((details-start (point))
+              (fields (or (overlay-get entry-overlay 'json-log-viewer-entry-fields)
+                          '())))
+          (json-log-viewer--insert-entry-details-lines fields)
+          (let ((details-end (point))
+                (fold-ov (make-overlay details-start (point))))
+            (overlay-put fold-ov 'json-log-viewer-fold t)
+            (push fold-ov json-log-viewer--fold-overlays)
+            (overlay-put entry-overlay 'json-log-viewer-fold-overlay fold-ov)
+            (overlay-put entry-overlay 'json-log-viewer-entry-expanded t)
+            (move-overlay entry-overlay
+                          (overlay-start entry-overlay)
+                          details-end)))))))
+
+(defun json-log-viewer--entry-collapse (entry-overlay)
+  "Remove details for ENTRY-OVERLAY when currently expanded."
+  (when (overlay-get entry-overlay 'json-log-viewer-entry-expanded)
+    (let ((inhibit-read-only t)
+          (fold-ov (overlay-get entry-overlay 'json-log-viewer-fold-overlay)))
+      (when (and (overlayp fold-ov)
+                 (overlay-buffer fold-ov)
+                 (overlay-start fold-ov)
+                 (overlay-end fold-ov))
+        (delete-region (overlay-start fold-ov) (overlay-end fold-ov))
+        (setq json-log-viewer--fold-overlays
+              (delq fold-ov json-log-viewer--fold-overlays))
+        (delete-overlay fold-ov))
+      (overlay-put entry-overlay 'json-log-viewer-fold-overlay nil)
+      (overlay-put entry-overlay 'json-log-viewer-entry-expanded nil)
+      (move-overlay entry-overlay
+                    (overlay-start entry-overlay)
+                    (json-log-viewer--entry-summary-end entry-overlay)))))
 
 (defun json-log-viewer-toggle-entry ()
   "Toggle fold state for current log entry."
   (interactive)
-  (when-let ((ov (json-log-viewer--fold-overlay-at-point)))
-    (overlay-put ov 'invisible (not (overlay-get ov 'invisible)))))
+  (when-let ((entry-ov (json-log-viewer--entry-overlay-at-point)))
+    (if (overlay-get entry-ov 'json-log-viewer-entry-expanded)
+        (json-log-viewer--entry-collapse entry-ov)
+      (json-log-viewer--entry-expand entry-ov))
+    (json-log-viewer--highlight-current-line)))
 
 (defun json-log-viewer-toggle-all ()
   "Toggle fold state for all log entries."
   (interactive)
-  (let ((show-any nil))
-    (dolist (ov json-log-viewer--fold-overlays)
-      (when (overlay-get ov 'invisible)
-        (setq show-any t)))
-    (dolist (ov json-log-viewer--fold-overlays)
-      (overlay-put ov 'invisible (not show-any)))))
+  (let ((expand-any nil))
+    (dolist (entry-ov json-log-viewer--entry-overlays)
+      (unless (overlay-get entry-ov 'json-log-viewer-entry-expanded)
+        (setq expand-any t)))
+    (dolist (entry-ov (reverse (append json-log-viewer--entry-overlays nil)))
+      (if expand-any
+          (json-log-viewer--entry-expand entry-ov)
+        (json-log-viewer--entry-collapse entry-ov)))
+    (json-log-viewer--highlight-current-line)))
 
 (defun json-log-viewer--entry-overlay-at-point (&optional pos)
   "Return entry overlay at POS, or nil."
@@ -636,11 +688,11 @@ Returns cons cell (ENTRIES . NEXT-ID)."
             (setq json-log-viewer--current-line-overlay nil))
         (let* ((entry-start (max entries-start (overlay-start entry-ov)))
                (entry-end (overlay-end entry-ov))
-               (fold-ov (overlay-get entry-ov 'json-log-viewer-fold-overlay))
-               (collapsed (and fold-ov (overlay-get fold-ov 'invisible)))
-               (highlight-end (if (and collapsed fold-ov)
-                                  (max entries-start (overlay-start fold-ov))
-                                entry-end)))
+               (expanded (overlay-get entry-ov 'json-log-viewer-entry-expanded))
+               (highlight-end (if expanded
+                                  entry-end
+                                (max entries-start
+                                     (json-log-viewer--entry-summary-end entry-ov)))))
           (if (<= highlight-end entry-start)
               (when json-log-viewer--current-line-overlay
                 (delete-overlay json-log-viewer--current-line-overlay)
@@ -1010,28 +1062,17 @@ When result size allows it, updates are previewed live while typing."
          (summary (funcall json-log-viewer--summary-function entry fields))
          (filter-text (json-log-viewer--entry-filter-text fields))
          (summary-start (point))
-         details-start details-end fold-ov entry-ov)
+         entry-ov)
     (insert (or (json-log-viewer--value->string summary) "-") "\n")
-    (setq details-start (point))
-    (dolist (pair fields)
-      (insert "  ")
-      (insert (propertize (car pair) 'face 'json-log-viewer-key-face))
-      (insert ": " (cdr pair) "\n"))
-    (insert "\n")
-    (setq details-end (point))
-    (setq fold-ov (make-overlay details-start details-end))
-    (overlay-put fold-ov 'json-log-viewer-fold t)
-    (overlay-put fold-ov 'invisible t)
-    (push fold-ov json-log-viewer--fold-overlays)
-    (setq entry-ov (make-overlay summary-start details-end))
+    (setq entry-ov (make-overlay summary-start (point)))
     (overlay-put entry-ov 'json-log-viewer-entry t)
-    (overlay-put entry-ov 'json-log-viewer-fold-overlay fold-ov)
+    (overlay-put entry-ov 'json-log-viewer-entry-expanded nil)
+    (overlay-put entry-ov 'json-log-viewer-entry-fields fields)
+    (overlay-put entry-ov 'json-log-viewer-fold-overlay nil)
     (overlay-put entry-ov 'json-log-viewer-filter-text filter-text)
     (overlay-put entry-ov 'json-log-viewer-signature
                  (json-log-viewer--entry-signature entry))
     (push entry-ov json-log-viewer--entry-overlays)
-    (put-text-property summary-start (1- details-start)
-                       'json-log-viewer-details-overlay fold-ov)
     entry-ov))
 
 (defun json-log-viewer--mark-seen-entries (entries)

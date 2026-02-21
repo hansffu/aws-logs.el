@@ -162,6 +162,34 @@
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
+(ert-deftest json-log-viewer-lazy-details-render-on-toggle-test ()
+  (let* ((buf (json-log-viewer-make-buffer
+               "*json-log-viewer-lazy-details-test*"
+               :log-lines
+               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"level\":\"info\",\"msg\":\"hello\",\"meta\":{\"service\":\"orders\"}}")
+               :timestamp-path "timestamp"
+               :level-path "level"
+               :message-path "msg"
+               :streaming nil)))
+    (unwind-protect
+        (with-current-buffer buf
+          (goto-char (point-min))
+          (let ((entry-ov (car json-log-viewer--entry-overlays)))
+            (should entry-ov)
+            (should-not (overlay-get entry-ov 'json-log-viewer-entry-expanded))
+            (should-not (string-match-p "meta\\.service: orders"
+                                        (buffer-substring-no-properties (point-min) (point-max))))
+            (json-log-viewer-toggle-entry)
+            (should (overlay-get entry-ov 'json-log-viewer-entry-expanded))
+            (should (string-match-p "meta\\.service: orders"
+                                    (buffer-substring-no-properties (point-min) (point-max))))
+            (json-log-viewer-toggle-entry)
+            (should-not (overlay-get entry-ov 'json-log-viewer-entry-expanded))
+            (should-not (string-match-p "meta\\.service: orders"
+                                        (buffer-substring-no-properties (point-min) (point-max))))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
 (ert-deftest json-log-viewer-stream-evicts-in-chunks-test ()
   (let* ((json-log-viewer-stream-chunk-size 100)
          (lines (let (acc)
