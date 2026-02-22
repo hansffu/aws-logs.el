@@ -97,15 +97,6 @@ Values are dot-separated paths understood by json-log-viewer, for example
   :type '(repeat string)
   :group 'kafka-logs)
 
-(defcustom kafka-logs-storage-backend 'sqlite
-  "Storage backend used by kafka-logs viewer buffers.
-
-When set to `sqlite`, hidden viewer data (raw lines and detail fields) is
-stored outside Lisp memory."
-  :type '(choice (const :tag "SQLite" sqlite)
-                 (const :tag "Memory" memory))
-  :group 'kafka-logs)
-
 (defcustom kafka-logs-stream-drain-interval 0.05
   "Seconds between stream queue drain ticks.
 
@@ -675,7 +666,6 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
            :message-path "message"
            :extra-paths '("connection" "topic" "partition" "offset" "key")
            :json-paths kafka-logs-json-paths
-           :storage-backend kafka-logs-storage-backend
            :streaming streaming
            :direction 'oldest-first
            :header-lines-function #'kafka-logs--viewer-header-lines))

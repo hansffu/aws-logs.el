@@ -13,7 +13,6 @@
 (defvar kafka-logs-filter)
 (defvar kafka-logs-max-messages)
 (defvar kafka-logs-json-paths)
-(defvar kafka-logs-storage-backend)
 (defvar kafka-logs-stream-max-lines-per-batch)
 (defvar kafka-logs-connections)
 
@@ -122,7 +121,6 @@
         (kafka-logs-filter nil)
         (kafka-logs-payload-format nil)
         (kafka-logs-json-paths '("payload" "payload.log"))
-        (kafka-logs-storage-backend 'sqlite)
         captured-args
         viewer-buffer)
     (cl-letf (((symbol-function 'json-log-viewer-make-buffer)
@@ -137,7 +135,6 @@
             (should (eq buffer viewer-buffer))
             (should (equal (plist-get captured-args :json-paths)
                            '("payload" "payload.log")))
-            (should (eq (plist-get captured-args :storage-backend) 'sqlite))
             (with-current-buffer buffer
               (should (equal kafka-logs--viewer-json-paths
                              '("payload" "payload.log")))))

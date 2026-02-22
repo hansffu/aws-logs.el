@@ -129,8 +129,6 @@
       (should (get-text-property 0 'json-log-viewer-json-block value)))))
 
 (ert-deftest json-log-viewer-sqlite-storage-offloads-hidden-data-test ()
-  (skip-unless (and (fboundp 'sqlite-available-p)
-                    (sqlite-available-p)))
   (let* ((buf (json-log-viewer-make-buffer
                "*json-log-viewer-sqlite-storage-test*"
                :log-lines
@@ -139,13 +137,11 @@
                :level-path "payload.log.level"
                :message-path "msg"
                :json-paths '("payload")
-               :storage-backend 'sqlite
                :streaming t))
          sqlite-file)
     (unwind-protect
         (with-current-buffer buf
           (setq sqlite-file json-log-viewer--sqlite-file)
-          (should (eq json-log-viewer--storage-backend 'sqlite))
           (should (stringp sqlite-file))
           (should (file-exists-p sqlite-file))
           (let ((entry-ov (car json-log-viewer--entry-overlays)))
@@ -308,8 +304,10 @@
         (with-current-buffer buf
           (json-log-viewer-push buf lines)
           (should (= json-log-viewer--entry-count 901))
-          (should (= json-log-viewer--raw-log-lines-count 901))
-          (should (= (length json-log-viewer--raw-log-line-chunks) 10)))
+          (let ((stored (json-log-viewer-current-log-lines buf)))
+            (should (= (length stored) 901))
+            (should (string-match-p "\"m-100\"" (car stored)))
+            (should (string-match-p "\"m-1000\"" (car (last stored))))))
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 

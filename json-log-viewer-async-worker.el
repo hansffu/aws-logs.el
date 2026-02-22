@@ -10,13 +10,10 @@
 
 (require 'cl-lib)
 (require 'json)
+(require 'sqlite)
 (require 'subr-x)
 
 (declare-function json-pretty-print-buffer "json" ())
-(declare-function sqlite-open "sqlite" (file))
-(declare-function sqlite-close "sqlite" (db))
-(declare-function sqlite-execute "sqlite" (db sql &optional values))
-(declare-function sqlite-select "sqlite" (db sql &optional values))
 
 (defun json-log-viewer-async-worker--value->string (value)
   "Convert VALUE into worker-safe string or nil."
@@ -289,43 +286,37 @@
                               (vector last-seq)))))))))
 
 (defun json-log-viewer-async-worker--persist-sqlite (op lines details config)
-  "Persist worker outputs and return resulting raw line count, or nil."
-  (let ((storage-backend (plist-get config :storage-backend))
-        (sqlite-file (plist-get config :sqlite-file)))
-    (when (and (eq storage-backend 'sqlite)
-               sqlite-file
-               (fboundp 'sqlite-open))
-      (let ((db (sqlite-open sqlite-file))
-            (ok nil)
-            (raw-count nil))
-        (unwind-protect
-            (progn
-              (sqlite-execute db "BEGIN")
-              (when (eq op 'replace)
-                (sqlite-execute db "DELETE FROM raw_lines")
-                (sqlite-execute db "DELETE FROM entry_details"))
-              (dolist (line lines)
-                (sqlite-execute db
-                                "INSERT INTO raw_lines(line) VALUES (?)"
-                                (vector line)))
-              (dolist (detail details)
-                (sqlite-execute
-                 db
-                 "INSERT OR REPLACE INTO entry_details(signature, filter_text, fields_json) VALUES (?, ?, ?)"
-                 detail))
-              (when (plist-get config :streaming)
-                (json-log-viewer-async-worker--sqlite-trim-raw-lines
-                 db
-                 (plist-get config :max-entries)
-                 (plist-get config :chunk-size)))
-              (setq raw-count
-                    (or (car (car (sqlite-select db "SELECT COUNT(*) FROM raw_lines"))) 0))
-              (setq ok t)
-              (sqlite-execute db "COMMIT"))
-          (unless ok
-            (ignore-errors (sqlite-execute db "ROLLBACK")))
-          (ignore-errors (sqlite-close db)))
-        raw-count))))
+  "Persist worker outputs to sqlite."
+  (let ((sqlite-file (plist-get config :sqlite-file)))
+    (unless sqlite-file
+      (error "sqlite support is required for json-log-viewer worker"))
+    (let ((db (sqlite-open sqlite-file))
+          (ok nil))
+      (unwind-protect
+          (progn
+            (sqlite-execute db "BEGIN")
+            (when (eq op 'replace)
+              (sqlite-execute db "DELETE FROM raw_lines")
+              (sqlite-execute db "DELETE FROM entry_details"))
+            (dolist (line lines)
+              (sqlite-execute db
+                              "INSERT INTO raw_lines(line) VALUES (?)"
+                              (vector line)))
+            (dolist (detail details)
+              (sqlite-execute
+               db
+               "INSERT OR REPLACE INTO entry_details(signature, filter_text, fields_json) VALUES (?, ?, ?)"
+               detail))
+            (when (plist-get config :streaming)
+              (json-log-viewer-async-worker--sqlite-trim-raw-lines
+               db
+               (plist-get config :max-entries)
+               (plist-get config :chunk-size)))
+            (setq ok t)
+            (sqlite-execute db "COMMIT"))
+        (unless ok
+          (ignore-errors (sqlite-execute db "ROLLBACK")))
+        (ignore-errors (sqlite-close db))))))
 
 (defun json-log-viewer-async-worker--config-from-job (job)
   "Extract reusable config plist from JOB."
@@ -335,7 +326,6 @@
         :extra-paths (or (plist-get job :extra-paths) nil)
         :json-paths (or (plist-get job :json-paths) nil)
         :sqlite-file (plist-get job :sqlite-file)
-        :storage-backend (plist-get job :storage-backend)
         :streaming (plist-get job :streaming)
         :max-entries (plist-get job :max-entries)
         :chunk-size (max 1 (or (plist-get job :chunk-size) 1))))
@@ -348,8 +338,7 @@
          (filter-text (or (plist-get job :filter-text) ""))
          (fields-json (or (plist-get job :fields-json) "[]"))
          (signatures (or (plist-get job :signatures) nil)))
-    (unless (and sqlite-file
-                 (fboundp 'sqlite-open))
+    (unless sqlite-file
       (error "Entry-details worker missing sqlite support"))
     (let ((db (sqlite-open sqlite-file))
           (ok nil)
@@ -395,13 +384,11 @@ Return a plist consumed by main-process callback code."
          (batch (json-log-viewer-async-worker--build-batch lines start-id config))
          (entries (plist-get batch :entries))
          (details (plist-get batch :details))
-         (next-id (plist-get batch :next-id))
-         (raw-count (json-log-viewer-async-worker--persist-sqlite
-                     op lines details config)))
+         (next-id (plist-get batch :next-id)))
+    (json-log-viewer-async-worker--persist-sqlite op lines details config)
     (list :op op
           :entries entries
           :next-id next-id
-          :raw-count raw-count
           :preserve-filter preserve-filter)))
 
 (provide 'json-log-viewer-async-worker)
