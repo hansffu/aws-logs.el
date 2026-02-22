@@ -133,12 +133,12 @@ When non-nil, tail output is piped through grep with this regex."
   :type 'number
   :group 'aws-logs)
 
-(defcustom aws-logs-tail-ecs-batch-max-lines 200
+(defcustom aws-logs-tail-ecs-batch-max-lines 30
   "Maximum queued ECS follow lines before forcing an immediate flush."
   :type 'integer
   :group 'aws-logs)
 
-(defcustom aws-logs-tail-ecs-normalize-batch-lines 300
+(defcustom aws-logs-tail-ecs-normalize-batch-lines 50
   "Maximum raw ECS lines normalized per idle batch.
 
 Lower values improve UI responsiveness under heavy throughput, while higher
@@ -146,12 +146,33 @@ values maximize throughput."
   :type 'integer
   :group 'aws-logs)
 
-(defcustom aws-logs-tail-ecs-chunk-batch-size 16
+(defcustom aws-logs-tail-ecs-chunk-batch-size 3
   "Maximum process output chunks consumed per idle batch in ECS follow mode.
 
 Lower values reduce single-run latency in the main thread, while higher values
 improve throughput when output arrives very quickly."
   :type 'integer
+  :group 'aws-logs)
+
+(defcustom aws-logs-tail-ecs-backpressure-high-watermark 800
+  "Pause ECS tail process when pending queue size reaches this threshold.
+
+Set to nil to disable process-level backpressure."
+  :type '(choice (const :tag "Disabled" nil) integer)
+  :group 'aws-logs)
+
+(defcustom aws-logs-tail-ecs-backpressure-low-watermark 200
+  "Resume ECS tail process when pending queue size drops to this threshold.
+
+Should be lower than `aws-logs-tail-ecs-backpressure-high-watermark`."
+  :type 'integer
+  :group 'aws-logs)
+
+(defcustom aws-logs-tail-ecs-work-interval 0.02
+  "Delay in seconds between ECS follow pipeline work batches.
+
+Using a small positive delay avoids deep timer re-entrancy under heavy load."
+  :type 'number
   :group 'aws-logs)
 
 (defcustom aws-logs-default-since aws-logs-since
