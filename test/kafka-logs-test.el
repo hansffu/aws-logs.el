@@ -65,6 +65,22 @@
                        "-e"
                        "-c" "75"))))))
 
+(ert-deftest kafka-logs-consume-args-time-span-to-defaults-to-now-test ()
+  (let ((kafka-logs-topic "orders")
+        (kafka-logs-stream nil)
+        (kafka-logs-time-range '("1000"))
+        (kafka-logs-max-messages nil))
+    (cl-letf (((symbol-function 'kafka-logs--connection-base-args)
+               (lambda () '("-b" "localhost:9092")))
+              ((symbol-function 'float-time)
+               (lambda (&optional _time) 2.0)))
+      (should (equal (kafka-logs--consume-args)
+                     '("-b" "localhost:9092"
+                       "-C" "-J" "-u" "-q" "-t" "orders"
+                       "-o" "s@1000"
+                       "-o" "e@2000"
+                       "-e"))))))
+
 (ert-deftest kafka-logs-line->json-line-json-payload-test ()
   (with-temp-buffer
     (setq-local kafka-logs--viewer-connection "prod")

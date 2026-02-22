@@ -57,8 +57,15 @@ When nil, start in time-span lookup mode."
   :type 'boolean
   :group 'kafka-logs)
 
+(defcustom kafka-logs-default-since nil
+  "Default relative lookup range for new Emacs sessions.
+
+Values use the same format as aws-logs, e.g. 10m, 2h, 1d, 30s, 1w."
+  :type '(choice (const :tag "None" nil) string)
+  :group 'kafka-logs)
+
 (defcustom kafka-logs-default-time-range nil
-  "Default lookup range for new Emacs sessions.
+  "Default explicit lookup range for new Emacs sessions.
 
 Value is nil or a cons cell (FROM . TO), where each value is a date-time
 string parseable by Emacs `date-to-time` or an epoch millisecond string."
@@ -117,6 +124,9 @@ Lower values reduce display latency at the cost of more frequent UI work."
 
 (defvar kafka-logs-stream kafka-logs-default-stream
   "Non-nil means stream new Kafka messages.")
+
+(defvar kafka-logs-since kafka-logs-default-since
+  "Selected relative time range (e.g. 10m) for this Emacs session.")
 
 (defvar kafka-logs-time-range kafka-logs-default-time-range
   "Selected explicit FROM/TO time range for this Emacs session.
@@ -444,13 +454,17 @@ Signals `user-error` on failure."
        (user-error "Invalid %s time %S: %s" label value (error-message-string err))))))
 
 (defun kafka-logs--resolved-time-range-ms ()
-  "Return resolved (FROM-MS . TO-MS) for current session."
+  "Return resolved (FROM-MS . TO-MS) for current session.
+
+When TO is omitted, treat it as current time."
   (unless kafka-logs-time-range
     (user-error "Set a FROM/TO range first"))
   (let* ((from (car kafka-logs-time-range))
          (to (cdr kafka-logs-time-range))
          (from-ms (kafka-logs--time-string->ms from "FROM"))
-         (to-ms (kafka-logs--time-string->ms to "TO")))
+         (to-ms (if (and to (not (string-empty-p to)))
+                    (kafka-logs--time-string->ms to "TO")
+                  (truncate (* 1000.0 (float-time))))))
     (when (>= from-ms to-ms)
       (user-error "FROM must be earlier than TO"))
     (cons from-ms to-ms)))
@@ -956,8 +970,22 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
         (when (or from to)
           (cons from to))))
 
+(defun kafka-logs--time-string->time (value)
+  "Parse VALUE into an Emacs time value, or nil when parsing fails."
+  (when (and value (not (string-empty-p value)))
+    (if (string-match-p "\\`[0-9]+\\'" value)
+        (seconds-to-time (/ (string-to-number value) 1000.0))
+      (ignore-errors (date-to-time value)))))
+
+(defun kafka-logs--read-org-time (prompt &optional initial)
+  "Read timestamp with Org date picker using PROMPT and INITIAL time string."
+  (require 'org)
+  (let* ((initial-time (kafka-logs--time-string->time initial))
+         (selected (org-read-date nil t nil prompt initial-time)))
+    (format-time-string "%Y-%m-%dT%H:%M:%S%z" selected)))
+
 (transient-define-suffix kafka-logs-set-range-from ()
-  "Set range FROM value."
+  "Set range FROM value with Org timestamp picker."
   :description (lambda ()
                  (format "From: %s"
                          (or (and kafka-logs-time-range (car kafka-logs-time-range))
@@ -965,16 +993,14 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
   :transient t
   (interactive)
   (let* ((current (and kafka-logs-time-range (car kafka-logs-time-range)))
-         (input (string-trim (read-string "From (datetime or epoch ms, empty=clear): "
-                                          (or current ""))))
          (to (and kafka-logs-time-range (cdr kafka-logs-time-range))))
     (kafka-logs--set-time-range
-     (unless (string-empty-p input) input)
+     (kafka-logs--read-org-time "From: " current)
      to)
     (kafka-logs--transient-reprompt)))
 
 (transient-define-suffix kafka-logs-set-range-to ()
-  "Set range TO value."
+  "Set range TO value with Org timestamp picker."
   :description (lambda ()
                  (format "To: %s"
                          (or (and kafka-logs-time-range (cdr kafka-logs-time-range))
@@ -982,12 +1008,10 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
   :transient t
   (interactive)
   (let* ((current (and kafka-logs-time-range (cdr kafka-logs-time-range)))
-         (input (string-trim (read-string "To (datetime or epoch ms, empty=clear): "
-                                          (or current ""))))
          (from (and kafka-logs-time-range (car kafka-logs-time-range))))
     (kafka-logs--set-time-range
      from
-     (unless (string-empty-p input) input))
+     (kafka-logs--read-org-time "To: " current))
     (kafka-logs--transient-reprompt)))
 
 (transient-define-suffix kafka-logs-set-filter ()
