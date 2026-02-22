@@ -152,6 +152,7 @@ It is callback-driven, keeps runtime state buffer-local, and supports:
  :message-path "msg"
  :extra-paths '("meta.service" "meta.env")
  :json-paths '("payload" "payload.log")
+ :storage-backend 'sqlite
  :refresh-function (lambda (old-log-lines) old-log-lines)
  :streaming nil
  :direction 'newest-first
@@ -168,6 +169,7 @@ Notes:
   and suppresses flattened descendant fields for those paths.
 - JSON block highlighting uses ~json-log-viewer-json-syntax-mode~ (default
   ~json-ts-mode~, with fallback to ~js-mode~ if unavailable).
+- ~:storage-backend~ controls hidden-data storage: ~memory~ or ~sqlite~.
 - ~:streaming~ controls append semantics:
   - ~nil~: non-streaming order follows ~:direction~.
   - non-~nil~: pushes append to bottom.
@@ -351,6 +353,7 @@ rendered in ~json-log-viewer~.
 - Optional regex filtering with ~grep~.
 - Optional payload decoding mode for JSON message bodies.
 - Optional JSON-path detail rendering (for example ~payload~ as pretty JSON block).
+- SQLite-backed hidden-data storage to reduce in-memory growth.
 
 ** File
 
@@ -373,6 +376,7 @@ Put ~kafka-logs.el~ and ~json-log-viewer.el~ on your ~load-path~.
   (kafka-logs-default-stream t)
   (kafka-logs-default-payload-format 'json)
   (kafka-logs-default-json-paths '("payload"))
+  (kafka-logs-storage-backend 'sqlite)
   :config
   ;; auth-source lookup (example entry source):
   ;; machine kafka-prod login app-user password s3cr3t port 9093

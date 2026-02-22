@@ -13,6 +13,8 @@
 (defvar kafka-logs-filter)
 (defvar kafka-logs-max-messages)
 (defvar kafka-logs-json-paths)
+(defvar kafka-logs-storage-backend)
+(defvar kafka-logs-stream-max-lines-per-batch)
 (defvar kafka-logs-connections)
 
 (ert-deftest kafka-logs-connection-base-args-with-auth-source-test ()
@@ -120,6 +122,7 @@
         (kafka-logs-filter nil)
         (kafka-logs-payload-format nil)
         (kafka-logs-json-paths '("payload" "payload.log"))
+        (kafka-logs-storage-backend 'sqlite)
         captured-args
         viewer-buffer)
     (cl-letf (((symbol-function 'json-log-viewer-make-buffer)
@@ -134,11 +137,45 @@
             (should (eq buffer viewer-buffer))
             (should (equal (plist-get captured-args :json-paths)
                            '("payload" "payload.log")))
+            (should (eq (plist-get captured-args :storage-backend) 'sqlite))
             (with-current-buffer buffer
               (should (equal kafka-logs--viewer-json-paths
                              '("payload" "payload.log")))))
         (when (buffer-live-p viewer-buffer)
           (kill-buffer viewer-buffer))))))
+
+(ert-deftest kafka-logs-stream-drain-batches-output-test ()
+  (let ((kafka-logs-stream-max-lines-per-batch 2)
+        (captured nil)
+        (buffer (generate-new-buffer "*kafka-logs-stream-drain-test*")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (setq-local kafka-logs--pending-fragment "")
+          (setq-local kafka-logs--stream-chunks-in nil)
+          (setq-local kafka-logs--stream-chunks-out nil)
+          (setq-local kafka-logs--stream-pending-lines nil)
+          (setq-local kafka-logs--stream-drain-timer nil)
+          (cl-letf (((symbol-function 'kafka-logs--stream-schedule-drain)
+                    (lambda () nil))
+                    ((symbol-function 'kafka-logs--line->json-line)
+                     (lambda (line)
+                       (unless (equal line "")
+                         line)))
+                    ((symbol-function 'json-log-viewer-push)
+                     (lambda (_buffer lines)
+                       (push lines captured))))
+            (kafka-logs--stream-enqueue-chunk "line-1\nline-2\nline-3\n")
+            (should (equal captured nil))
+            (kafka-logs--stream-drain nil)
+            (should (equal (car captured) '("line-1" "line-2")))
+            (kafka-logs--stream-drain nil)
+            (should (equal (car captured) '("line-3")))
+            (should (kafka-logs--stream-queue-empty-p))))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (when (timerp kafka-logs--stream-drain-timer)
+            (cancel-timer kafka-logs--stream-drain-timer)))
+        (kill-buffer buffer)))))
 
 (provide 'kafka-logs-test)
 ;;; kafka-logs-test.el ends here

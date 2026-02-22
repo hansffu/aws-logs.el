@@ -13,6 +13,11 @@
 (require 'subr-x)
 
 (declare-function json-pretty-print-buffer "json" ())
+(declare-function sqlite-available-p "sqlite" ())
+(declare-function sqlite-open "sqlite" (file))
+(declare-function sqlite-close "sqlite" (db))
+(declare-function sqlite-execute "sqlite" (db sql &optional values))
+(declare-function sqlite-select "sqlite" (db sql &optional values))
 
 (defgroup json-log-viewer nil
   "Foldable JSON log viewer buffers."
@@ -83,6 +88,17 @@ to `js-mode`."
   :type 'symbol
   :group 'json-log-viewer)
 
+(defcustom json-log-viewer-storage-backend 'memory
+  "Storage backend for hidden, growing viewer data.
+
+When `memory`, json-log-viewer keeps raw lines and hidden entry details in
+Elisp structures.
+When `sqlite`, json-log-viewer stores that data in a temporary sqlite database
+and keeps only active render state in memory."
+  :type '(choice (const :tag "Memory" memory)
+                 (const :tag "SQLite" sqlite))
+  :group 'json-log-viewer)
+
 (defvar-local json-log-viewer--fold-overlays nil
   "Detail overlays for expanded entries in the current viewer buffer.")
 
@@ -142,6 +158,18 @@ to `js-mode`."
 
 (defvar-local json-log-viewer--raw-log-lines-count 0
   "Cached count of `json-log-viewer--raw-log-lines'.")
+
+(defvar-local json-log-viewer--storage-backend 'memory
+  "Buffer-local storage backend symbol.")
+
+(defvar-local json-log-viewer--sqlite-db nil
+  "SQLite database handle for storage backend, or nil.")
+
+(defvar-local json-log-viewer--sqlite-file nil
+  "Path of sqlite file used by current viewer buffer, or nil.")
+
+(defvar-local json-log-viewer--sqlite-transaction-depth 0
+  "Nesting depth for sqlite transactions in current viewer buffer.")
 
 (defvar-local json-log-viewer--entry-count 0
   "Cached count of rendered entry overlays.")
@@ -227,6 +255,158 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
                         (or (json-log-viewer--value->string (cdr pair)) ""))
                   normalized)))))
     (nreverse normalized)))
+
+(defun json-log-viewer--sqlite-available-p ()
+  "Return non-nil when sqlite backend is available."
+  (and (fboundp 'sqlite-available-p)
+       (ignore-errors (sqlite-available-p))))
+
+(defun json-log-viewer--storage-use-sqlite-p ()
+  "Return non-nil when current buffer uses sqlite storage."
+  (eq json-log-viewer--storage-backend 'sqlite))
+
+(defun json-log-viewer--fields->storage-json (fields)
+  "Serialize normalized FIELDS into JSON for storage."
+  (let (rows)
+    (dolist (pair fields)
+      (let* ((key (or (car pair) ""))
+             (value (or (cdr pair) ""))
+             (json-block (and (> (length value) 0)
+                              (get-text-property 0 'json-log-viewer-json-block value)))
+             (obj (list :k key :v (substring-no-properties value))))
+        (when json-block
+          (setq obj (append obj (list :b t))))
+        (push obj rows)))
+    (json-serialize (vconcat (nreverse rows)))))
+
+(defun json-log-viewer--storage-json->fields (value)
+  "Deserialize field VALUE JSON from storage."
+  (condition-case nil
+      (let ((rows (json-parse-string value :object-type 'alist :array-type 'list
+                                     :null-object nil :false-object :false))
+            fields)
+        (dolist (row rows)
+          (let* ((key (or (json-log-viewer--value->string
+                           (json-log-viewer--json-get-child row "k"))
+                          ""))
+                 (text (or (json-log-viewer--value->string
+                            (json-log-viewer--json-get-child row "v"))
+                           ""))
+                 (json-block (eq (json-log-viewer--json-get-child row "b") t))
+                 (rendered (if json-block
+                               (propertize (json-log-viewer--fontify-json-string text)
+                                           'json-log-viewer-json-block t)
+                             text)))
+            (push (cons key rendered) fields)))
+        (nreverse fields))
+    (error nil)))
+
+(defun json-log-viewer--storage-init (backend)
+  "Initialize storage BACKEND for current buffer."
+  (json-log-viewer--storage-close)
+  (setq-local json-log-viewer--storage-backend backend)
+  (when (and (eq backend 'sqlite)
+             (json-log-viewer--sqlite-available-p))
+    (let* ((file (make-temp-file "json-log-viewer-" nil ".sqlite"))
+           (db (sqlite-open file)))
+      (setq-local json-log-viewer--sqlite-file file)
+      (setq-local json-log-viewer--sqlite-db db)
+      (sqlite-execute db "CREATE TABLE raw_lines (seq INTEGER PRIMARY KEY AUTOINCREMENT, line TEXT NOT NULL)")
+      (sqlite-execute db "CREATE TABLE entry_details (signature TEXT PRIMARY KEY, filter_text TEXT NOT NULL, fields_json TEXT NOT NULL)")))
+  (when (and (eq backend 'sqlite)
+             (not json-log-viewer--sqlite-db))
+    (setq-local json-log-viewer--storage-backend 'memory)))
+
+(defun json-log-viewer--storage-close ()
+  "Close and cleanup current buffer storage resources."
+  (when json-log-viewer--sqlite-db
+    (ignore-errors (sqlite-close json-log-viewer--sqlite-db))
+    (setq-local json-log-viewer--sqlite-db nil))
+  (when (and json-log-viewer--sqlite-file
+             (file-exists-p json-log-viewer--sqlite-file))
+    (ignore-errors (delete-file json-log-viewer--sqlite-file)))
+  (setq-local json-log-viewer--sqlite-file nil)
+  (setq-local json-log-viewer--sqlite-transaction-depth 0))
+
+(defun json-log-viewer--storage-with-sqlite-transaction (thunk)
+  "Run THUNK in one sqlite transaction when sqlite storage is active."
+  (if (not (and (json-log-viewer--storage-use-sqlite-p)
+                json-log-viewer--sqlite-db))
+      (funcall thunk)
+    (if (> json-log-viewer--sqlite-transaction-depth 0)
+        (funcall thunk)
+      (let ((ok nil))
+        (sqlite-execute json-log-viewer--sqlite-db "BEGIN")
+        (setq json-log-viewer--sqlite-transaction-depth
+              (1+ json-log-viewer--sqlite-transaction-depth))
+        (unwind-protect
+            (progn
+              (funcall thunk)
+              (setq ok t))
+          (setq json-log-viewer--sqlite-transaction-depth
+                (max 0 (1- json-log-viewer--sqlite-transaction-depth)))
+          (sqlite-execute json-log-viewer--sqlite-db
+                          (if ok "COMMIT" "ROLLBACK")))))))
+
+(defun json-log-viewer--storage-reset-entry-details ()
+  "Drop all persisted entry details for current buffer."
+  (when (and (json-log-viewer--storage-use-sqlite-p)
+             json-log-viewer--sqlite-db)
+    (sqlite-execute json-log-viewer--sqlite-db "DELETE FROM entry_details")))
+
+(defun json-log-viewer--storage-put-entry-details (signature filter-text fields)
+  "Persist entry details keyed by SIGNATURE."
+  (when (and (json-log-viewer--storage-use-sqlite-p)
+             json-log-viewer--sqlite-db
+             signature)
+    (sqlite-execute
+     json-log-viewer--sqlite-db
+     "INSERT OR REPLACE INTO entry_details(signature, filter_text, fields_json) VALUES (?, ?, ?)"
+     (vector signature (or filter-text "") (json-log-viewer--fields->storage-json fields)))))
+
+(defun json-log-viewer--storage-remove-entry-details (signature)
+  "Remove persisted entry details identified by SIGNATURE."
+  (when (and (json-log-viewer--storage-use-sqlite-p)
+             json-log-viewer--sqlite-db
+             signature)
+    (sqlite-execute json-log-viewer--sqlite-db
+                    "DELETE FROM entry_details WHERE signature = ?"
+                    (vector signature))))
+
+(defun json-log-viewer--storage-entry-filter-text (entry-overlay)
+  "Return normalized filter text for ENTRY-OVERLAY."
+  (or (overlay-get entry-overlay 'json-log-viewer-filter-text)
+      (when (and (json-log-viewer--storage-use-sqlite-p)
+                 json-log-viewer--sqlite-db)
+        (when-let* ((signature (overlay-get entry-overlay 'json-log-viewer-signature))
+                    (row (car (sqlite-select json-log-viewer--sqlite-db
+                                             "SELECT filter_text FROM entry_details WHERE signature = ?"
+                                             (vector signature)))))
+          (car row)))))
+
+(defun json-log-viewer--storage-entry-fields (entry-overlay)
+  "Return normalized fields for ENTRY-OVERLAY."
+  (or (overlay-get entry-overlay 'json-log-viewer-entry-fields)
+      (when (and (json-log-viewer--storage-use-sqlite-p)
+                 json-log-viewer--sqlite-db)
+        (when-let* ((signature (overlay-get entry-overlay 'json-log-viewer-signature))
+                    (row (car (sqlite-select json-log-viewer--sqlite-db
+                                             "SELECT fields_json FROM entry_details WHERE signature = ?"
+                                             (vector signature)))))
+          (json-log-viewer--storage-json->fields (car row))))))
+
+(defun json-log-viewer--storage-matching-signatures (needle)
+  "Return hash table of signatures matching NEEDLE."
+  (let ((matches (make-hash-table :test 'equal)))
+    (when (and (json-log-viewer--storage-use-sqlite-p)
+               json-log-viewer--sqlite-db
+               needle
+               (not (string-empty-p needle)))
+      (dolist (row (sqlite-select json-log-viewer--sqlite-db
+                                  "SELECT signature FROM entry_details WHERE filter_text LIKE ?"
+                                  (vector (concat "%" needle "%"))))
+        (puthash (car row) t matches)))
+    matches))
 
 (defun json-log-viewer--alist-like-p (node)
   "Return non-nil when NODE looks like an alist object."
@@ -632,6 +812,10 @@ Returns cons cell (ENTRIES . NEXT-ID)."
             (set-window-point window target)))
       (setq json-log-viewer--auto-follow-internal-move nil))))
 
+(defun json-log-viewer--cleanup-storage-on-kill ()
+  "Cleanup persistent storage resources for current viewer buffer."
+  (json-log-viewer--storage-close))
+
 (defun json-log-viewer--remember-point-before-command ()
   "Record current point for auto-follow cursor-move detection."
   (setq json-log-viewer--auto-follow-point-before-command (point)))
@@ -696,7 +880,7 @@ Returns cons cell (ENTRIES . NEXT-ID)."
       (save-excursion
         (goto-char (json-log-viewer--entry-summary-end entry-overlay))
         (let ((details-start (point))
-              (fields (or (overlay-get entry-overlay 'json-log-viewer-entry-fields)
+              (fields (or (json-log-viewer--storage-entry-fields entry-overlay)
                           '())))
           (json-log-viewer--insert-entry-details-lines fields)
           (let ((details-end (point))
@@ -809,18 +993,24 @@ Returns cons cell (ENTRIES . NEXT-ID)."
   "Return non-nil when ENTRY-OVERLAY matches NEEDLE."
   (string-match-p
    (regexp-quote needle)
-   (or (overlay-get entry-overlay 'json-log-viewer-filter-text) "")))
+   (or (json-log-viewer--storage-entry-filter-text entry-overlay) "")))
 
 (defun json-log-viewer--apply-filter ()
   "Apply active filter to entry overlays in current buffer."
   (let* ((needle (and json-log-viewer--filter-string
                       (string-trim json-log-viewer--filter-string)))
-         (normalized (and needle (downcase needle))))
+         (normalized (and needle (downcase needle)))
+         (active (and normalized (not (string-empty-p normalized))))
+         (matching-signatures (and active
+                                   (json-log-viewer--storage-use-sqlite-p)
+                                   (json-log-viewer--storage-matching-signatures normalized))))
     (dolist (entry-overlay json-log-viewer--entry-overlays)
       (overlay-put entry-overlay 'invisible
-                   (if (and normalized
-                            (not (string-empty-p normalized))
-                            (not (json-log-viewer--filter-match-p entry-overlay normalized)))
+                   (if (and active
+                            (if matching-signatures
+                                (not (gethash (overlay-get entry-overlay 'json-log-viewer-signature)
+                                              matching-signatures))
+                              (not (json-log-viewer--filter-match-p entry-overlay normalized))))
                        'json-log-viewer-filter
                      nil)))))
 
@@ -892,45 +1082,70 @@ Returns cons cell (ENTRIES . NEXT-ID)."
 
 (defun json-log-viewer--raw-lines-set (lines)
   "Replace raw line storage with LINES."
-  (setq json-log-viewer--raw-log-line-chunks
-        (json-log-viewer--chunk-lines lines))
-  (setq json-log-viewer--raw-log-lines json-log-viewer--raw-log-line-chunks)
-  (setq json-log-viewer--raw-log-lines-count (length lines)))
+  (if (and (json-log-viewer--storage-use-sqlite-p)
+           json-log-viewer--sqlite-db)
+      (json-log-viewer--storage-with-sqlite-transaction
+       (lambda ()
+         (sqlite-execute json-log-viewer--sqlite-db "DELETE FROM raw_lines")
+         (dolist (line lines)
+           (sqlite-execute json-log-viewer--sqlite-db
+                           "INSERT INTO raw_lines(line) VALUES (?)"
+                           (vector line)))
+         (setq json-log-viewer--raw-log-line-chunks nil)
+         (setq json-log-viewer--raw-log-lines nil)
+         (setq json-log-viewer--raw-log-lines-count (length lines))))
+    (setq json-log-viewer--raw-log-line-chunks
+          (json-log-viewer--chunk-lines lines))
+    (setq json-log-viewer--raw-log-lines json-log-viewer--raw-log-line-chunks)
+    (setq json-log-viewer--raw-log-lines-count (length lines))))
 
 (defun json-log-viewer--raw-lines-list ()
   "Return flattened copy of raw lines from chunk storage."
-  (apply #'append
-         (mapcar (lambda (chunk) (append chunk nil))
-                 json-log-viewer--raw-log-line-chunks)))
+  (if (and (json-log-viewer--storage-use-sqlite-p)
+           json-log-viewer--sqlite-db)
+      (mapcar #'car
+              (sqlite-select json-log-viewer--sqlite-db
+                             "SELECT line FROM raw_lines ORDER BY seq"))
+    (apply #'append
+           (mapcar (lambda (chunk) (append chunk nil))
+                   json-log-viewer--raw-log-line-chunks))))
 
 (defun json-log-viewer--raw-lines-append (lines)
   "Append LINES into chunked raw storage."
-  (let ((remaining (append lines nil))
-        (chunk-size (json-log-viewer--stream-chunk-size)))
-    (when remaining
-      (if json-log-viewer--raw-log-line-chunks
-          (let* ((tail-cell (last json-log-viewer--raw-log-line-chunks))
-                 (tail (car tail-cell))
-                 (space (- chunk-size (length tail))))
-            (when (> space 0)
-              (let ((addition nil)
-                    (n 0))
-                (while (and remaining (< n space))
-                  (push (pop remaining) addition)
-                  (setq n (1+ n)))
-                (setcar tail-cell (nconc tail (nreverse addition))))))
-        (setq json-log-viewer--raw-log-line-chunks nil))
-      (while remaining
-        (let ((chunk nil)
-              (n 0))
-          (while (and remaining (< n chunk-size))
-            (push (pop remaining) chunk)
-            (setq n (1+ n)))
-          (setq chunk (nreverse chunk))
-          (if json-log-viewer--raw-log-line-chunks
-              (setcdr (last json-log-viewer--raw-log-line-chunks) (list chunk))
-            (setq json-log-viewer--raw-log-line-chunks (list chunk)))))))
-  (setq json-log-viewer--raw-log-lines json-log-viewer--raw-log-line-chunks)
+  (if (and (json-log-viewer--storage-use-sqlite-p)
+           json-log-viewer--sqlite-db)
+      (json-log-viewer--storage-with-sqlite-transaction
+       (lambda ()
+         (dolist (line lines)
+           (sqlite-execute json-log-viewer--sqlite-db
+                           "INSERT INTO raw_lines(line) VALUES (?)"
+                           (vector line)))))
+    (let ((remaining (append lines nil))
+          (chunk-size (json-log-viewer--stream-chunk-size)))
+      (when remaining
+        (if json-log-viewer--raw-log-line-chunks
+            (let* ((tail-cell (last json-log-viewer--raw-log-line-chunks))
+                   (tail (car tail-cell))
+                   (space (- chunk-size (length tail))))
+              (when (> space 0)
+                (let ((addition nil)
+                      (n 0))
+                  (while (and remaining (< n space))
+                    (push (pop remaining) addition)
+                    (setq n (1+ n)))
+                  (setcar tail-cell (nconc tail (nreverse addition))))))
+          (setq json-log-viewer--raw-log-line-chunks nil))
+        (while remaining
+          (let ((chunk nil)
+                (n 0))
+            (while (and remaining (< n chunk-size))
+              (push (pop remaining) chunk)
+              (setq n (1+ n)))
+            (setq chunk (nreverse chunk))
+            (if json-log-viewer--raw-log-line-chunks
+                (setcdr (last json-log-viewer--raw-log-line-chunks) (list chunk))
+              (setq json-log-viewer--raw-log-line-chunks (list chunk)))))))
+    (setq json-log-viewer--raw-log-lines json-log-viewer--raw-log-line-chunks))
   (setq json-log-viewer--raw-log-lines-count
         (+ json-log-viewer--raw-log-lines-count (length lines))))
 
@@ -944,12 +1159,23 @@ Returns cons cell (ENTRIES . NEXT-ID)."
       (let* ((over (- json-log-viewer--raw-log-lines-count max-entries))
              (drop-target (json-log-viewer--stream-eviction-drop-count over))
              (dropped 0))
-        (while (and json-log-viewer--raw-log-line-chunks
-                    (< dropped drop-target))
-          (setq dropped (+ dropped (length (car json-log-viewer--raw-log-line-chunks))))
-          (setq json-log-viewer--raw-log-line-chunks
-                (cdr json-log-viewer--raw-log-line-chunks)))
-        (setq json-log-viewer--raw-log-lines json-log-viewer--raw-log-line-chunks)
+        (if (and (json-log-viewer--storage-use-sqlite-p)
+                 json-log-viewer--sqlite-db)
+            (let ((rows (sqlite-select
+                         json-log-viewer--sqlite-db
+                         (format "SELECT seq FROM raw_lines ORDER BY seq LIMIT %d" drop-target))))
+              (setq dropped (length rows))
+              (when rows
+                (let ((last-seq (car (car (last rows)))))
+                  (sqlite-execute json-log-viewer--sqlite-db
+                                  "DELETE FROM raw_lines WHERE seq <= ?"
+                                  (vector last-seq)))))
+          (while (and json-log-viewer--raw-log-line-chunks
+                      (< dropped drop-target))
+            (setq dropped (+ dropped (length (car json-log-viewer--raw-log-line-chunks))))
+            (setq json-log-viewer--raw-log-line-chunks
+                  (cdr json-log-viewer--raw-log-line-chunks)))
+          (setq json-log-viewer--raw-log-lines json-log-viewer--raw-log-line-chunks))
         (setq json-log-viewer--raw-log-lines-count
               (max 0 (- json-log-viewer--raw-log-lines-count dropped)))))))
 
@@ -1153,17 +1379,19 @@ When result size allows it, updates are previewed live while typing."
          (fields (json-log-viewer--normalize-fields raw-fields))
          (summary (funcall json-log-viewer--summary-function entry fields))
          (filter-text (json-log-viewer--entry-filter-text fields))
+         (signature (json-log-viewer--entry-signature entry))
          (summary-start (point))
          entry-ov)
     (insert (or (json-log-viewer--value->string summary) "-") "\n")
     (setq entry-ov (make-overlay summary-start (point)))
     (overlay-put entry-ov 'json-log-viewer-entry t)
     (overlay-put entry-ov 'json-log-viewer-entry-expanded nil)
-    (overlay-put entry-ov 'json-log-viewer-entry-fields fields)
     (overlay-put entry-ov 'json-log-viewer-fold-overlay nil)
-    (overlay-put entry-ov 'json-log-viewer-filter-text filter-text)
-    (overlay-put entry-ov 'json-log-viewer-signature
-                 (json-log-viewer--entry-signature entry))
+    (if (json-log-viewer--storage-use-sqlite-p)
+        (json-log-viewer--storage-put-entry-details signature filter-text fields)
+      (overlay-put entry-ov 'json-log-viewer-entry-fields fields)
+      (overlay-put entry-ov 'json-log-viewer-filter-text filter-text))
+    (overlay-put entry-ov 'json-log-viewer-signature signature)
     (push entry-ov json-log-viewer--entry-overlays)
     entry-ov))
 
@@ -1209,6 +1437,7 @@ When result size allows it, updates are previewed live while typing."
               (push fold-ov victim-folds))
             (when sig
               (remhash sig json-log-viewer--seen-signatures))
+            (json-log-viewer--storage-remove-entry-details sig)
             (when (and (overlay-buffer entry-overlay)
                        (overlay-start entry-overlay)
                        (overlay-end entry-overlay))
@@ -1231,6 +1460,7 @@ When PRESERVE-FILTER is non-nil, keep the current active filter."
         (ordered (json-log-viewer--sort-entries entries)))
     (setq json-log-viewer--filter-string active-filter)
     (json-log-viewer--clear-overlays)
+    (json-log-viewer--storage-reset-entry-details)
     (setq json-log-viewer--seen-signatures (make-hash-table :test 'equal))
     (erase-buffer)
     (if (null ordered)
@@ -1323,6 +1553,7 @@ In non-streaming mode the append position follows configured direction."
   (setq-local line-move-ignore-invisible t)
   (setq-local buffer-invisibility-spec '(t))
   (add-to-invisibility-spec 'json-log-viewer-filter)
+  (add-hook 'kill-buffer-hook #'json-log-viewer--cleanup-storage-on-kill nil t)
   (add-hook 'pre-command-hook #'json-log-viewer--remember-point-before-command nil t)
   (add-hook 'post-command-hook #'json-log-viewer--maybe-disable-auto-follow-after-command nil t)
   (add-hook 'post-command-hook #'json-log-viewer--highlight-current-line t t))
@@ -1352,6 +1583,7 @@ In non-streaming mode the append position follows configured direction."
                                        refresh-function
                                        streaming
                                        (max-entries json-log-viewer-stream-max-entries)
+                                       (storage-backend json-log-viewer-storage-backend)
                                        (direction 'newest-first)
                                        header-lines-function
                                        (live-narrow-max-rows 2000)
@@ -1377,9 +1609,16 @@ STREAMING controls append semantics:
 
 MAX-ENTRIES caps retained rows in streaming mode. Nil disables capping.
 
+STORAGE-BACKEND controls where hidden/growing data is stored:
+- `memory`: Elisp structures only
+- `sqlite`: sqlite-backed storage for raw lines and hidden entry details
+
 Returns the created buffer."
   (unless (stringp buffer-name)
     (user-error "json-log-viewer-make-buffer requires BUFFER-NAME to be a string"))
+  (unless (memq storage-backend '(memory sqlite))
+    (user-error "Invalid storage backend: %S (expected memory or sqlite)"
+                storage-backend))
   (let* ((normalized-extra-paths (json-log-viewer--normalize-path-list
                                   extra-paths
                                   "json-log-viewer-make-buffer :extra-paths"))
@@ -1426,8 +1665,11 @@ Returns the created buffer."
       (setq-local json-log-viewer--json-refresh-log-lines-function refresh-function)
       (setq-local json-log-viewer--json-header-lines-function header-lines-function)
       (setq-local json-log-viewer--seen-signatures (make-hash-table :test 'equal))
-      (json-log-viewer--raw-lines-set normalized-lines)
-      (json-log-viewer-replace-entries initial-entries nil))
+      (json-log-viewer--storage-init storage-backend)
+      (json-log-viewer--storage-with-sqlite-transaction
+       (lambda ()
+         (json-log-viewer--raw-lines-set normalized-lines)
+         (json-log-viewer-replace-entries initial-entries nil))))
     target))
 
 (defun json-log-viewer-push (buffer-or-name log-lines)
@@ -1444,9 +1686,11 @@ BUFFER-OR-NAME must identify a live `json-log-viewer-mode` buffer created by
       (let* ((normalized-lines (json-log-viewer--ensure-log-lines
                                 log-lines "json-log-viewer-push"))
              (entries (mapcar json-log-viewer--line-to-entry-function normalized-lines)))
-        (json-log-viewer--raw-lines-append normalized-lines)
-        (json-log-viewer--trim-raw-log-lines-if-needed)
-        (json-log-viewer-append-entries entries)))))
+        (json-log-viewer--storage-with-sqlite-transaction
+         (lambda ()
+           (json-log-viewer--raw-lines-append normalized-lines)
+           (json-log-viewer--trim-raw-log-lines-if-needed)
+           (json-log-viewer-append-entries entries)))))))
 
 (defun json-log-viewer-current-log-lines (buffer-or-name)
   "Return a copy of current raw log lines from BUFFER-OR-NAME."
@@ -1475,9 +1719,11 @@ When PRESERVE-FILTER is non-nil, keep the current active filter."
                   (cons (nreverse entries) json-log-viewer--next-entry-id))))
              (entries (car entries+next))
              (next-id (cdr entries+next)))
-        (json-log-viewer--raw-lines-set normalized-lines)
-        (setq json-log-viewer--next-entry-id next-id)
-        (json-log-viewer-replace-entries entries preserve-filter)))))
+        (json-log-viewer--storage-with-sqlite-transaction
+         (lambda ()
+           (json-log-viewer--raw-lines-set normalized-lines)
+           (setq json-log-viewer--next-entry-id next-id)
+           (json-log-viewer-replace-entries entries preserve-filter)))))))
 
 (provide 'json-log-viewer)
 ;;; json-log-viewer.el ends here

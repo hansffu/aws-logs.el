@@ -128,6 +128,40 @@
       (should (string-match-p "\"service\": \"orders\"" value))
       (should (get-text-property 0 'json-log-viewer-json-block value)))))
 
+(ert-deftest json-log-viewer-sqlite-storage-offloads-hidden-data-test ()
+  (skip-unless (and (fboundp 'sqlite-available-p)
+                    (sqlite-available-p)))
+  (let* ((buf (json-log-viewer-make-buffer
+               "*json-log-viewer-sqlite-storage-test*"
+               :log-lines
+               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"hello\",\"payload\":{\"service\":\"orders\",\"log\":{\"level\":\"ERROR\"}}}")
+               :timestamp-path "timestamp"
+               :level-path "payload.log.level"
+               :message-path "msg"
+               :json-paths '("payload")
+               :storage-backend 'sqlite
+               :streaming t))
+         sqlite-file)
+    (unwind-protect
+        (with-current-buffer buf
+          (setq sqlite-file json-log-viewer--sqlite-file)
+          (should (eq json-log-viewer--storage-backend 'sqlite))
+          (should (stringp sqlite-file))
+          (should (file-exists-p sqlite-file))
+          (let ((entry-ov (car json-log-viewer--entry-overlays)))
+            (should entry-ov)
+            (should-not (overlay-get entry-ov 'json-log-viewer-entry-fields))
+            (should-not (overlay-get entry-ov 'json-log-viewer-filter-text))
+            (json-log-viewer-toggle-entry)
+            (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+              (should (string-match-p "payload:\n{" text))
+              (should (string-match-p "\"service\": \"orders\"" text))))
+          (should (= (length (json-log-viewer-current-log-lines buf)) 1)))
+      (when (buffer-live-p buf)
+        (kill-buffer buf))
+      (when sqlite-file
+        (should-not (file-exists-p sqlite-file))))))
+
 (ert-deftest json-log-viewer-json-refresh-async-sentinel-test ()
   (let* ((buf (json-log-viewer-make-buffer
                "*json-log-viewer-test*"

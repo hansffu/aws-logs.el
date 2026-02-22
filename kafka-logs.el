@@ -97,6 +97,27 @@ Values are dot-separated paths understood by json-log-viewer, for example
   :type '(repeat string)
   :group 'kafka-logs)
 
+(defcustom kafka-logs-storage-backend 'sqlite
+  "Storage backend used by kafka-logs viewer buffers.
+
+When set to `sqlite`, hidden viewer data (raw lines and detail fields) is
+stored outside Lisp memory."
+  :type '(choice (const :tag "SQLite" sqlite)
+                 (const :tag "Memory" memory))
+  :group 'kafka-logs)
+
+(defcustom kafka-logs-stream-drain-interval 0.05
+  "Seconds between stream queue drain ticks.
+
+Lower values reduce display latency at the cost of more frequent UI work."
+  :type 'number
+  :group 'kafka-logs)
+
+(defcustom kafka-logs-stream-max-lines-per-batch 250
+  "Maximum streamed lines rendered per drain tick."
+  :type 'integer
+  :group 'kafka-logs)
+
 (defvar kafka-logs-connection kafka-logs-default-connection
   "Selected Kafka connection name for this Emacs session.")
 
@@ -136,6 +157,18 @@ Each element has the form (NAME . PLIST).")
 
 (defvar-local kafka-logs--once-output-buffer nil
   "Temporary process output buffer for one-shot asynchronous fetches.")
+
+(defvar-local kafka-logs--stream-chunks-in nil
+  "LIFO queue of pending stream output chunks waiting for reversal.")
+
+(defvar-local kafka-logs--stream-chunks-out nil
+  "FIFO queue of pending stream output chunks ready for draining.")
+
+(defvar-local kafka-logs--stream-pending-lines nil
+  "Parsed full lines waiting to be converted and rendered.")
+
+(defvar-local kafka-logs--stream-drain-timer nil
+  "Per-buffer timer used to drain queued stream data incrementally.")
 
 (defvar-local kafka-logs--viewer-connection nil
   "Connection name shown in current viewer buffer header.")
@@ -519,6 +552,12 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
         (when (process-live-p proc)
           (delete-process proc))
         (setq kafka-logs--process nil))
+      (when (timerp kafka-logs--stream-drain-timer)
+        (cancel-timer kafka-logs--stream-drain-timer))
+      (setq kafka-logs--stream-drain-timer nil)
+      (setq kafka-logs--stream-chunks-in nil)
+      (setq kafka-logs--stream-chunks-out nil)
+      (setq kafka-logs--stream-pending-lines nil)
       (setq kafka-logs--pending-fragment "")
       (when (buffer-live-p kafka-logs--once-output-buffer)
         (kill-buffer kafka-logs--once-output-buffer))
@@ -636,6 +675,7 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
            :message-path "message"
            :extra-paths '("connection" "topic" "partition" "offset" "key")
            :json-paths kafka-logs-json-paths
+           :storage-backend kafka-logs-storage-backend
            :streaming streaming
            :direction 'oldest-first
            :header-lines-function #'kafka-logs--viewer-header-lines))
@@ -643,6 +683,10 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
       (setq-local kafka-logs--process nil)
       (setq-local kafka-logs--pending-fragment "")
       (setq-local kafka-logs--once-output-buffer nil)
+      (setq-local kafka-logs--stream-chunks-in nil)
+      (setq-local kafka-logs--stream-chunks-out nil)
+      (setq-local kafka-logs--stream-pending-lines nil)
+      (setq-local kafka-logs--stream-drain-timer nil)
       (setq-local kafka-logs--viewer-connection kafka-logs-connection)
       (setq-local kafka-logs--viewer-topic kafka-logs-topic)
       (setq-local kafka-logs--viewer-stream kafka-logs-stream)
@@ -667,6 +711,86 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
     (setq kafka-logs--pending-fragment (or rest ""))
     complete-lines))
 
+(defun kafka-logs--stream-queue-empty-p ()
+  "Return non-nil when no stream output is waiting to be rendered."
+  (and (null kafka-logs--stream-chunks-in)
+       (null kafka-logs--stream-chunks-out)
+       (null kafka-logs--stream-pending-lines)))
+
+(defun kafka-logs--stream-cancel-drain-timer ()
+  "Cancel and clear stream drain timer for current buffer."
+  (when (timerp kafka-logs--stream-drain-timer)
+    (cancel-timer kafka-logs--stream-drain-timer))
+  (setq kafka-logs--stream-drain-timer nil))
+
+(defun kafka-logs--stream-drain-on-timer (buffer)
+  "Drain queued stream output for BUFFER from timer callbacks."
+  (if (not (buffer-live-p buffer))
+      nil
+    (with-current-buffer buffer
+      (condition-case err
+          (kafka-logs--stream-drain nil)
+        (error
+         (kafka-logs--stream-cancel-drain-timer)
+         (message "kafka-logs drain failed: %s" (error-message-string err)))))))
+
+(defun kafka-logs--stream-schedule-drain ()
+  "Ensure periodic draining is scheduled for current buffer."
+  (unless (timerp kafka-logs--stream-drain-timer)
+    (let ((interval (max 0.01 (or kafka-logs-stream-drain-interval 0.05))))
+      (setq kafka-logs--stream-drain-timer
+            (run-at-time interval interval
+                         #'kafka-logs--stream-drain-on-timer
+                         (current-buffer))))))
+
+(defun kafka-logs--stream-enqueue-chunk (chunk)
+  "Queue one process output CHUNK for later incremental rendering."
+  (when (and (stringp chunk) (> (length chunk) 0))
+    (push chunk kafka-logs--stream-chunks-in)
+    (kafka-logs--stream-schedule-drain)))
+
+(defun kafka-logs--stream-pop-chunk ()
+  "Pop the next queued process output chunk, or nil."
+  (unless kafka-logs--stream-chunks-out
+    (when kafka-logs--stream-chunks-in
+      (setq kafka-logs--stream-chunks-out (nreverse kafka-logs--stream-chunks-in))
+      (setq kafka-logs--stream-chunks-in nil)))
+  (prog1 (car kafka-logs--stream-chunks-out)
+    (setq kafka-logs--stream-chunks-out (cdr kafka-logs--stream-chunks-out))))
+
+(defun kafka-logs--stream-pop-lines (max-lines)
+  "Pop up to MAX-LINES complete streamed lines in order."
+  (let ((lines nil)
+        (count 0))
+    (while (< count max-lines)
+      (unless kafka-logs--stream-pending-lines
+        (if-let ((chunk (kafka-logs--stream-pop-chunk)))
+            (setq kafka-logs--stream-pending-lines
+                  (kafka-logs--consume-chunk-lines chunk))
+          (setq count max-lines)))
+      (while (and kafka-logs--stream-pending-lines
+                  (< count max-lines))
+        (push (pop kafka-logs--stream-pending-lines) lines)
+        (setq count (1+ count))))
+    (nreverse lines)))
+
+(defun kafka-logs--stream-drain (&optional drain-all)
+  "Render queued streamed output in batches.
+
+When DRAIN-ALL is non-nil, consume the full queue in one call."
+  (let ((batch-size (max 1 (or kafka-logs-stream-max-lines-per-batch 250)))
+        (more t))
+    (while more
+      (let* ((limit (if drain-all most-positive-fixnum batch-size))
+             (lines (kafka-logs--stream-pop-lines limit))
+             (json-lines (kafka-logs--lines->json-lines lines)))
+        (when json-lines
+          (json-log-viewer-push (current-buffer) json-lines))
+        (setq more (and drain-all
+                        (not (kafka-logs--stream-queue-empty-p))))))
+    (when (kafka-logs--stream-queue-empty-p)
+      (kafka-logs--stream-cancel-drain-timer))))
+
 (defun kafka-logs--flush-pending-fragment ()
   "Flush pending trailing fragment in current buffer."
   (when (and kafka-logs--pending-fragment
@@ -681,17 +805,17 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
   (let ((buffer (process-buffer process)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
-        (let* ((lines (kafka-logs--consume-chunk-lines output))
-               (json-lines (kafka-logs--lines->json-lines lines)))
-          (when json-lines
-            (json-log-viewer-push buffer json-lines)))))))
+        ;; Keep process filter lightweight: queue output and render on timer ticks.
+        (kafka-logs--stream-enqueue-chunk output)))))
 
 (defun kafka-logs--stream-process-sentinel (process event)
   "Process sentinel for streaming kcat PROCESS EVENT."
   (let ((buffer (process-buffer process)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
+        (kafka-logs--stream-drain t)
         (kafka-logs--flush-pending-fragment)
+        (kafka-logs--stream-cancel-drain-timer)
         (setq kafka-logs--process nil)))
     (when (and (memq (process-status process) '(exit signal))
                (not (zerop (process-exit-status process)))
@@ -764,6 +888,10 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
     (with-current-buffer buffer
       (setq-local kafka-logs--process process)
       (setq-local kafka-logs--pending-fragment "")
+      (setq-local kafka-logs--stream-chunks-in nil)
+      (setq-local kafka-logs--stream-chunks-out nil)
+      (setq-local kafka-logs--stream-pending-lines nil)
+      (setq-local kafka-logs--stream-drain-timer nil)
       (display-buffer buffer))
     (set-process-filter process #'kafka-logs--stream-process-filter)
     (set-process-sentinel process #'kafka-logs--stream-process-sentinel)
