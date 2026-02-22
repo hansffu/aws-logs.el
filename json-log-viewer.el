@@ -413,7 +413,8 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
           (next-id (plist-get result :next-id))
           (preserve-filter (plist-get result :preserve-filter)))
       (when (numberp next-id)
-        (setq json-log-viewer--next-entry-id next-id))
+        (setq json-log-viewer--next-entry-id
+              (max json-log-viewer--next-entry-id next-id)))
       (cond
        ((eq op 'replace)
         (json-log-viewer-replace-entries entries preserve-filter t))
@@ -490,22 +491,27 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
                              (max 0 (1- json-log-viewer--entry-details-async-pending-count)))
                        (json-log-viewer--entry-details-async-handle-result result))))))))
 
-(defun json-log-viewer--make-async-job (op lines start-id &optional preserve-filter)
-  "Build async queue payload for OP, LINES, START-ID and PRESERVE-FILTER."
-  (list :op op
-        :lines lines
-        :start-id start-id
-        :worker-file (json-log-viewer--async-worker-file)
-        :timestamp-path json-log-viewer--timestamp-path
-        :level-path json-log-viewer--level-path
-        :message-path json-log-viewer--message-path
-        :extra-paths json-log-viewer--extra-paths
-        :json-paths json-log-viewer--json-paths
-        :sqlite-file json-log-viewer--sqlite-file
-        :streaming json-log-viewer--streaming
-        :max-entries json-log-viewer--stream-max-entries
-        :chunk-size (json-log-viewer--stream-chunk-size)
-        :preserve-filter preserve-filter))
+(defun json-log-viewer--make-async-job (op lines &optional preserve-filter)
+  "Build async queue payload for OP, LINES and PRESERVE-FILTER.
+
+Reserves entry IDs at enqueue time to avoid collisions across queued jobs."
+  (let* ((line-count (length lines))
+         (start-id json-log-viewer--next-entry-id))
+    (setq json-log-viewer--next-entry-id (+ start-id line-count))
+    (list :op op
+          :lines lines
+          :start-id start-id
+          :worker-file (json-log-viewer--async-worker-file)
+          :timestamp-path json-log-viewer--timestamp-path
+          :level-path json-log-viewer--level-path
+          :message-path json-log-viewer--message-path
+          :extra-paths json-log-viewer--extra-paths
+          :json-paths json-log-viewer--json-paths
+          :sqlite-file json-log-viewer--sqlite-file
+          :streaming json-log-viewer--streaming
+          :max-entries json-log-viewer--stream-max-entries
+          :chunk-size (json-log-viewer--stream-chunk-size)
+          :preserve-filter preserve-filter)))
 
 (defun json-log-viewer--make-entry-details-async-job (op
                                                       &optional
@@ -914,7 +920,7 @@ Returns cons cell (ENTRIES . NEXT-ID)."
         (json-log-viewer--ensure-async-queue-running)
         (json-log-viewer--async-submit
          (json-log-viewer--make-async-job
-          'replace new-lines json-log-viewer--next-entry-id t))
+          'replace new-lines t))
         (list :entries nil :replace nil)))))
 
 (defun json-log-viewer--entry-signature (entry)
@@ -1048,6 +1054,7 @@ Returns cons cell (ENTRIES . NEXT-ID)."
           (let ((details-end (point))
                 (fold-ov (make-overlay details-start (point))))
             (overlay-put fold-ov 'json-log-viewer-fold t)
+            (overlay-put fold-ov 'invisible (overlay-get entry-overlay 'invisible))
             (push fold-ov json-log-viewer--fold-overlays)
             (overlay-put entry-overlay 'json-log-viewer-fold-overlay fold-ov)
             (overlay-put entry-overlay 'json-log-viewer-entry-expanded t)
@@ -1083,14 +1090,29 @@ Returns cons cell (ENTRIES . NEXT-ID)."
       (json-log-viewer--entry-expand entry-ov))
     (json-log-viewer--highlight-current-line)))
 
+(defun json-log-viewer--entry-overlays-in-buffer-order (&optional visible-only)
+  "Return entry overlays sorted by buffer position.
+
+When VISIBLE-ONLY is non-nil, return only currently visible entries."
+  (let (rows)
+    (dolist (entry-ov json-log-viewer--entry-overlays)
+      (when (and (overlay-buffer entry-ov)
+                 (overlay-start entry-ov)
+                 (overlay-end entry-ov)
+                 (or (not visible-only)
+                     (not (overlay-get entry-ov 'invisible))))
+        (push entry-ov rows)))
+    (sort rows (lambda (a b) (< (overlay-start a) (overlay-start b))))))
+
 (defun json-log-viewer-toggle-all ()
   "Toggle fold state for all log entries."
   (interactive)
-  (let ((expand-any nil))
-    (dolist (entry-ov json-log-viewer--entry-overlays)
+  (let ((expand-any nil)
+        (entries (json-log-viewer--entry-overlays-in-buffer-order t)))
+    (dolist (entry-ov entries)
       (unless (overlay-get entry-ov 'json-log-viewer-entry-expanded)
         (setq expand-any t)))
-    (dolist (entry-ov (reverse (append json-log-viewer--entry-overlays nil)))
+    (dolist (entry-ov (reverse entries))
       (if expand-any
           (json-log-viewer--entry-expand entry-ov)
         (json-log-viewer--entry-collapse entry-ov)))
@@ -1166,14 +1188,17 @@ Returns cons cell (ENTRIES . NEXT-ID)."
          (matching-signatures (and active
                                    (json-log-viewer--storage-matching-signatures normalized))))
     (dolist (entry-overlay json-log-viewer--entry-overlays)
-      (overlay-put entry-overlay 'invisible
-                   (if (and active
-                            (if matching-signatures
-                                (not (gethash (overlay-get entry-overlay 'json-log-viewer-signature)
-                                              matching-signatures))
-                              (not (json-log-viewer--filter-match-p entry-overlay normalized))))
-                       'json-log-viewer-filter
-                     nil)))))
+      (let ((invisible
+             (if (and active
+                      (if matching-signatures
+                          (not (gethash (overlay-get entry-overlay 'json-log-viewer-signature)
+                                        matching-signatures))
+                        (not (json-log-viewer--filter-match-p entry-overlay normalized))))
+                 'json-log-viewer-filter
+               nil)))
+        (overlay-put entry-overlay 'invisible invisible)
+        (when-let ((fold-ov (overlay-get entry-overlay 'json-log-viewer-fold-overlay)))
+          (overlay-put fold-ov 'invisible invisible))))))
 
 (defun json-log-viewer--apply-filter-to-overlays (overlays)
   "Apply current filter to OVERLAYS only."
@@ -1182,11 +1207,14 @@ Returns cons cell (ENTRIES . NEXT-ID)."
          (normalized (and needle (downcase needle)))
          (active (and normalized (not (string-empty-p normalized)))))
     (dolist (entry-overlay overlays)
-      (overlay-put entry-overlay 'invisible
-                   (if (and active
-                            (not (json-log-viewer--filter-match-p entry-overlay normalized)))
-                       'json-log-viewer-filter
-                     nil)))))
+      (let ((invisible
+             (if (and active
+                      (not (json-log-viewer--filter-match-p entry-overlay normalized)))
+                 'json-log-viewer-filter
+               nil)))
+        (overlay-put entry-overlay 'invisible invisible)
+        (when-let ((fold-ov (overlay-get entry-overlay 'json-log-viewer-fold-overlay)))
+          (overlay-put fold-ov 'invisible invisible))))))
 
 (defun json-log-viewer--set-filter (needle)
   "Set viewer filter to NEEDLE and apply it."
@@ -1730,7 +1758,7 @@ Returns the created buffer."
       (when normalized-lines
         (json-log-viewer--async-submit
          (json-log-viewer--make-async-job
-          'replace normalized-lines json-log-viewer--next-entry-id nil)))
+          'replace normalized-lines nil)))
     target)))
 
 (defun json-log-viewer-push (buffer-or-name log-lines)
@@ -1747,7 +1775,7 @@ BUFFER-OR-NAME must identify a live `json-log-viewer-mode` buffer created by
         (json-log-viewer--ensure-async-queue-running)
         (json-log-viewer--async-submit
          (json-log-viewer--make-async-job
-          'append normalized-lines json-log-viewer--next-entry-id nil))))))
+          'append normalized-lines nil))))))
 
 (defun json-log-viewer-current-log-lines (buffer-or-name)
   "Return a copy of current raw log lines from BUFFER-OR-NAME."
@@ -1766,7 +1794,7 @@ When PRESERVE-FILTER is non-nil, keep the current active filter."
         (json-log-viewer--ensure-async-queue-running)
         (json-log-viewer--async-submit
          (json-log-viewer--make-async-job
-          'replace normalized-lines json-log-viewer--next-entry-id preserve-filter))))))
+          'replace normalized-lines preserve-filter))))))
 
 (provide 'json-log-viewer)
 ;;; json-log-viewer.el ends here

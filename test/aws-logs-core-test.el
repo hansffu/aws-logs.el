@@ -202,6 +202,30 @@
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
+(ert-deftest json-log-viewer-async-job-reserves-unique-start-ids-test ()
+  (let ((buf (json-log-viewer-make-buffer
+              "*json-log-viewer-reserve-ids-test*"
+              :log-lines nil
+              :timestamp-path "timestamp"
+              :level-path "level"
+              :message-path "msg"
+              :streaming t)))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((job-a (json-log-viewer--make-async-job
+                         'append
+                         '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"a\"}")
+                         nil))
+                 (job-b (json-log-viewer--make-async-job
+                         'append
+                         '("{\"timestamp\":\"2026-01-01T00:00:01Z\",\"msg\":\"b\"}")
+                         nil)))
+            (should (= 0 (plist-get job-a :start-id)))
+            (should (= 1 (plist-get job-b :start-id)))
+            (should (= 2 json-log-viewer--next-entry-id))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
 (ert-deftest json-log-viewer-lazy-details-render-on-toggle-test ()
   (let* ((buf (json-log-viewer-make-buffer
                "*json-log-viewer-lazy-details-test*"
@@ -227,6 +251,65 @@
             (should-not (overlay-get entry-ov 'json-log-viewer-entry-expanded))
             (should-not (string-match-p "meta\\.service: orders"
                                         (buffer-substring-no-properties (point-min) (point-max))))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest json-log-viewer-toggle-all-respects-current-filter-visibility-test ()
+  (let* ((buf (json-log-viewer-make-buffer
+               "*json-log-viewer-toggle-all-filter-test*"
+               :log-lines
+               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"level\":\"info\",\"msg\":\"alpha\"}"
+                 "{\"timestamp\":\"2026-01-01T00:00:01Z\",\"level\":\"info\",\"msg\":\"beta\"}"
+                 "{\"timestamp\":\"2026-01-01T00:00:02Z\",\"level\":\"info\",\"msg\":\"gamma\"}")
+               :timestamp-path "timestamp"
+               :level-path "level"
+               :message-path "msg"
+               :streaming nil)))
+    (unwind-protect
+        (with-current-buffer buf
+          (json-log-viewer--set-filter "beta")
+          (json-log-viewer-toggle-all)
+          (let ((visible 0)
+                (visible-expanded 0)
+                (hidden-expanded 0))
+            (dolist (entry-ov json-log-viewer--entry-overlays)
+              (let ((expanded (overlay-get entry-ov 'json-log-viewer-entry-expanded)))
+                (if (overlay-get entry-ov 'invisible)
+                    (when expanded
+                      (setq hidden-expanded (1+ hidden-expanded)))
+                  (setq visible (1+ visible))
+                  (when expanded
+                    (setq visible-expanded (1+ visible-expanded))))))
+            (should (= visible 1))
+            (should (= visible-expanded 1))
+            (should (= hidden-expanded 0))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest json-log-viewer-filter-hides-expanded-fold-overlay-test ()
+  (let* ((buf (json-log-viewer-make-buffer
+               "*json-log-viewer-filter-fold-overlay-test*"
+               :log-lines
+               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"level\":\"info\",\"msg\":\"alpha\"}"
+                 "{\"timestamp\":\"2026-01-01T00:00:01Z\",\"level\":\"info\",\"msg\":\"beta\"}")
+               :timestamp-path "timestamp"
+               :level-path "level"
+               :message-path "msg"
+               :direction 'oldest-first
+               :streaming nil)))
+    (unwind-protect
+        (with-current-buffer buf
+          (goto-char (point-min))
+          (json-log-viewer-toggle-entry)
+          (let ((first (car (json-log-viewer--entry-overlays-in-buffer-order)))
+                (second (cadr (json-log-viewer--entry-overlays-in-buffer-order))))
+            (should (overlay-get first 'json-log-viewer-entry-expanded))
+            (json-log-viewer--set-filter "beta")
+            (should (eq (overlay-get first 'invisible) 'json-log-viewer-filter))
+            (should-not (overlay-get second 'invisible))
+            (let ((fold-ov (overlay-get first 'json-log-viewer-fold-overlay)))
+              (should (overlayp fold-ov))
+              (should (eq (overlay-get fold-ov 'invisible) 'json-log-viewer-filter)))))
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
