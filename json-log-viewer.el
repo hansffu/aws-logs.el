@@ -22,6 +22,9 @@
 (declare-function async-job-queue-create "async-job-queue" (process-func callback-func))
 (declare-function async-job-queue-push "async-job-queue" (queue element))
 (declare-function async-job-queue-stop "async-job-queue" (queue))
+(declare-function json-log-viewer-async-worker-process-job
+                  "json-log-viewer-async-worker"
+                  (job))
 
 (defgroup json-log-viewer nil
   "Foldable JSON log viewer buffers."
@@ -218,6 +221,14 @@ processed in a subordinate Emacs and only rendered when callbacks arrive."
 
 (defvar-local json-log-viewer--json-paths nil
   "List of JSON paths rendered as pretty JSON detail blocks.")
+
+(defconst json-log-viewer--source-directory
+  (let ((source-file (or load-file-name
+                         (and (boundp 'byte-compile-current-file)
+                              byte-compile-current-file)
+                         (buffer-file-name))))
+    (and source-file (file-name-directory source-file)))
+  "Directory that contains json-log-viewer source files.")
 
 (defvar-local json-log-viewer--json-refresh-log-lines-function nil
   "Callback: (OLD-LOG-LINES) -> NEW-LOG-LINES for JSON-line buffers.")
@@ -427,282 +438,28 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
         (puthash (car row) t matches)))
     matches))
 
-(defun json-log-viewer--async-worker-process-job (job)
-  "Process one async JOB payload in subordinate Emacs.
-
-Returns a plist consumed by main-process callback code."
-  (require 'json)
-  (require 'subr-x)
-  (let* ((op (plist-get job :op))
-         (lines (or (plist-get job :lines) nil))
-         (start-id (or (plist-get job :start-id) 0))
-         (timestamp-path (plist-get job :timestamp-path))
-         (level-path (plist-get job :level-path))
-         (message-path (plist-get job :message-path))
-         (extra-paths (or (plist-get job :extra-paths) nil))
-         (json-paths (or (plist-get job :json-paths) nil))
-         (sqlite-file (plist-get job :sqlite-file))
-         (storage-backend (plist-get job :storage-backend))
-         (streaming (plist-get job :streaming))
-         (max-entries (plist-get job :max-entries))
-         (chunk-size (max 1 (or (plist-get job :chunk-size) 1)))
-         (preserve-filter (plist-get job :preserve-filter)))
-    (cl-labels
-        ((value->string (value)
-           (cond
-            ((stringp value) value)
-            ((numberp value) (number-to-string value))
-            ((eq value t) "true")
-            ((eq value :false) "false")
-            ((null value) nil)
-            (t (format "%s" value))))
-         (parse-line (line)
-           (when (stringp line)
-             (condition-case nil
-                 (json-parse-string line :object-type 'alist :array-type 'list
-                                    :null-object nil :false-object :false)
-               (error nil))))
-         (parse-maybe (value)
-           (when (and (stringp value)
-                      (string-match-p "\\`[[:space:]\n\r\t]*[{\\[]" value))
-             (parse-line value)))
-         (array-index (key)
-           (when (and (stringp key)
-                      (string-match-p "\\`[0-9]+\\'" key))
-             (string-to-number key)))
-         (alist-like-p (node)
-           (and (listp node)
-                (or (null node)
-                    (let ((first (car node)))
-                      (and (consp first)
-                           (or (stringp (car first))
-                               (symbolp (car first))))))))
-         (get-child (node key)
-           (cond
-            ((hash-table-p node)
-             (or (gethash key node)
-                 (gethash (intern-soft key) node)))
-            ((alist-like-p node)
-             (or (alist-get key node nil nil #'equal)
-                 (when-let ((sym (intern-soft key)))
-                   (alist-get sym node))))
-            ((listp node)
-             (when-let ((idx (array-index key)))
-               (nth idx node)))
-            (t nil)))
-         (get-path (node path)
-           (let ((parts (split-string path "\\."))
-                 (current node)
-                 (failed nil))
-             (while (and parts (not failed))
-               (when-let ((parsed (parse-maybe current)))
-                 (setq current parsed))
-               (setq current (get-child current (car parts)))
-               (unless current
-                 (setq failed t))
-               (setq parts (cdr parts)))
-             (unless failed
-               current)))
-         (resolve-path (parsed path)
-           (when (and parsed
-                      (stringp path)
-                      (not (string-empty-p path)))
-             (value->string (get-path parsed path))))
-         (parse-time (value)
-           (when (and (stringp value) (not (string-empty-p value)))
-             (let ((parsed (ignore-errors (date-to-time value))))
-               (when parsed
-                 (let* ((base (float-time parsed))
-                        (fraction
-                         (when (string-match
-                                "[T ][0-9][0-9]:[0-9][0-9]:[0-9][0-9][.,]\\([0-9]+\\)"
-                                value)
-                           (let ((digits (match-string 1 value)))
-                             (/ (string-to-number digits)
-                                (expt 10.0 (length digits)))))))
-                   (if (and fraction (= base (truncate base)))
-                       (+ base fraction)
-                     base))))))
-         (json-value->pretty-string (value)
-           (let* ((normalized (or (parse-maybe value) value))
-                  (json (condition-case nil
-                            (json-serialize normalized :null-object nil :false-object :false)
-                          (error nil))))
-             (if (not json)
-                 (or (value->string normalized) "")
-               (condition-case nil
-                   (with-temp-buffer
-                     (insert json)
-                     (json-pretty-print-buffer)
-                     (string-trim-right (buffer-string)))
-                 (error json)))))
-         (join-path (prefix part)
-           (if (and prefix (not (string-empty-p prefix)))
-               (concat prefix "." part)
-             part))
-         (flatten-node (node json-path-list &optional prefix)
-           (cond
-            ((and prefix (member prefix json-path-list))
-             (list (list :k prefix
-                         :v (json-value->pretty-string node)
-                         :b t)))
-            ((hash-table-p node)
-             (let (rows keys)
-               (maphash (lambda (key _value)
-                          (when-let ((k (value->string key)))
-                            (push k keys)))
-                        node)
-               (setq keys (sort keys #'string-lessp))
-               (if (null keys)
-                   (when prefix (list (list :k prefix :v "")))
-                 (dolist (key keys)
-                   (setq rows
-                         (append rows
-                                 (flatten-node (or (gethash key node)
-                                                   (when-let ((sym (intern-soft key)))
-                                                     (gethash sym node)))
-                                               json-path-list
-                                               (join-path prefix key)))))
-                 rows)))
-            ((alist-like-p node)
-             (if (null node)
-                 (when prefix (list (list :k prefix :v "")))
-               (let (rows)
-                 (dolist (pair node)
-                   (when (consp pair)
-                     (when-let ((k (value->string (car pair))))
-                       (setq rows
-                             (append rows
-                                     (flatten-node (cdr pair)
-                                                   json-path-list
-                                                   (join-path prefix k)))))))
-                 rows)))
-            ((listp node)
-             (let ((base (or prefix "value")))
-               (if (null node)
-                   (list (list :k base :v "[]"))
-                 (let ((idx 0)
-                       rows)
-                   (dolist (item node)
-                     (setq rows
-                           (append rows
-                                   (flatten-node item
-                                                 json-path-list
-                                                 (format "%s[%d]" base idx))))
-                     (setq idx (1+ idx)))
-                   rows))))
-            (t
-             (list (list :k (or prefix "value")
-                         :v (or (value->string node) ""))))))
-         (json-object-rows (parsed raw-line json-path-list)
-           (let ((rows (and parsed (flatten-node parsed json-path-list nil))))
-             (if rows
-                 rows
-               (list (list :k "raw" :v (or raw-line ""))))))
-         (entry-filter-text (rows)
-           (downcase
-            (mapconcat (lambda (row)
-                         (format "%s %s"
-                                 (or (plist-get row :k) "")
-                                 (or (plist-get row :v) "")))
-                       rows
-                       "\n")))
-         (rows->storage-json (rows)
-           (let (objects)
-             (dolist (row rows)
-               (let ((obj (list :k (or (plist-get row :k) "")
-                                :v (or (plist-get row :v) ""))))
-                 (when (plist-get row :b)
-                   (setq obj (append obj (list :b t))))
-                 (push obj objects)))
-             (json-serialize (vconcat (nreverse objects)))))
-         (line->entry+detail (line id)
-           (let* ((parsed (parse-line line))
-                  (timestamp (resolve-path parsed timestamp-path))
-                  (timestamp-epoch (parse-time timestamp))
-                  (sort-key (or timestamp-epoch (+ 1000000000000.0 id)))
-                  (level (or (resolve-path parsed level-path) "-"))
-                  (message (or (resolve-path parsed message-path)
-                               line
-                               "-"))
-                  (extras nil)
-                  (rows (json-object-rows parsed line json-paths))
-                  (filter-text (entry-filter-text rows))
-                  (fields-json (rows->storage-json rows))
-                  (signature (number-to-string id)))
-             (dolist (path extra-paths)
-               (when-let ((value (resolve-path parsed path)))
-                 (push value extras)))
-             (cons
-              (list :id id
-                    :sort-key sort-key
-                    :timestamp (or timestamp "-")
-                    :level level
-                    :message message
-                    :extras (nreverse extras)
-                    :filter-text filter-text
-                    :storage-populated t)
-              (vector signature filter-text fields-json)))))
-      (let ((next-id start-id)
-            entries
-            details
-            (raw-count nil))
-        (dolist (line lines)
-          (let ((pair (line->entry+detail line next-id)))
-            (push (car pair) entries)
-            (push (cdr pair) details))
-          (setq next-id (1+ next-id)))
-        (setq entries (nreverse entries))
-        (setq details (nreverse details))
-        (when (and (eq storage-backend 'sqlite)
-                   sqlite-file
-                   (fboundp 'sqlite-open))
-          (let ((db (sqlite-open sqlite-file))
-                (ok nil))
-            (unwind-protect
-                (progn
-                  (sqlite-execute db "BEGIN")
-                  (when (eq op 'replace)
-                    (sqlite-execute db "DELETE FROM raw_lines")
-                    (sqlite-execute db "DELETE FROM entry_details"))
-                  (dolist (line lines)
-                    (sqlite-execute db
-                                    "INSERT INTO raw_lines(line) VALUES (?)"
-                                    (vector line)))
-                  (dolist (detail details)
-                    (sqlite-execute
-                     db
-                     "INSERT OR REPLACE INTO entry_details(signature, filter_text, fields_json) VALUES (?, ?, ?)"
-                     detail))
-                  (when (and streaming
-                             (integerp max-entries)
-                             (> max-entries 0))
-                    (let* ((count-row (car (sqlite-select db "SELECT COUNT(*) FROM raw_lines")))
-                           (count (or (car count-row) 0))
-                           (over (- count max-entries)))
-                      (when (> over 0)
-                        (let* ((chunks (/ (+ over chunk-size -1) chunk-size))
-                               (drop-target (* chunks chunk-size))
-                               (rows (sqlite-select
-                                      db
-                                      (format "SELECT seq FROM raw_lines ORDER BY seq LIMIT %d"
-                                              drop-target))))
-                          (when rows
-                            (let ((last-seq (car (car (last rows)))))
-                              (sqlite-execute db
-                                              "DELETE FROM raw_lines WHERE seq <= ?"
-                                              (vector last-seq))))))))
-                  (setq raw-count (or (car (car (sqlite-select db "SELECT COUNT(*) FROM raw_lines"))) 0))
-                  (setq ok t)
-                  (sqlite-execute db "COMMIT"))
-              (unless ok
-                (ignore-errors (sqlite-execute db "ROLLBACK")))
-              (ignore-errors (sqlite-close db)))))
-        (list :op op
-              :entries entries
-              :next-id next-id
-              :raw-count raw-count
-              :preserve-filter preserve-filter)))))
+(defun json-log-viewer--async-worker-file ()
+  "Return a readable path to `json-log-viewer-async-worker.el'."
+  (let* ((candidate-from-source
+          (and json-log-viewer--source-directory
+               (expand-file-name "json-log-viewer-async-worker.el"
+                                 json-log-viewer--source-directory)))
+         (main-file (locate-library "json-log-viewer"))
+         (candidate-from-library
+          (and main-file
+               (expand-file-name "json-log-viewer-async-worker.el"
+                                 (file-name-directory main-file)))))
+    (cond
+     ((and (stringp candidate-from-source)
+           (file-readable-p candidate-from-source))
+      candidate-from-source)
+     ((and (stringp candidate-from-library)
+           (file-readable-p candidate-from-library))
+      candidate-from-library)
+     ((file-readable-p "json-log-viewer-async-worker.el")
+      (expand-file-name "json-log-viewer-async-worker.el"))
+     (t
+      (user-error "Cannot find json-log-viewer-async-worker.el")))))
 
 (defun json-log-viewer--async-queue-supported-p ()
   "Return non-nil when async job queue API is available."
@@ -761,7 +518,16 @@ Returns a plist consumed by main-process callback code."
     (let ((buffer (current-buffer)))
       (setq-local json-log-viewer--async-queue
                   (async-job-queue-create
-                   #'json-log-viewer--async-worker-process-job
+                   (lambda (job)
+                     (let ((worker-file (plist-get job :worker-file)))
+                       (unless (and (stringp worker-file)
+                                    (file-readable-p worker-file))
+                         (error "Async worker file is unreadable: %S" worker-file))
+                       (unless (fboundp 'json-log-viewer-async-worker-process-job)
+                         (load worker-file nil t)
+                         (unless (fboundp 'json-log-viewer-async-worker-process-job)
+                           (error "Missing worker entrypoint in %s" worker-file)))
+                       (json-log-viewer-async-worker-process-job job)))
                    (lambda (result)
                      (when (buffer-live-p buffer)
                        (with-current-buffer buffer
@@ -774,6 +540,7 @@ Returns a plist consumed by main-process callback code."
   (list :op op
         :lines lines
         :start-id start-id
+        :worker-file (json-log-viewer--async-worker-file)
         :timestamp-path json-log-viewer--timestamp-path
         :level-path json-log-viewer--level-path
         :message-path json-log-viewer--message-path
