@@ -91,8 +91,8 @@ echo "Producing $COUNT mock messages to topic: $TOPIC"
     req_id="$(printf "req-%06d" "$((RANDOM % 1000000))")"
     user_id="$((RANDOM % 10000))"
 
-    printf '{"@timestamp":"%s","log":{"level":"%s"},"message":"mock kafka event %d","service":"kafka-local-demo","request_id":"%s","user_id":%d}\n' \
-      "$ts" "$level" "$i" "$req_id" "$user_id"
+    printf '{"adate":"%s","stuff":"mock kafka event %d","demo":"kafka-local-demo","request_id":"%s","user_id":%d}\n' \
+      "$ts" "$i" "$req_id" "$user_id"
   done
 } | "${DC[@]}" exec -T \
   -e TOPIC="$TOPIC" \
