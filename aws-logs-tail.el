@@ -29,6 +29,8 @@
 (defvar aws-logs-custom-time-range)
 (defvar aws-logs-tail-ecs-batch-flush-interval)
 (defvar aws-logs-tail-ecs-batch-max-lines)
+(defvar aws-logs-tail-ecs-normalize-batch-lines)
+(defvar aws-logs-tail-ecs-chunk-batch-size)
 (defvar aws-logs-mode-hook)
 
 (declare-function aws-logs--list-log-groups "aws-logs" ())
@@ -50,6 +52,18 @@
 
 (defvar-local aws-logs--tail-flush-timer nil
   "Timer used to batch ECS viewer pushes for streaming buffers.")
+
+(defvar-local aws-logs--tail-chunk-timer nil
+  "Timer used to batch ECS output chunk consumption.")
+
+(defvar-local aws-logs--tail-normalize-timer nil
+  "Timer used to batch ECS raw-line normalization for streaming buffers.")
+
+(defvar-local aws-logs--tail-pending-output-chunks nil
+  "Queued ECS process output chunks waiting to be consumed.")
+
+(defvar-local aws-logs--tail-pending-raw-lines nil
+  "Queued raw ECS lines waiting to be normalized.")
 
 (defvar-local aws-logs--tail-once-output-buffer nil
   "Temporary process output buffer used by async ECS one-shot tail.")
@@ -273,6 +287,7 @@ Returns (NORMALIZED-LINES . NEW-PENDING)."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (aws-logs--tail-ecs-cancel-flush-timer)
+      (aws-logs--tail-ecs-cancel-chunk-timer)
       (let ((proc (or aws-logs--tail-process
                       (get-buffer-process buffer))))
         (when (process-live-p proc)
@@ -282,6 +297,9 @@ Returns (NORMALIZED-LINES . NEW-PENDING)."
         (setq aws-logs--tail-pending-json-lines nil)
         (setq aws-logs--tail-pending-viewer-lines nil)
         (setq aws-logs--tail-pending-viewer-count 0)
+        (setq aws-logs--tail-pending-output-chunks nil)
+        (aws-logs--tail-ecs-cancel-normalize-timer)
+        (setq aws-logs--tail-pending-raw-lines nil)
         (when (buffer-live-p aws-logs--tail-once-output-buffer)
           (kill-buffer aws-logs--tail-once-output-buffer))
         (setq aws-logs--tail-once-output-buffer nil)))))
@@ -312,6 +330,10 @@ When STREAMING is non-nil, buffer is configured for incremental pushes."
       (setq-local aws-logs--tail-pending-viewer-lines nil)
       (setq-local aws-logs--tail-pending-viewer-count 0)
       (setq-local aws-logs--tail-flush-timer nil)
+      (setq-local aws-logs--tail-chunk-timer nil)
+      (setq-local aws-logs--tail-normalize-timer nil)
+      (setq-local aws-logs--tail-pending-output-chunks nil)
+      (setq-local aws-logs--tail-pending-raw-lines nil)
       (setq-local aws-logs--tail-once-output-buffer nil)
       (aws-logs--tail-install-viewer-keymap))
     buffer))
@@ -331,6 +353,18 @@ When STREAMING is non-nil, buffer is configured for incremental pushes."
   (when (timerp aws-logs--tail-flush-timer)
     (cancel-timer aws-logs--tail-flush-timer))
   (setq aws-logs--tail-flush-timer nil))
+
+(defun aws-logs--tail-ecs-cancel-chunk-timer ()
+  "Cancel pending ECS output chunk timer in current buffer."
+  (when (timerp aws-logs--tail-chunk-timer)
+    (cancel-timer aws-logs--tail-chunk-timer))
+  (setq aws-logs--tail-chunk-timer nil))
+
+(defun aws-logs--tail-ecs-cancel-normalize-timer ()
+  "Cancel pending ECS normalization timer in current buffer."
+  (when (timerp aws-logs--tail-normalize-timer)
+    (cancel-timer aws-logs--tail-normalize-timer))
+  (setq aws-logs--tail-normalize-timer nil))
 
 (defun aws-logs--tail-ecs-flush-queued-lines ()
   "Flush queued ECS lines to json-log-viewer in one batch."
@@ -361,29 +395,108 @@ When STREAMING is non-nil, buffer is configured for incremental pushes."
 When FLUSH-NOW is non-nil, flush immediately."
   (when lines
     (setq aws-logs--tail-pending-viewer-lines
-          (append aws-logs--tail-pending-viewer-lines lines))
+          (nconc aws-logs--tail-pending-viewer-lines lines))
     (setq aws-logs--tail-pending-viewer-count
           (+ aws-logs--tail-pending-viewer-count (length lines)))
     (if (or flush-now
             (>= aws-logs--tail-pending-viewer-count
                 (max 1 (or aws-logs-tail-ecs-batch-max-lines 1))))
         (progn
+          ;; Avoid heavy viewer updates inside process-filter callbacks.
           (aws-logs--tail-ecs-cancel-flush-timer)
-          (aws-logs--tail-ecs-flush-queued-lines))
+          (let ((buffer (current-buffer)))
+            (setq aws-logs--tail-flush-timer
+                  (run-at-time
+                   0 nil
+                   (lambda ()
+                     (when (buffer-live-p buffer)
+                       (with-current-buffer buffer
+                         (setq aws-logs--tail-flush-timer nil)
+                         (aws-logs--tail-ecs-flush-queued-lines))))))))
       (aws-logs--tail-ecs-schedule-flush))))
+
+(defun aws-logs--tail-ecs-process-queued-raw-lines ()
+  "Normalize queued raw ECS lines in one batch."
+  (let* ((batch-size (max 1 (or aws-logs-tail-ecs-normalize-batch-lines 1)))
+         (count 0)
+         batch)
+    (while (and aws-logs--tail-pending-raw-lines
+                (< count batch-size))
+      (push (pop aws-logs--tail-pending-raw-lines) batch)
+      (setq count (1+ count)))
+    (when batch
+      (when-let ((lines (aws-logs--tail-ecs-normalize-lines (nreverse batch))))
+        (aws-logs--tail-ecs-enqueue-lines lines)))
+    (when aws-logs--tail-pending-raw-lines
+      (aws-logs--tail-ecs-schedule-normalize))))
+
+(defun aws-logs--tail-ecs-process-queued-output-chunks ()
+  "Consume queued ECS output chunks in one batch."
+  (let* ((batch-size (max 1 (or aws-logs-tail-ecs-chunk-batch-size 1)))
+         (count 0))
+    (while (and aws-logs--tail-pending-output-chunks
+                (< count batch-size))
+      (when-let ((raw-lines (aws-logs--tail-consume-chunk-lines
+                             (pop aws-logs--tail-pending-output-chunks))))
+        (setq aws-logs--tail-pending-raw-lines
+              (nconc aws-logs--tail-pending-raw-lines raw-lines)))
+      (setq count (1+ count)))
+    (when aws-logs--tail-pending-raw-lines
+      (aws-logs--tail-ecs-schedule-normalize))
+    (when aws-logs--tail-pending-output-chunks
+      (aws-logs--tail-ecs-schedule-output-consume))))
+
+(defun aws-logs--tail-ecs-schedule-output-consume ()
+  "Schedule deferred consumption of queued ECS output chunks."
+  (unless (timerp aws-logs--tail-chunk-timer)
+    (let ((buffer (current-buffer)))
+      (setq aws-logs--tail-chunk-timer
+            (run-at-time
+             0 nil
+             (lambda ()
+               (when (buffer-live-p buffer)
+                 (with-current-buffer buffer
+                   (setq aws-logs--tail-chunk-timer nil)
+                   (aws-logs--tail-ecs-process-queued-output-chunks)))))))))
+
+(defun aws-logs--tail-ecs-drain-output-queue ()
+  "Synchronously drain pending process output chunks."
+  (aws-logs--tail-ecs-cancel-chunk-timer)
+  (while aws-logs--tail-pending-output-chunks
+    (aws-logs--tail-ecs-process-queued-output-chunks)))
+
+(defun aws-logs--tail-ecs-schedule-normalize ()
+  "Schedule deferred normalization of queued ECS raw lines."
+  (unless (timerp aws-logs--tail-normalize-timer)
+    (let ((buffer (current-buffer)))
+      (setq aws-logs--tail-normalize-timer
+            (run-at-time
+             0 nil
+             (lambda ()
+               (when (buffer-live-p buffer)
+                 (with-current-buffer buffer
+                   (setq aws-logs--tail-normalize-timer nil)
+                   (aws-logs--tail-ecs-process-queued-raw-lines)))))))))
+
+(defun aws-logs--tail-ecs-drain-normalize-queue ()
+  "Synchronously drain pending raw-line normalization queue."
+  (aws-logs--tail-ecs-cancel-normalize-timer)
+  (while aws-logs--tail-pending-raw-lines
+    (aws-logs--tail-ecs-process-queued-raw-lines)))
 
 (defun aws-logs--tail-ecs-process-filter (process output)
   "Push ECS PROCESS OUTPUT into json-log-viewer incrementally."
   (let ((buffer (process-buffer process)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
-        (let* ((raw-lines (aws-logs--tail-consume-chunk-lines output))
-               (lines (aws-logs--tail-ecs-normalize-lines raw-lines)))
-          (when lines
-            (aws-logs--tail-ecs-enqueue-lines lines)))))))
+        (setq aws-logs--tail-pending-output-chunks
+              (nconc aws-logs--tail-pending-output-chunks (list output)))
+        (aws-logs--tail-ecs-schedule-output-consume)))))
 
 (defun aws-logs--tail-ecs-flush-pending-line ()
   "Flush buffered trailing ECS line in current viewer buffer."
+  (aws-logs--tail-ecs-drain-output-queue)
+  (aws-logs--tail-ecs-drain-normalize-queue)
   (when (and aws-logs--tail-pending-fragment
              (not (string-empty-p aws-logs--tail-pending-fragment)))
     (let ((lines (aws-logs--tail-ecs-normalize-lines
@@ -495,7 +608,9 @@ When FLUSH-NOW is non-nil, flush immediately."
                    :buffer buffer
                    :command command
                    :noquery t
-                   :connection-type 'pipe)))
+                   :connection-type 'pipe
+                   :filter #'aws-logs--tail-ecs-process-filter
+                   :sentinel #'aws-logs--tail-ecs-process-sentinel)))
     (with-current-buffer buffer
       (setq-local aws-logs--tail-process process)
       (setq-local aws-logs--tail-pending-fragment "")
@@ -503,9 +618,11 @@ When FLUSH-NOW is non-nil, flush immediately."
       (setq-local aws-logs--tail-pending-viewer-lines nil)
       (setq-local aws-logs--tail-pending-viewer-count 0)
       (setq-local aws-logs--tail-flush-timer nil)
+      (setq-local aws-logs--tail-chunk-timer nil)
+      (setq-local aws-logs--tail-normalize-timer nil)
+      (setq-local aws-logs--tail-pending-output-chunks nil)
+      (setq-local aws-logs--tail-pending-raw-lines nil)
       (display-buffer buffer))
-    (set-process-filter process #'aws-logs--tail-ecs-process-filter)
-    (set-process-sentinel process #'aws-logs--tail-ecs-process-sentinel)
     (set-process-query-on-exit-flag process nil)
     (message "Started ECS logs tail for %s" aws-logs-log-group)))
 

@@ -266,6 +266,51 @@
           :details (nreverse details)
           :next-id next-id)))
 
+(defconst json-log-viewer-async-worker--sqlite-lock-retries 12
+  "Maximum retries when sqlite reports lock contention.")
+
+(defun json-log-viewer-async-worker--sqlite-setup (db)
+  "Apply sqlite settings for DB used by async workers."
+  ;; WAL allows concurrent reader/writer connections, and busy timeout avoids
+  ;; immediate failure when the other async worker holds the write lock.
+  (sqlite-execute db "PRAGMA journal_mode = WAL")
+  (sqlite-execute db "PRAGMA synchronous = NORMAL")
+  (sqlite-execute db "PRAGMA busy_timeout = 5000"))
+
+(defun json-log-viewer-async-worker--sqlite-lock-error-p (err)
+  "Return non-nil when ERR indicates sqlite lock contention."
+  (string-match-p
+   "\\(database is locked\\|database is busy\\|sqlite_busy\\|sqlite_locked\\)"
+   (downcase (error-message-string err))))
+
+(defun json-log-viewer-async-worker--sqlite-run-transaction (sqlite-file body-fn)
+  "Run BODY-FN inside a sqlite transaction for SQLITE-FILE with lock retries."
+  (let ((attempt 0)
+        result
+        done)
+    (while (not done)
+      (setq attempt (1+ attempt))
+      (let ((db (sqlite-open sqlite-file))
+            (committed nil))
+        (unwind-protect
+            (condition-case err
+                (progn
+                  (json-log-viewer-async-worker--sqlite-setup db)
+                  (sqlite-execute db "BEGIN IMMEDIATE")
+                  (setq result (funcall body-fn db))
+                  (sqlite-execute db "COMMIT")
+                  (setq committed t)
+                  (setq done t))
+              (error
+               (unless committed
+                 (ignore-errors (sqlite-execute db "ROLLBACK")))
+               (if (and (< attempt json-log-viewer-async-worker--sqlite-lock-retries)
+                        (json-log-viewer-async-worker--sqlite-lock-error-p err))
+                   (sleep-for (* 0.02 attempt))
+                 (signal (car err) (cdr err)))))
+          (ignore-errors (sqlite-close db)))))
+    result))
+
 (defun json-log-viewer-async-worker--sqlite-trim-raw-lines (db max-entries chunk-size)
   "Trim RAW_LINES table on DB to MAX-ENTRIES in CHUNK-SIZE batches."
   (when (and (integerp max-entries)
@@ -290,33 +335,26 @@
   (let ((sqlite-file (plist-get config :sqlite-file)))
     (unless sqlite-file
       (error "sqlite support is required for json-log-viewer worker"))
-    (let ((db (sqlite-open sqlite-file))
-          (ok nil))
-      (unwind-protect
-          (progn
-            (sqlite-execute db "BEGIN")
-            (when (eq op 'replace)
-              (sqlite-execute db "DELETE FROM raw_lines")
-              (sqlite-execute db "DELETE FROM entry_details"))
-            (dolist (line lines)
-              (sqlite-execute db
-                              "INSERT INTO raw_lines(line) VALUES (?)"
-                              (vector line)))
-            (dolist (detail details)
-              (sqlite-execute
-               db
-               "INSERT OR REPLACE INTO entry_details(signature, filter_text, fields_json) VALUES (?, ?, ?)"
-               detail))
-            (when (plist-get config :streaming)
-              (json-log-viewer-async-worker--sqlite-trim-raw-lines
-               db
-               (plist-get config :max-entries)
-               (plist-get config :chunk-size)))
-            (setq ok t)
-            (sqlite-execute db "COMMIT"))
-        (unless ok
-          (ignore-errors (sqlite-execute db "ROLLBACK")))
-        (ignore-errors (sqlite-close db))))))
+    (json-log-viewer-async-worker--sqlite-run-transaction
+     sqlite-file
+     (lambda (db)
+       (when (eq op 'replace)
+         (sqlite-execute db "DELETE FROM raw_lines")
+         (sqlite-execute db "DELETE FROM entry_details"))
+       (dolist (line lines)
+         (sqlite-execute db
+                         "INSERT INTO raw_lines(line) VALUES (?)"
+                         (vector line)))
+       (dolist (detail details)
+         (sqlite-execute
+          db
+          "INSERT OR REPLACE INTO entry_details(signature, filter_text, fields_json) VALUES (?, ?, ?)"
+          detail))
+       (when (plist-get config :streaming)
+         (json-log-viewer-async-worker--sqlite-trim-raw-lines
+          db
+          (plist-get config :max-entries)
+          (plist-get config :chunk-size)))))))
 
 (defun json-log-viewer-async-worker--config-from-job (job)
   "Extract reusable config plist from JOB."
@@ -340,36 +378,29 @@
          (signatures (or (plist-get job :signatures) nil)))
     (unless sqlite-file
       (error "Entry-details worker missing sqlite support"))
-    (let ((db (sqlite-open sqlite-file))
-          (ok nil)
-          (count 0))
-      (unwind-protect
-          (progn
-            (sqlite-execute db "BEGIN")
-            (pcase op
-              ('reset
-               (sqlite-execute db "DELETE FROM entry_details"))
-              ('upsert
-               (when signature
-                 (setq count 1)
-                 (sqlite-execute
-                  db
-                  "INSERT OR REPLACE INTO entry_details(signature, filter_text, fields_json) VALUES (?, ?, ?)"
-                  (vector signature filter-text fields-json))))
-              ('delete-many
-               (dolist (sig signatures)
-                 (when sig
-                   (setq count (1+ count))
-                   (sqlite-execute db
-                                   "DELETE FROM entry_details WHERE signature = ?"
-                                   (vector sig)))))
-              (_
-               (error "Unknown entry_details op: %S" op)))
-            (setq ok t)
-            (sqlite-execute db "COMMIT"))
-        (unless ok
-          (ignore-errors (sqlite-execute db "ROLLBACK")))
-        (ignore-errors (sqlite-close db)))
+    (let ((count 0))
+      (json-log-viewer-async-worker--sqlite-run-transaction
+       sqlite-file
+       (lambda (db)
+         (pcase op
+           ('reset
+            (sqlite-execute db "DELETE FROM entry_details"))
+           ('upsert
+            (when signature
+              (setq count 1)
+              (sqlite-execute
+               db
+               "INSERT OR REPLACE INTO entry_details(signature, filter_text, fields_json) VALUES (?, ?, ?)"
+               (vector signature filter-text fields-json))))
+           ('delete-many
+            (dolist (sig signatures)
+              (when sig
+                (setq count (1+ count))
+                (sqlite-execute db
+                                "DELETE FROM entry_details WHERE signature = ?"
+                                (vector sig)))))
+           (_
+            (error "Unknown entry_details op: %S" op)))))
       (list :op op :count count))))
 
 (defun json-log-viewer-async-worker-process-job (job)

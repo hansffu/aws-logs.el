@@ -138,6 +138,22 @@ When non-nil, tail output is piped through grep with this regex."
   :type 'integer
   :group 'aws-logs)
 
+(defcustom aws-logs-tail-ecs-normalize-batch-lines 300
+  "Maximum raw ECS lines normalized per idle batch.
+
+Lower values improve UI responsiveness under heavy throughput, while higher
+values maximize throughput."
+  :type 'integer
+  :group 'aws-logs)
+
+(defcustom aws-logs-tail-ecs-chunk-batch-size 16
+  "Maximum process output chunks consumed per idle batch in ECS follow mode.
+
+Lower values reduce single-run latency in the main thread, while higher values
+improve throughput when output arrives very quickly."
+  :type 'integer
+  :group 'aws-logs)
+
 (defcustom aws-logs-default-since aws-logs-since
   "Default time range used to initialize `aws-logs-time-range`."
   :type 'string

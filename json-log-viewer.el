@@ -297,6 +297,10 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
          (db (sqlite-open file)))
     (setq-local json-log-viewer--sqlite-file file)
     (setq-local json-log-viewer--sqlite-db db)
+    ;; Keep UI reads responsive while async worker connections write.
+    (sqlite-execute db "PRAGMA journal_mode = WAL")
+    (sqlite-execute db "PRAGMA synchronous = NORMAL")
+    (sqlite-execute db "PRAGMA busy_timeout = 5000")
     (sqlite-execute db "CREATE TABLE raw_lines (seq INTEGER PRIMARY KEY AUTOINCREMENT, line TEXT NOT NULL)")
     (sqlite-execute db "CREATE TABLE entry_details (signature TEXT PRIMARY KEY, filter_text TEXT NOT NULL, fields_json TEXT NOT NULL)")))
 
@@ -1467,10 +1471,19 @@ When result size allows it, updates are previewed live while typing."
              (drop (min json-log-viewer--entry-count
                         (json-log-viewer--stream-eviction-drop-count over)))
              (keep (- json-log-viewer--entry-count drop))
-             (kept (cl-subseq json-log-viewer--entry-overlays 0 keep))
-             (victims (nthcdr keep json-log-viewer--entry-overlays))
+             kept
+             victims
              (victim-folds nil)
              (victim-signatures nil))
+        ;; Avoid `cl-subseq` on long lists to prevent deep recursive list copying.
+        (let ((idx 0))
+          (dolist (entry-overlay json-log-viewer--entry-overlays)
+            (if (< idx keep)
+                (push entry-overlay kept)
+              (push entry-overlay victims))
+            (setq idx (1+ idx))))
+        (setq kept (nreverse kept))
+        (setq victims (nreverse victims))
         (setq json-log-viewer--entry-overlays kept)
         (setq json-log-viewer--entry-count keep)
         (dolist (entry-overlay victims)
@@ -1669,6 +1682,10 @@ Returns the created buffer."
          (normalized-direction (json-log-viewer--normalize-direction direction))
          (target (get-buffer-create buffer-name)))
     (with-current-buffer target
+      ;; Reinitializing an existing viewer buffer can lose old queue handles if
+      ;; mode setup resets locals first. Stop/close previous resources upfront.
+      (json-log-viewer--stop-async-queue)
+      (json-log-viewer--storage-close)
       (json-log-viewer-mode)
       (setq-local json-log-viewer--entry-fields-function #'json-log-viewer--json-entry-fields)
       (setq-local json-log-viewer--summary-function #'json-log-viewer--json-summary)
