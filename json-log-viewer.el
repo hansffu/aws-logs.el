@@ -428,6 +428,34 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
     (message "json-log-viewer entry_details worker error: %s"
              (or (cadr result) "unknown error"))))
 
+(defun json-log-viewer--make-main-queue-process-func ()
+  "Return a serialization-safe PROCESS-FUNC for main async queue."
+  (eval
+   '(lambda (job)
+      (let ((worker-file (plist-get job :worker-file)))
+        (unless (and (stringp worker-file)
+                     (file-readable-p worker-file))
+          (error "Async worker file is unreadable: %S" worker-file))
+        (unless (fboundp 'json-log-viewer-async-worker-process-job)
+          (load worker-file nil t)
+          (unless (fboundp 'json-log-viewer-async-worker-process-job)
+            (error "Missing worker entrypoint in %s" worker-file)))
+        (json-log-viewer-async-worker-process-job job)))))
+
+(defun json-log-viewer--make-entry-details-queue-process-func ()
+  "Return a serialization-safe PROCESS-FUNC for entry_details queue."
+  (eval
+   '(lambda (job)
+      (let ((worker-file (plist-get job :worker-file)))
+        (unless (and (stringp worker-file)
+                     (file-readable-p worker-file))
+          (error "Async worker file is unreadable: %S" worker-file))
+        (unless (fboundp 'json-log-viewer-async-worker-process-entry-details-job)
+          (load worker-file nil t)
+          (unless (fboundp 'json-log-viewer-async-worker-process-entry-details-job)
+            (error "Missing entry-details worker entrypoint in %s" worker-file)))
+        (json-log-viewer-async-worker-process-entry-details-job job)))))
+
 (defun json-log-viewer--stop-async-queue ()
   "Stop async queue for current buffer."
   (when json-log-viewer--async-queue
@@ -445,16 +473,7 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
   (let ((buffer (current-buffer)))
     (setq-local json-log-viewer--async-queue
                 (async-job-queue-create
-                 (lambda (job)
-                   (let ((worker-file (plist-get job :worker-file)))
-                     (unless (and (stringp worker-file)
-                                  (file-readable-p worker-file))
-                       (error "Async worker file is unreadable: %S" worker-file))
-                     (unless (fboundp 'json-log-viewer-async-worker-process-job)
-                       (load worker-file nil t)
-                       (unless (fboundp 'json-log-viewer-async-worker-process-job)
-                         (error "Missing worker entrypoint in %s" worker-file)))
-                     (json-log-viewer-async-worker-process-job job)))
+                 (json-log-viewer--make-main-queue-process-func)
                  (lambda (result)
                    (when (buffer-live-p buffer)
                      (with-current-buffer buffer
@@ -463,16 +482,7 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
                        (json-log-viewer--async-handle-result result))))))
     (setq-local json-log-viewer--entry-details-async-queue
                 (async-job-queue-create
-                 (lambda (job)
-                   (let ((worker-file (plist-get job :worker-file)))
-                     (unless (and (stringp worker-file)
-                                  (file-readable-p worker-file))
-                       (error "Async worker file is unreadable: %S" worker-file))
-                     (unless (fboundp 'json-log-viewer-async-worker-process-entry-details-job)
-                       (load worker-file nil t)
-                       (unless (fboundp 'json-log-viewer-async-worker-process-entry-details-job)
-                         (error "Missing entry-details worker entrypoint in %s" worker-file)))
-                     (json-log-viewer-async-worker-process-entry-details-job job)))
+                 (json-log-viewer--make-entry-details-queue-process-func)
                  (lambda (result)
                    (when (buffer-live-p buffer)
                      (with-current-buffer buffer
