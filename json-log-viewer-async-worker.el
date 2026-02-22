@@ -340,6 +340,49 @@
         :max-entries (plist-get job :max-entries)
         :chunk-size (max 1 (or (plist-get job :chunk-size) 1))))
 
+(defun json-log-viewer-async-worker-process-entry-details-job (job)
+  "Process one async entry_details JOB payload in subordinate Emacs."
+  (let* ((op (plist-get job :op))
+         (sqlite-file (plist-get job :sqlite-file))
+         (signature (plist-get job :signature))
+         (filter-text (or (plist-get job :filter-text) ""))
+         (fields-json (or (plist-get job :fields-json) "[]"))
+         (signatures (or (plist-get job :signatures) nil)))
+    (unless (and sqlite-file
+                 (fboundp 'sqlite-open))
+      (error "Entry-details worker missing sqlite support"))
+    (let ((db (sqlite-open sqlite-file))
+          (ok nil)
+          (count 0))
+      (unwind-protect
+          (progn
+            (sqlite-execute db "BEGIN")
+            (pcase op
+              ('reset
+               (sqlite-execute db "DELETE FROM entry_details"))
+              ('upsert
+               (when signature
+                 (setq count 1)
+                 (sqlite-execute
+                  db
+                  "INSERT OR REPLACE INTO entry_details(signature, filter_text, fields_json) VALUES (?, ?, ?)"
+                  (vector signature filter-text fields-json))))
+              ('delete-many
+               (dolist (sig signatures)
+                 (when sig
+                   (setq count (1+ count))
+                   (sqlite-execute db
+                                   "DELETE FROM entry_details WHERE signature = ?"
+                                   (vector sig)))))
+              (_
+               (error "Unknown entry_details op: %S" op)))
+            (setq ok t)
+            (sqlite-execute db "COMMIT"))
+        (unless ok
+          (ignore-errors (sqlite-execute db "ROLLBACK")))
+        (ignore-errors (sqlite-close db)))
+      (list :op op :count count))))
+
 (defun json-log-viewer-async-worker-process-job (job)
   "Process one async JOB payload in subordinate Emacs.
 
