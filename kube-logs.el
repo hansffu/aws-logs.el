@@ -238,11 +238,14 @@ Signals `user-error' on failure."
   (append
    (kube-logs--context-args)
    (list "logs" (kube-logs--target-ref))
+   (when (equal kube-logs-target-kind "deployment")
+     (list "--all-pods"))
    (when kube-logs-namespace-enabled
      (progn
        (when (or (null kube-logs-namespace) (string-empty-p kube-logs-namespace))
          (user-error "Set a namespace first or disable namespace override with -n"))
        (list "--namespace" kube-logs-namespace)))
+   (list "--prefix")
    (list "--timestamps")
    (when kube-logs-follow
      (list "--follow"))
@@ -250,6 +253,17 @@ Signals `user-error' on failure."
      (list (format "--tail=%s" kube-logs-tail-lines)))
    (when (and kube-logs-since (not (string-empty-p kube-logs-since)))
      (list (format "--since=%s" kube-logs-since)))))
+
+(defun kube-logs--strip-kubectl-prefix (line)
+  "Drop kubectl --prefix fields from LINE by finding the first timestamp token."
+  (let* ((tokens (split-string line "[[:space:]]+" t))
+         (rest tokens))
+    (while (and rest
+                (not (ignore-errors (date-to-time (car rest)))))
+      (setq rest (cdr rest)))
+    (if (and rest (not (eq rest tokens)))
+        (string-join rest " ")
+      line)))
 
 (defun kube-logs--target-description ()
   "Return one-line target description for transient."
@@ -419,7 +433,8 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
   "Convert one kubectl log LINE into one JSON line for json-log-viewer."
   (let* ((clean (string-trim-right (or line "") "\r")))
     (unless (string-empty-p clean)
-      (let* ((split (kube-logs--split-timestamp-prefix clean))
+      (let* ((without-prefix (kube-logs--strip-kubectl-prefix clean))
+             (split (kube-logs--split-timestamp-prefix without-prefix))
              (timestamp (car split))
              (message (or (cdr split) ""))
              (parsed (kube-logs--parse-json-maybe message))
@@ -439,7 +454,7 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
         (puthash "message" (or display-message "") obj)
         (when level
           (puthash "level" level obj))
-        (puthash "raw" clean obj)
+        (puthash "raw" without-prefix obj)
         (puthash "namespace" (or kube-logs--viewer-namespace kube-logs-namespace "") obj)
         (puthash "target" (or kube-logs--viewer-target kube-logs-target "") obj)
         (puthash "kind" (or kube-logs--viewer-target-kind kube-logs-target-kind "") obj)

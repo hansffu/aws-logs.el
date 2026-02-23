@@ -39,7 +39,9 @@
     (should (equal (kube-logs--logs-args)
                    '("--context=prod-cluster"
                      "logs" "deployment/payments-api"
+                     "--all-pods"
                      "--namespace" "payments"
+                     "--prefix"
                      "--timestamps"
                      "--follow"
                      "--tail=150"
@@ -57,6 +59,8 @@
     (should (equal (kube-logs--logs-args)
                    '("--context=prod-cluster"
                      "logs" "deployment/payments-api"
+                     "--all-pods"
+                     "--prefix"
                      "--timestamps")))))
 
 (ert-deftest kube-logs-line->json-line-json-message-test ()
@@ -72,6 +76,20 @@
       (should (equal (alist-get 'message parsed) "boom"))
       (should (equal (alist-get 'namespace parsed) "payments"))
       (should (equal (alist-get 'target parsed) "payments-api")))))
+
+(ert-deftest kube-logs-line->json-line-strips-kubectl-prefix-test ()
+  (with-temp-buffer
+    (setq-local kube-logs--viewer-namespace "payments")
+    (setq-local kube-logs--viewer-target-kind "deployment")
+    (setq-local kube-logs--viewer-target "payments-api")
+    (let* ((line "payments-api-7bbf4c app 2026-01-01T12:00:00Z {\"level\":\"info\",\"message\":\"ok\"}")
+           (json-line (kube-logs--line->json-line line))
+           (parsed (json-parse-string json-line :object-type 'alist)))
+      (should (equal (alist-get 'timestamp parsed) "2026-01-01T12:00:00Z"))
+      (should (equal (alist-get 'level parsed) "info"))
+      (should (equal (alist-get 'message parsed) "ok"))
+      (should (equal (alist-get 'raw parsed)
+                     "2026-01-01T12:00:00Z {\"level\":\"info\",\"message\":\"ok\"}")))))
 
 (ert-deftest kube-logs-line->json-line-plain-test ()
   (with-temp-buffer
