@@ -590,6 +590,54 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback has applied."
              (string-match-p "\\`[[:space:]\n\r\t]*[{\\[]" value))
     (json-log-viewer--json-parse-line value)))
 
+(defun json-log-viewer--normalize-json-value-for-serialize (value)
+  "Normalize VALUE into a shape `json-serialize' can encode reliably."
+  (cond
+   ((hash-table-p value)
+    (let ((normalized (make-hash-table :test 'equal)))
+      (maphash
+       (lambda (key child)
+         (when-let ((name (json-log-viewer--value->string key)))
+           (puthash name
+                    (json-log-viewer--normalize-json-value-for-serialize child)
+                    normalized)))
+       value)
+      normalized))
+   ((json-log-viewer--alist-like-p value)
+    (let ((normalized (make-hash-table :test 'equal)))
+      (dolist (pair value)
+        (when (consp pair)
+          (when-let ((name (json-log-viewer--value->string (car pair))))
+            (puthash name
+                     (json-log-viewer--normalize-json-value-for-serialize (cdr pair))
+                     normalized))))
+      normalized))
+   ((vectorp value)
+    (vconcat
+     (mapcar #'json-log-viewer--normalize-json-value-for-serialize
+             (append value nil))))
+   ((listp value)
+    (vconcat
+     (mapcar #'json-log-viewer--normalize-json-value-for-serialize value)))
+   (t value)))
+
+(defun json-log-viewer--value->summary-string (value)
+  "Convert resolved path VALUE into one-line summary text."
+  (cond
+   ((or (hash-table-p value)
+        (vectorp value)
+        (json-log-viewer--alist-like-p value)
+        (and (listp value) (not (null value))))
+    (let ((json (condition-case nil
+                    (json-serialize
+                     (json-log-viewer--normalize-json-value-for-serialize value)
+                     :null-object nil
+                     :false-object :false)
+                  (error nil))))
+      (or json (json-log-viewer--value->string value))))
+   (t
+    (json-log-viewer--value->string value))))
+
 (defun json-log-viewer--array-index (key)
   "Return integer array index from string KEY, or nil."
   (when (and (stringp key)
@@ -631,7 +679,7 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback has applied."
   (when (and parsed
              (stringp path)
              (not (string-empty-p path)))
-    (json-log-viewer--value->string
+    (json-log-viewer--value->summary-string
      (json-log-viewer--json-get-path parsed path))))
 
 (defun json-log-viewer--normalize-path-list (paths source)
@@ -677,12 +725,13 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback has applied."
 
 (defun json-log-viewer--json-value->pretty-string (value)
   "Render VALUE as pretty, syntax-highlighted JSON text."
-  (let* ((normalized (or (json-log-viewer--json-parse-maybe value) value))
+  (let* ((parsed (or (json-log-viewer--json-parse-maybe value) value))
+         (normalized (json-log-viewer--normalize-json-value-for-serialize parsed))
          (json (condition-case nil
                    (json-serialize normalized :null-object nil :false-object :false)
                  (error nil))))
     (if (not json)
-        (or (json-log-viewer--value->string normalized) "")
+        (or (json-log-viewer--value->string parsed) "")
       (let ((pretty (condition-case nil
                         (with-temp-buffer
                           (insert json)

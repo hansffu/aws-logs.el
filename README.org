@@ -350,6 +350,8 @@ rendered in ~json-log-viewer~.
 - Look up messages in a FROM/TO time span.
 - Optional regex filtering with ~grep~.
 - Optional payload decoding mode for JSON message bodies.
+- Configurable summary message JSON path (including nested paths).
+- Configurable summary extra JSON paths.
 - Optional JSON-path detail rendering (for example ~payload~ as pretty JSON block).
 - SQLite-backed hidden-data storage to reduce in-memory growth.
 
@@ -372,6 +374,8 @@ Put ~kafka-logs.el~ and ~json-log-viewer.el~ on your ~load-path~.
   (kafka-logs-default-connection "prod")
   (kafka-logs-default-topic "orders.events")
   (kafka-logs-default-stream t)
+  (kafka-logs-default-message-path "payload.data.name")
+  (kafka-logs-default-extra-paths '("connection" "topic" "partition"))
   (kafka-logs-default-payload-format 'json)
   (kafka-logs-default-json-paths '("payload"))
   :config
@@ -409,7 +413,11 @@ Main transient keys:
 - ~a~ set FROM time (time-span mode)
 - ~z~ set TO time (time-span mode)
 - ~-F~ set regex filter
+- ~-M~ set summary message path (for example ~payload~, ~payload.data.name~)
 - ~-j~ set json detail paths (comma-separated, e.g. ~payload,payload.log~)
 - ~-p~ toggle payload format (string/json)
 - ~-m~ set max message count for time-span mode
 - ~RET~ run logs
+
+When the selected message path resolves to a JSON object or array, it is
+rendered as compact one-line JSON in the summary line.

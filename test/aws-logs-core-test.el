@@ -109,6 +109,26 @@
     (should (= 10 (plist-get (car entries) :id)))
     (should (= 11 (plist-get (cadr entries) :id)))))
 
+(ert-deftest json-log-viewer-resolve-path-renders-json-on-one-line-test ()
+  (let* ((parsed (json-parse-string
+                  "{\"payload\":{\"data\":{\"name\":\"alice\"},\"events\":[{\"id\":1},{\"id\":2}]}}"
+                  :object-type 'alist
+                  :array-type 'list))
+         (payload (json-log-viewer--resolve-path parsed "payload"))
+         (data (json-log-viewer--resolve-path parsed "payload.data"))
+         (events (json-log-viewer--resolve-path parsed "payload.events"))
+         (name (json-log-viewer--resolve-path parsed "payload.data.name")))
+    (should (string-match-p "\\`{.*}\\'" payload))
+    (should (string-match-p "\"name\":\"alice\"" payload))
+    (should-not (string-match-p "\n" payload))
+    (should (string-match-p "\\`{.*}\\'" data))
+    (should (string-match-p "\"name\":\"alice\"" data))
+    (should-not (string-match-p "\n" data))
+    (should (string-match-p "\\`\\[.*\\]\\'" events))
+    (should (string-match-p "\"id\":1" events))
+    (should-not (string-match-p "\n" events))
+    (should (equal name "alice"))))
+
 (ert-deftest json-log-viewer-parse-time-preserves-subsecond-order-test ()
   (let ((t1 (json-log-viewer--parse-time "2026-01-01T00:00:00.123Z"))
         (t2 (json-log-viewer--parse-time "2026-01-01T00:00:00.124Z")))
@@ -126,6 +146,12 @@
     (let ((value (json-log-viewer--json-value->pretty-string
                   '((service . "orders") (log . ((level . "ERROR")))))))
       (should (string-match-p "\"service\": \"orders\"" value))
+      (should (get-text-property 0 'json-log-viewer-json-block value)))
+    (let ((value (json-log-viewer--json-value->pretty-string
+                  '(((externalTransactionId . "c12345d6789")
+                     (loyaltyAccountId . 1))))))
+      (should (string-match-p "\"externalTransactionId\": \"c12345d6789\"" value))
+      (should (string-match-p "\"loyaltyAccountId\": 1" value))
       (should (get-text-property 0 'json-log-viewer-json-block value)))))
 
 (ert-deftest json-log-viewer-sqlite-storage-offloads-hidden-data-test ()
@@ -199,6 +225,29 @@
            buf
            '("{\"timestamp\":\"2026-01-01T00:00:02Z\",\"msg\":\"c\"}"))
           (should (= (point) (point-max))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest json-log-viewer-stream-message-path-object-renders-json-test ()
+  (let* ((buf (json-log-viewer-make-buffer
+               "*json-log-viewer-stream-message-path-test*"
+               :log-lines nil
+               :timestamp-path "timestamp"
+               :level-path "level"
+               :message-path "payload.data"
+               :streaming t)))
+    (unwind-protect
+        (with-current-buffer buf
+          (json-log-viewer-push
+           buf
+           '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"payload\":{\"data\":{\"name\":\"alice\",\"roles\":[\"admin\"]}}}"))
+          (goto-char (point-min))
+          (let ((summary (buffer-substring-no-properties
+                          (line-beginning-position)
+                          (line-end-position))))
+            (should (string-match-p "\"name\":\"alice\"" summary))
+            (should (string-match-p "\"roles\":\\[\"admin\"\\]" summary))
+            (should-not (string-match-p "\n" summary))))
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
@@ -364,6 +413,26 @@
             (should (string-match-p "\"level\": \"ERROR\"" text))
             (should-not (string-match-p "payload\\.log\\.level:" text))
             (should (string-match-p "payload\\.service: orders" text))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest json-log-viewer-json-path-renders-array-block-test ()
+  (let* ((buf (json-log-viewer-make-buffer
+               "*json-log-viewer-json-path-array-test*"
+               :log-lines
+               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"hello\",\"payload\":[{\"externalTransactionId\":\"c12345d6789\",\"loyaltyAccountId\":1}]}")
+               :timestamp-path "timestamp"
+               :message-path "msg"
+               :json-paths '("payload")
+               :streaming nil)))
+    (unwind-protect
+        (with-current-buffer buf
+          (goto-char (point-min))
+          (json-log-viewer-toggle-entry)
+          (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+            (should (string-match-p "payload:\n\\[" text))
+            (should (string-match-p "\"externalTransactionId\": \"c12345d6789\"" text))
+            (should (string-match-p "\"loyaltyAccountId\": 1" text))))
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 

@@ -104,6 +104,24 @@ Values are dot-separated paths understood by json-log-viewer, for example
   :type '(repeat string)
   :group 'kafka-logs)
 
+(defcustom kafka-logs-default-extra-paths
+  '("topic" "partition")
+  "Default JSON paths rendered as summary extra segments."
+  :type '(repeat string)
+  :group 'kafka-logs)
+
+(defcustom kafka-logs-default-message-path "message"
+  "Default JSON path used for summary message rendering.
+
+Examples:
+- `message`
+- `payload`
+- `payload.data.name`
+
+When the resolved value is a JSON object/array, it is rendered on one line."
+  :type 'string
+  :group 'kafka-logs)
+
 (defcustom kafka-logs-stream-drain-interval 0.05
   "Seconds between stream queue drain ticks.
 
@@ -144,6 +162,12 @@ Value is nil or (FROM . TO), where both are date-time strings.")
 
 (defvar kafka-logs-json-paths (append kafka-logs-default-json-paths nil)
   "JSON detail paths rendered as formatted blocks in this Emacs session.")
+
+(defvar kafka-logs-extra-paths (append kafka-logs-default-extra-paths nil)
+  "JSON paths rendered as summary extra segments in this Emacs session.")
+
+(defvar kafka-logs-message-path kafka-logs-default-message-path
+  "JSON path used for summary message rendering in this Emacs session.")
 
 (defvar kafka-logs-connections nil
   "Alist of named Kafka connections.
@@ -192,6 +216,9 @@ Each element has the form (NAME . PLIST).")
 (defvar-local kafka-logs--viewer-json-paths nil
   "JSON detail paths shown in current viewer buffer header.")
 
+(defvar-local kafka-logs--viewer-message-path nil
+  "Message path shown in current viewer buffer header.")
+
 (defconst kafka-logs--connection-keys
   '(:brokers :security-protocol :sasl-mechanisms :username :password
     :auth-source :properties :kcat-args :description)
@@ -219,6 +246,23 @@ SOURCE is an optional user-facing origin label."
           (puthash trimmed t seen)
           (push trimmed normalized))))
     (nreverse normalized)))
+
+(defun kafka-logs--normalize-message-path (path &optional source)
+  "Validate and normalize message PATH from SOURCE."
+  (unless (stringp path)
+    (user-error "%s must be a string, got: %S"
+                (or source "Message path")
+                path))
+  (let ((trimmed (string-trim path)))
+    (when (string-empty-p trimmed)
+      (user-error "%s cannot be empty" (or source "Message path")))
+    trimmed))
+
+(defun kafka-logs--normalize-extra-paths (paths &optional source)
+  "Validate and normalize summary extra PATHS from SOURCE."
+  (kafka-logs--normalize-json-paths
+   paths
+   (or source "Extra paths")))
 
 (defun kafka-logs--json-paths-display (paths)
   "Return one-line display label for JSON PATHS."
@@ -428,6 +472,46 @@ Signals `user-error` on failure."
                            :null-object nil :false-object :false)
       (error nil))))
 
+(defun kafka-logs--alist-like-p (value)
+  "Return non-nil when VALUE is an alist-like JSON object."
+  (and (listp value)
+       (or (null value)
+           (let ((first (car value)))
+             (and (consp first)
+                  (or (stringp (car first))
+                      (symbolp (car first))))))))
+
+(defun kafka-logs--normalize-json-value (value)
+  "Normalize VALUE into a shape `json-serialize' handles reliably."
+  (cond
+   ((hash-table-p value)
+    (let ((normalized (make-hash-table :test 'equal)))
+      (maphash
+       (lambda (key child)
+         (when-let ((name (kafka-logs--value->string key)))
+           (puthash name
+                    (kafka-logs--normalize-json-value child)
+                    normalized)))
+       value)
+      normalized))
+   ((kafka-logs--alist-like-p value)
+    (let ((normalized (make-hash-table :test 'equal)))
+      (dolist (pair value)
+        (when (consp pair)
+          (when-let ((name (kafka-logs--value->string (car pair))))
+            (puthash name
+                     (kafka-logs--normalize-json-value (cdr pair))
+                     normalized))))
+      normalized))
+   ((vectorp value)
+    (vconcat
+     (mapcar #'kafka-logs--normalize-json-value
+             (append value nil))))
+   ((listp value)
+    (vconcat
+     (mapcar #'kafka-logs--normalize-json-value value)))
+   (t value)))
+
 (defun kafka-logs--list-topics ()
   "Return available topic names for current connection."
   (let* ((args (append (kafka-logs--connection-base-args) '("-L" "-J" "-q")))
@@ -540,6 +624,7 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
    (cons "Payload format" (if (eq kafka-logs--viewer-payload-format 'json)
                               "json"
                             "string"))
+   (cons "Message path" (or kafka-logs--viewer-message-path "message"))
    (cons "JSON paths" (kafka-logs--json-paths-display kafka-logs--viewer-json-paths))))
 
 (defun kafka-logs--install-viewer-keymap ()
@@ -656,7 +741,7 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
           (puthash "key" key obj))
         (when display-payload
           (puthash "payload" display-payload obj))
-        (json-serialize obj)))))
+        (json-serialize (kafka-logs--normalize-json-value obj))))))
 
 (defun kafka-logs--lines->json-lines (lines)
   "Convert kcat output LINES to json-log-viewer JSON lines."
@@ -668,6 +753,14 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
 When STREAMING is non-nil, configure buffer for incremental pushes."
   (let* ((buffer-name (kafka-logs--viewer-buffer-name))
          (existing (get-buffer buffer-name))
+         (extra-paths
+          (kafka-logs--normalize-extra-paths
+           kafka-logs-extra-paths
+           "kafka-logs-extra-paths"))
+         (message-path
+          (kafka-logs--normalize-message-path
+           kafka-logs-message-path
+           "kafka-logs-message-path"))
          buffer)
     (when existing
       (kafka-logs--kill-buffer-process existing))
@@ -676,9 +769,8 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
            buffer-name
            :log-lines (or initial-lines nil)
            :timestamp-path "timestamp"
-           :level-path "level"
-           :message-path "message"
-           :extra-paths '("connection" "topic" "partition" "offset" "key")
+           :message-path message-path
+           :extra-paths extra-paths
            :json-paths kafka-logs-json-paths
            :streaming streaming
            :direction 'oldest-first
@@ -697,6 +789,7 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
       (setq-local kafka-logs--viewer-time-range kafka-logs-time-range)
       (setq-local kafka-logs--viewer-filter kafka-logs-filter)
       (setq-local kafka-logs--viewer-payload-format kafka-logs-payload-format)
+      (setq-local kafka-logs--viewer-message-path message-path)
       (setq-local kafka-logs--viewer-json-paths kafka-logs-json-paths)
       (add-hook 'kill-buffer-hook
                 (lambda ()
@@ -1066,6 +1159,25 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
              "JSON paths")))
     (kafka-logs--transient-reprompt)))
 
+(transient-define-suffix kafka-logs-set-message-path ()
+  "Set JSON path used for summary message rendering."
+  :description (lambda ()
+                 (format "Message path: %s"
+                         (or kafka-logs-message-path "message")))
+  :transient t
+  (interactive)
+  (let* ((initial (or kafka-logs-message-path kafka-logs-default-message-path "message"))
+         (input (string-trim (read-string
+                              "Message path (empty=default): "
+                              initial))))
+    (setq kafka-logs-message-path
+          (kafka-logs--normalize-message-path
+           (if (string-empty-p input)
+               (or kafka-logs-default-message-path "message")
+             input)
+           "Message path"))
+    (kafka-logs--transient-reprompt)))
+
 (transient-define-suffix kafka-logs-toggle-payload-format ()
   "Toggle payload rendering format."
   :description (lambda ()
@@ -1093,6 +1205,7 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
     ("t" kafka-logs-select-topic)
     ("-f" kafka-logs-toggle-stream)
     ("-F" kafka-logs-set-filter)
+    ("-M" kafka-logs-set-message-path)
     ("-j" kafka-logs-set-json-paths)
     ("-p" kafka-logs-toggle-payload-format)
     ("-m" kafka-logs-set-max-messages)]

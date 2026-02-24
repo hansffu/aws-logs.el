@@ -360,9 +360,9 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
            buffer-name
            :log-lines (or initial-lines nil)
            :timestamp-path "timestamp"
-           :level-path "level"
+           :level-path "payload.log.level"
            :message-path "message"
-           :extra-paths '("namespace" "target" "kind")
+           :extra-paths '("target")
            :streaming streaming
            :direction 'oldest-first
            :header-lines-function #'kube-logs--viewer-header-lines))

@@ -13,6 +13,8 @@
 (defvar kafka-logs-filter)
 (defvar kafka-logs-max-messages)
 (defvar kafka-logs-json-paths)
+(defvar kafka-logs-extra-paths)
+(defvar kafka-logs-message-path)
 (defvar kafka-logs-stream-max-lines-per-batch)
 (defvar kafka-logs-connections)
 
@@ -101,6 +103,23 @@
       (should (equal (alist-get 'timestamp parsed)
                      (kafka-logs--epoch-ms->iso8601 1700000000123))))))
 
+(ert-deftest kafka-logs-line->json-line-array-payload-test ()
+  (with-temp-buffer
+    (setq-local kafka-logs--viewer-connection "prod")
+    (let* ((line
+            (concat
+             "{\"topic\":\"orders\",\"partition\":2,\"offset\":9,"
+             "\"payload\":[{\"externalTransactionId\":\"c12345d6789\","
+             "\"loyaltyAccountId\":1}]}"))
+           (json-line (kafka-logs--line->json-line line))
+           (parsed (json-parse-string json-line :object-type 'alist :array-type 'list))
+           (payload (alist-get 'payload parsed))
+           (first (car payload)))
+      (should (equal (alist-get 'topic parsed) "orders"))
+      (should (listp payload))
+      (should (equal (alist-get 'externalTransactionId first) "c12345d6789"))
+      (should (equal (alist-get 'loyaltyAccountId first) 1)))))
+
 (ert-deftest kafka-logs-list-topics-parses-metadata-json-test ()
   (let ((kafka-logs-connection "dev")
         (kafka-logs-connections '(("dev" . (:brokers "localhost:9092")))))
@@ -129,6 +148,21 @@
   (should-error (kafka-logs--normalize-json-paths "payload")
                 :type 'user-error))
 
+(ert-deftest kafka-logs-normalize-message-path-test ()
+  (should (equal (kafka-logs--normalize-message-path " payload.data.name ")
+                 "payload.data.name"))
+  (should-error (kafka-logs--normalize-message-path "")
+                :type 'user-error)
+  (should-error (kafka-logs--normalize-message-path nil)
+                :type 'user-error))
+
+(ert-deftest kafka-logs-normalize-extra-paths-test ()
+  (should (equal (kafka-logs--normalize-extra-paths
+                  '(" topic " "payload.service" "topic"))
+                 '("topic" "payload.service")))
+  (should-error (kafka-logs--normalize-extra-paths "topic")
+                :type 'user-error))
+
 (ert-deftest kafka-logs-make-viewer-buffer-passes-json-paths-test ()
   (let ((kafka-logs-connection "prod")
         (kafka-logs-topic "orders")
@@ -137,6 +171,8 @@
         (kafka-logs-filter nil)
         (kafka-logs-payload-format nil)
         (kafka-logs-json-paths '("payload" "payload.log"))
+        (kafka-logs-extra-paths '("topic" "payload.service"))
+        (kafka-logs-message-path "payload.data.name")
         captured-args
         viewer-buffer)
     (cl-letf (((symbol-function 'json-log-viewer-make-buffer)
@@ -149,9 +185,15 @@
       (unwind-protect
           (let ((buffer (kafka-logs--make-viewer-buffer nil nil)))
             (should (eq buffer viewer-buffer))
+            (should (equal (plist-get captured-args :message-path)
+                           "payload.data.name"))
+            (should (equal (plist-get captured-args :extra-paths)
+                           '("topic" "payload.service")))
             (should (equal (plist-get captured-args :json-paths)
                            '("payload" "payload.log")))
             (with-current-buffer buffer
+              (should (equal kafka-logs--viewer-message-path
+                             "payload.data.name"))
               (should (equal kafka-logs--viewer-json-paths
                              '("payload" "payload.log")))))
         (when (buffer-live-p viewer-buffer)

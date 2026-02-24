@@ -39,6 +39,54 @@
              (string-match-p "\\`[[:space:]\n\r\t]*[{\\[]" value))
     (json-log-viewer-async-worker--parse-line value)))
 
+(defun json-log-viewer-async-worker--normalize-json-value-for-serialize (value)
+  "Normalize VALUE into a shape `json-serialize' can encode reliably."
+  (cond
+   ((hash-table-p value)
+    (let ((normalized (make-hash-table :test 'equal)))
+      (maphash
+       (lambda (key child)
+         (when-let ((name (json-log-viewer-async-worker--value->string key)))
+           (puthash name
+                    (json-log-viewer-async-worker--normalize-json-value-for-serialize child)
+                    normalized)))
+       value)
+      normalized))
+   ((json-log-viewer-async-worker--alist-like-p value)
+    (let ((normalized (make-hash-table :test 'equal)))
+      (dolist (pair value)
+        (when (consp pair)
+          (when-let ((name (json-log-viewer-async-worker--value->string (car pair))))
+            (puthash name
+                     (json-log-viewer-async-worker--normalize-json-value-for-serialize (cdr pair))
+                     normalized))))
+      normalized))
+   ((vectorp value)
+    (vconcat
+     (mapcar #'json-log-viewer-async-worker--normalize-json-value-for-serialize
+             (append value nil))))
+   ((listp value)
+    (vconcat
+     (mapcar #'json-log-viewer-async-worker--normalize-json-value-for-serialize value)))
+   (t value)))
+
+(defun json-log-viewer-async-worker--value->summary-string (value)
+  "Convert resolved path VALUE into one-line summary text."
+  (cond
+   ((or (hash-table-p value)
+        (vectorp value)
+        (json-log-viewer-async-worker--alist-like-p value)
+        (and (listp value) (not (null value))))
+    (let ((json (condition-case nil
+                    (json-serialize
+                     (json-log-viewer-async-worker--normalize-json-value-for-serialize value)
+                     :null-object nil
+                     :false-object :false)
+                  (error nil))))
+      (or json (json-log-viewer-async-worker--value->string value))))
+   (t
+    (json-log-viewer-async-worker--value->string value))))
+
 (defun json-log-viewer-async-worker--array-index (key)
   "Return numeric array index for KEY string, or nil."
   (when (and (stringp key)
@@ -89,7 +137,7 @@
   (when (and parsed
              (stringp path)
              (not (string-empty-p path)))
-    (json-log-viewer-async-worker--value->string
+    (json-log-viewer-async-worker--value->summary-string
      (json-log-viewer-async-worker--get-path parsed path))))
 
 (defun json-log-viewer-async-worker--parse-time (value)
@@ -111,12 +159,13 @@
 
 (defun json-log-viewer-async-worker--json-value->pretty-string (value)
   "Render VALUE as pretty JSON text when possible."
-  (let* ((normalized (or (json-log-viewer-async-worker--parse-maybe value) value))
+  (let* ((parsed (or (json-log-viewer-async-worker--parse-maybe value) value))
+         (normalized (json-log-viewer-async-worker--normalize-json-value-for-serialize parsed))
          (json (condition-case nil
                    (json-serialize normalized :null-object nil :false-object :false)
                  (error nil))))
     (if (not json)
-        (or (json-log-viewer-async-worker--value->string normalized) "")
+        (or (json-log-viewer-async-worker--value->string parsed) "")
       (condition-case nil
           (with-temp-buffer
             (insert json)
