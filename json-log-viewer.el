@@ -644,6 +644,33 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback has applied."
              (string-match-p "\\`[0-9]+\\'" key))
     (string-to-number key)))
 
+(defun json-log-viewer--split-path (path)
+  "Split PATH into segments, allowing escaped dots.
+
+Use `\\.' to represent a literal dot within a key segment."
+  (let ((idx 0)
+        (len (length path))
+        (current "")
+        parts)
+    (while (< idx len)
+      (let ((ch (aref path idx)))
+        (cond
+         ((= ch ?\\)
+          (setq idx (1+ idx))
+          (setq current
+                (concat current
+                        (if (< idx len)
+                            (string (aref path idx))
+                          "\\"))))
+         ((= ch ?.)
+          (push current parts)
+          (setq current ""))
+         (t
+          (setq current (concat current (string ch))))))
+      (setq idx (1+ idx)))
+    (push current parts)
+    (nreverse parts)))
+
 (defun json-log-viewer--json-get-child (node key)
   "Return child value KEY from NODE."
   (cond
@@ -660,8 +687,10 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback has applied."
    (t nil)))
 
 (defun json-log-viewer--json-get-path (node path)
-  "Return value at dot-separated PATH in NODE."
-  (let ((parts (split-string path "\\."))
+  "Return value at dot-separated PATH in NODE.
+
+Use `\\.' in PATH for literal dots in JSON keys."
+  (let ((parts (json-log-viewer--split-path path))
         (current node)
         (failed nil))
     (while (and parts (not failed))

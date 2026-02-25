@@ -360,9 +360,9 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
            buffer-name
            :log-lines (or initial-lines nil)
            :timestamp-path "timestamp"
-           :level-path "payload.log.level"
-           :message-path "message"
-           :extra-paths '("target")
+           :level-path "payload.log\\.level"
+           :message-path "payload.message"
+           :extra-paths '("payload.service\\.name" "payload.log\\.logger")
            :streaming streaming
            :direction 'oldest-first
            :header-lines-function #'kube-logs--viewer-header-lines))
@@ -391,33 +391,6 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
                            :null-object nil :false-object :false)
       (error nil))))
 
-(defun kube-logs--value->string (value)
-  "Convert VALUE into a display string."
-  (cond
-   ((stringp value) value)
-   ((numberp value) (number-to-string value))
-   ((eq value t) "true")
-   ((eq value :false) "false")
-   ((null value) nil)
-   (t (format "%s" value))))
-
-(defun kube-logs--alist-get-any (node key)
-  "Return KEY from alist-like NODE using string/symbol lookup."
-  (when (listp node)
-    (or (alist-get key node nil nil #'equal)
-        (when-let ((sym (intern-soft key)))
-          (alist-get sym node)))))
-
-(defun kube-logs--extract-first-field (node candidates)
-  "Extract first non-empty field from NODE matching CANDIDATES."
-  (catch 'found
-    (dolist (candidate candidates)
-      (when-let ((value (kube-logs--value->string
-                         (kube-logs--alist-get-any node candidate))))
-        (unless (string-empty-p value)
-          (throw 'found value))))
-    nil))
-
 (defun kube-logs--split-timestamp-prefix (line)
   "Split LINE into (TIMESTAMP . MESSAGE) when timestamp prefix exists."
   (if (and (stringp line)
@@ -438,28 +411,14 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
              (timestamp (car split))
              (message (or (cdr split) ""))
              (parsed (kube-logs--parse-json-maybe message))
-             (level (and parsed
-                         (kube-logs--extract-first-field
-                          parsed
-                          '("level" "severity" "logLevel" "lvl"))))
-             (display-message
-              (or (and parsed
-                       (kube-logs--extract-first-field
-                        parsed
-                        '("message" "msg" "log" "@message")))
-                  message))
              (obj (make-hash-table :test 'equal)))
         (when timestamp
           (puthash "timestamp" timestamp obj))
-        (puthash "message" (or display-message "") obj)
-        (when level
-          (puthash "level" level obj))
         (puthash "raw" without-prefix obj)
         (puthash "namespace" (or kube-logs--viewer-namespace kube-logs-namespace "") obj)
         (puthash "target" (or kube-logs--viewer-target kube-logs-target "") obj)
         (puthash "kind" (or kube-logs--viewer-target-kind kube-logs-target-kind "") obj)
-        (when parsed
-          (puthash "payload" parsed obj))
+        (puthash "payload" (or parsed message) obj)
         (json-serialize obj)))))
 
 (defun kube-logs--lines->json-lines (lines)

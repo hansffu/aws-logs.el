@@ -4,6 +4,7 @@
 (require 'cl-lib)
 
 (require 'json-log-viewer)
+(require 'json-log-viewer-async-worker)
 (require 'aws-logs-insights)
 (require 'aws-logs-tail)
 
@@ -128,6 +129,34 @@
     (should (string-match-p "\"id\":1" events))
     (should-not (string-match-p "\n" events))
     (should (equal name "alice"))))
+
+(ert-deftest json-log-viewer-resolve-path-supports-escaped-dot-keys-test ()
+  (let* ((parsed (json-parse-string
+                  "{\"payload\":{\"@timestamp\":\"2026-02-25T16:14:14.455Z\",\"log.level\":\"INFO\",\"service.name\":\"my-service\",\"log.logger\":\"com.example.MyClass\",\"log\":{\"origin\":{\"file\":{\"name\":\"MyClass.kt\"}}}}}"
+                  :object-type 'alist
+                  :array-type 'list))
+         (level (json-log-viewer--resolve-path parsed "payload.log\\.level"))
+         (service (json-log-viewer--resolve-path parsed "payload.service\\.name"))
+         (logger (json-log-viewer--resolve-path parsed "payload.log\\.logger"))
+         (origin-file (json-log-viewer--resolve-path parsed "payload.log.origin.file.name")))
+    (should (equal level "INFO"))
+    (should (equal service "my-service"))
+    (should (equal logger "com.example.MyClass"))
+    (should (equal origin-file "MyClass.kt"))))
+
+(ert-deftest json-log-viewer-async-worker-resolves-escaped-dot-keys-test ()
+  (let* ((line "{\"timestamp\":\"2026-02-25T16:14:14.455Z\",\"payload\":{\"log.level\":\"INFO\",\"message\":\"This is the log message\",\"service.name\":\"my-service\",\"log.logger\":\"com.example.MyClass\"}}")
+         (config '(:timestamp-path "timestamp"
+                   :level-path "payload.log\\.level"
+                   :message-path "payload.message"
+                   :extra-paths ("payload.service\\.name" "payload.log\\.logger")
+                   :json-paths nil))
+         (pair (json-log-viewer-async-worker--line->entry+detail line 42 config))
+         (entry (car pair)))
+    (should (equal (plist-get entry :level) "INFO"))
+    (should (equal (plist-get entry :message) "This is the log message"))
+    (should (equal (plist-get entry :extras)
+                   '("my-service" "com.example.MyClass")))))
 
 (ert-deftest json-log-viewer-parse-time-preserves-subsecond-order-test ()
   (let ((t1 (json-log-viewer--parse-time "2026-01-01T00:00:00.123Z"))
