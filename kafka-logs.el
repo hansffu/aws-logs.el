@@ -715,20 +715,11 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
                          (kafka-logs--extract-first-field
                           payload-node
                           '("level" "severity" "logLevel" "lvl"))))
-             (display-message
-              (or (and payload-node
-                       (kafka-logs--extract-first-field
-                        payload-node
-                        '("message" "msg" "log" "@message")))
-                  (and (stringp payload) payload)
-                  (and payload (kafka-logs--value->string payload))
-                  clean))
              (obj (make-hash-table :test 'equal)))
         (when timestamp
           (puthash "timestamp" timestamp obj))
         (when level
           (puthash "level" level obj))
-        (puthash "message" (or display-message "") obj)
         (puthash "raw" clean obj)
         (puthash "connection" (or kafka-logs--viewer-connection kafka-logs-connection "") obj)
         (when topic

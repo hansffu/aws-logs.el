@@ -77,6 +77,21 @@ When non-nil, output is piped through grep with this regex."
   :type '(choice (const :tag "No filter" nil) string)
   :group 'kube-logs)
 
+(defcustom kube-logs-level-path nil
+  "Path to the level"
+  :type 'string
+  :group 'kube-logs)
+
+(defcustom kube-logs-message-path nil
+  "Path to the message"
+  :type 'string
+  :group 'kube-logs)
+
+(defcustom kube-logs-extra-paths '()
+  "Path to the extra tags"
+  :type '(repeat string)
+  :group 'kube-logs)
+
 (defgroup kube-logs nil
   "Kubernetes logs transient UI and rendering."
   :group 'tools)
@@ -292,12 +307,12 @@ Signals `user-error' on failure."
           kube-logs--viewer-namespace-enabled
           kube-logs--viewer-namespace))
    (cons "Target" (format "%s/%s"
-                           (or kube-logs--viewer-target-kind "-")
-                           (or kube-logs--viewer-target "-")))
+                          (or kube-logs--viewer-target-kind "-")
+                          (or kube-logs--viewer-target "-")))
    (cons "Follow" (if kube-logs--viewer-follow "yes" "no"))
    (cons "Tail" (if kube-logs--viewer-tail
-                     (number-to-string kube-logs--viewer-tail)
-                   "none"))
+                    (number-to-string kube-logs--viewer-tail)
+                  "none"))
    (cons "Since" (or kube-logs--viewer-since "none"))
    (cons "Filter" (or kube-logs-filter "none"))))
 
@@ -360,9 +375,9 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
            buffer-name
            :log-lines (or initial-lines nil)
            :timestamp-path "timestamp"
-           :level-path "payload.log\\.level"
-           :message-path "payload.message"
-           :extra-paths '("payload.service\\.name" "payload.log\\.logger")
+           :level-path kube-logs-level-path
+           :message-path kube-logs-message-path
+           :extra-paths kube-logs-extra-paths
            :streaming streaming
            :direction 'oldest-first
            :header-lines-function #'kube-logs--viewer-header-lines))
