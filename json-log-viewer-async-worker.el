@@ -330,19 +330,80 @@ Use `\\.' in PATH for literal dots in JSON keys."
            :storage-populated t)
      (vector signature filter-text fields-json))))
 
-(defun json-log-viewer-async-worker--build-batch (lines start-id config)
-  "Return plist containing entries/details built from LINES."
-  (let ((next-id start-id)
-        entries
-        details)
-    (dolist (line lines)
-      (let ((pair (json-log-viewer-async-worker--line->entry+detail line next-id config)))
-        (push (car pair) entries)
-        (push (cdr pair) details))
-      (setq next-id (1+ next-id)))
-    (list :entries (nreverse entries)
-          :details (nreverse details)
-          :next-id next-id)))
+(defun json-log-viewer-async-worker--line->storage-json (line parsed)
+  "Return normalized JSON object text persisted for LINE and PARSED payload."
+  (let ((normalized
+         (cond
+          ((or (hash-table-p parsed)
+               (json-log-viewer-async-worker--alist-like-p parsed))
+           (json-log-viewer-async-worker--normalize-json-value-for-serialize parsed))
+          ((or (listp parsed) (vectorp parsed))
+           (let ((obj (make-hash-table :test 'equal)))
+             (puthash
+              "value"
+              (json-log-viewer-async-worker--normalize-json-value-for-serialize parsed)
+              obj)
+             obj))
+          (t
+           (let ((obj (make-hash-table :test 'equal)))
+             (puthash "raw" (or line "") obj)
+             obj)))))
+    (json-serialize normalized :null-object nil :false-object :false)))
+
+(defun json-log-viewer-async-worker--line->summary (line config)
+  "Return summary plist derived from LINE using CONFIG."
+  (let* ((parsed (json-log-viewer-async-worker--parse-line line))
+         (timestamp (json-log-viewer-async-worker--resolve-path
+                     parsed (plist-get config :timestamp-path)))
+         (timestamp-epoch (json-log-viewer-async-worker--parse-time timestamp))
+         (level (or (json-log-viewer-async-worker--resolve-path
+                     parsed (plist-get config :level-path))
+                    "-"))
+         (message (or (json-log-viewer-async-worker--resolve-path
+                       parsed (plist-get config :message-path))
+                      line
+                      "-"))
+         (extra-fields nil))
+    (dolist (path (plist-get config :extra-paths))
+      (when-let ((value (json-log-viewer-async-worker--resolve-path parsed path)))
+        (push value extra-fields)))
+    (list :parsed parsed
+          :timestamp (or timestamp "-")
+          :timestamp-epoch timestamp-epoch
+          :level level
+          :message message
+          :extra-fields (nreverse extra-fields))))
+
+(defun json-log-viewer-async-worker--sqlite-insert-log-entry (db line config)
+  "Insert one LINE into DB and return summary plist."
+  (let* ((summary (json-log-viewer-async-worker--line->summary line config))
+         (parsed (plist-get summary :parsed))
+         (timestamp-epoch (plist-get summary :timestamp-epoch))
+         (storage-json (json-log-viewer-async-worker--line->storage-json line parsed)))
+    (sqlite-execute
+     db
+     "INSERT INTO log_entry(timestamp, json) VALUES (?, ?)"
+     (vector timestamp-epoch storage-json))
+    (let ((id (car (car (sqlite-select db "SELECT last_insert_rowid()")))))
+      (list :id id
+            :timestamp (plist-get summary :timestamp)
+            :level (plist-get summary :level)
+            :message (plist-get summary :message)
+            :extra-fields (plist-get summary :extra-fields)))))
+
+(defun json-log-viewer-async-worker--sqlite-truncate-oldest (db count)
+  "Delete COUNT oldest rows from DB ordered by timestamp then id."
+  (when (> count 0)
+    (sqlite-execute
+     db
+     (concat
+      "DELETE FROM log_entry "
+      "WHERE id IN ("
+      "SELECT id FROM log_entry "
+      "ORDER BY CASE WHEN timestamp IS NULL THEN 1 ELSE 0 END, timestamp, id "
+      "LIMIT ?)")
+     (vector count)))
+  count)
 
 (defconst json-log-viewer-async-worker--sqlite-lock-retries 12
   "Maximum retries when sqlite reports lock contention.")
@@ -389,116 +450,62 @@ Use `\\.' in PATH for literal dots in JSON keys."
           (ignore-errors (sqlite-close db)))))
     result))
 
-(defun json-log-viewer-async-worker--sqlite-trim-raw-lines (db max-entries chunk-size)
-  "Trim RAW_LINES table on DB to MAX-ENTRIES in CHUNK-SIZE batches."
-  (when (and (integerp max-entries)
-             (> max-entries 0))
-    (let* ((count-row (car (sqlite-select db "SELECT COUNT(*) FROM raw_lines")))
-           (count (or (car count-row) 0))
-           (over (- count max-entries)))
-      (when (> over 0)
-        (let* ((chunks (/ (+ over chunk-size -1) chunk-size))
-               (drop-target (* chunks chunk-size))
-               (rows (sqlite-select db
-                                    (format "SELECT seq FROM raw_lines ORDER BY seq LIMIT %d"
-                                            drop-target))))
-          (when rows
-            (let ((last-seq (car (car (last rows)))))
-              (sqlite-execute db
-                              "DELETE FROM raw_lines WHERE seq <= ?"
-                              (vector last-seq)))))))))
-
-(defun json-log-viewer-async-worker--persist-sqlite (op lines details config)
-  "Persist worker outputs to sqlite."
-  (let ((sqlite-file (plist-get config :sqlite-file)))
-    (unless sqlite-file
-      (error "sqlite support is required for json-log-viewer worker"))
-    (json-log-viewer-async-worker--sqlite-run-transaction
-     sqlite-file
-     (lambda (db)
-       (when (eq op 'replace)
-         (sqlite-execute db "DELETE FROM raw_lines")
-         (sqlite-execute db "DELETE FROM entry_details"))
-       (dolist (line lines)
-         (sqlite-execute db
-                         "INSERT INTO raw_lines(line) VALUES (?)"
-                         (vector line)))
-       (dolist (detail details)
-         (sqlite-execute
-          db
-          "INSERT OR REPLACE INTO entry_details(signature, filter_text, fields_json) VALUES (?, ?, ?)"
-          detail))
-       (when (plist-get config :streaming)
-         (json-log-viewer-async-worker--sqlite-trim-raw-lines
-          db
-          (plist-get config :max-entries)
-          (plist-get config :chunk-size)))))))
-
 (defun json-log-viewer-async-worker--config-from-job (job)
   "Extract reusable config plist from JOB."
   (list :timestamp-path (plist-get job :timestamp-path)
         :level-path (plist-get job :level-path)
         :message-path (plist-get job :message-path)
         :extra-paths (or (plist-get job :extra-paths) nil)
-        :json-paths (or (plist-get job :json-paths) nil)
-        :sqlite-file (plist-get job :sqlite-file)
-        :streaming (plist-get job :streaming)
-        :max-entries (plist-get job :max-entries)
-        :chunk-size (max 1 (or (plist-get job :chunk-size) 1))))
+        :sqlite-file (plist-get job :sqlite-file)))
 
-(defun json-log-viewer-async-worker-process-entry-details-job (job)
-  "Process one async entry_details JOB payload in subordinate Emacs."
-  (let* ((op (plist-get job :op))
+(defun json-log-viewer-async-worker-process-log-ingestor-job (job)
+  "Process one LOG-INGESTOR JOB payload."
+  (let* ((op (or (plist-get job :op) 'ingest))
          (sqlite-file (plist-get job :sqlite-file))
-         (signature (plist-get job :signature))
-         (filter-text (or (plist-get job :filter-text) ""))
-         (fields-json (or (plist-get job :fields-json) "[]"))
-         (signatures (or (plist-get job :signatures) nil)))
+         (config (json-log-viewer-async-worker--config-from-job job)))
     (unless sqlite-file
-      (error "Entry-details worker missing sqlite support"))
-    (let ((count 0))
-      (json-log-viewer-async-worker--sqlite-run-transaction
-       sqlite-file
-       (lambda (db)
-         (pcase op
-           ('reset
-            (sqlite-execute db "DELETE FROM entry_details"))
-           ('upsert
-            (when signature
-              (setq count 1)
-              (sqlite-execute
-               db
-               "INSERT OR REPLACE INTO entry_details(signature, filter_text, fields_json) VALUES (?, ?, ?)"
-               (vector signature filter-text fields-json))))
-           ('delete-many
-            (dolist (sig signatures)
-              (when sig
-                (setq count (1+ count))
-                (sqlite-execute db
-                                "DELETE FROM entry_details WHERE signature = ?"
-                                (vector sig)))))
-           (_
-            (error "Unknown entry_details op: %S" op)))))
-      (list :op op :count count))))
+      (error "Log-ingestor worker missing sqlite support"))
+    (pcase op
+      ('reset
+       (json-log-viewer-async-worker--sqlite-run-transaction
+        sqlite-file
+        (lambda (db)
+          (sqlite-execute db "DELETE FROM log_entry")))
+       (list :op 'reset))
+      ('ingest
+       (let ((line (plist-get job :line)))
+         (unless (stringp line)
+           (error "Log-ingestor job :line must be a string"))
+         (list :op 'ingest
+               :entry
+               (json-log-viewer-async-worker--sqlite-run-transaction
+                sqlite-file
+                (lambda (db)
+                  (json-log-viewer-async-worker--sqlite-insert-log-entry
+                   db line config))))))
+      (_
+       (error "Unknown log-ingestor op: %S" op)))))
+
+(defun json-log-viewer-async-worker-process-trunkator-job (job)
+  "Process one TRUNKATOR JOB payload."
+  (let* ((sqlite-file (plist-get job :sqlite-file))
+         (count (max 0 (or (plist-get job :count) 0)))
+         (deleted 0))
+    (unless sqlite-file
+      (error "Trunkator worker missing sqlite support"))
+    (json-log-viewer-async-worker--sqlite-run-transaction
+     sqlite-file
+     (lambda (db)
+       (setq deleted (json-log-viewer-async-worker--sqlite-truncate-oldest db count))))
+    (list :op 'truncate :count deleted)))
+
+(defun json-log-viewer-async-worker-process-entry-details-job (_job)
+  "Compatibility no-op retained for older callers."
+  (list :op 'noop :count 0))
 
 (defun json-log-viewer-async-worker-process-job (job)
-  "Process one async JOB payload in subordinate Emacs.
-
-Return a plist consumed by main-process callback code."
-  (let* ((op (plist-get job :op))
-         (lines (or (plist-get job :lines) nil))
-         (start-id (or (plist-get job :start-id) 0))
-         (preserve-filter (plist-get job :preserve-filter))
-         (config (json-log-viewer-async-worker--config-from-job job))
-         (batch (json-log-viewer-async-worker--build-batch lines start-id config))
-         (entries (plist-get batch :entries))
-         (details (plist-get batch :details))
-         (next-id (plist-get batch :next-id)))
-    (json-log-viewer-async-worker--persist-sqlite op lines details config)
-    (list :op op
-          :entries entries
-          :next-id next-id
-          :preserve-filter preserve-filter)))
+  "Compatibility wrapper that routes JOB to log-ingestor worker."
+  (json-log-viewer-async-worker-process-log-ingestor-job job))
 
 (provide 'json-log-viewer-async-worker)
 ;;; json-log-viewer-async-worker.el ends here

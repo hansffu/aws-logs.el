@@ -18,10 +18,10 @@
 (declare-function async-job-queue-create "async-job-queue" (process-func callback-func))
 (declare-function async-job-queue-push "async-job-queue" (queue element))
 (declare-function async-job-queue-stop "async-job-queue" (queue))
-(declare-function json-log-viewer-async-worker-process-job
+(declare-function json-log-viewer-async-worker-process-log-ingestor-job
                   "json-log-viewer-async-worker"
                   (job))
-(declare-function json-log-viewer-async-worker-process-entry-details-job
+(declare-function json-log-viewer-async-worker-process-trunkator-job
                   "json-log-viewer-async-worker"
                   (job))
 
@@ -151,17 +151,17 @@ to `js-mode`."
 (defvar-local json-log-viewer--sqlite-file nil
   "Path of sqlite file used by current viewer buffer, or nil.")
 
-(defvar-local json-log-viewer--async-queue nil
-  "Per-buffer async job queue object, or nil before initialization.")
+(defvar-local json-log-viewer--log-ingestor-async-queue nil
+  "Per-buffer async queue that ingests one log line per job.")
 
-(defvar-local json-log-viewer--async-pending-count 0
-  "Count of queued async operations awaiting callbacks.")
+(defvar-local json-log-viewer--log-ingestor-async-pending-count 0
+  "Count of queued log-ingestor jobs awaiting callbacks.")
 
-(defvar-local json-log-viewer--entry-details-async-queue nil
-  "Per-buffer async queue for sqlite entry_details writes.")
+(defvar-local json-log-viewer--trunkator-async-queue nil
+  "Per-buffer async queue that truncates old sqlite rows.")
 
-(defvar-local json-log-viewer--entry-details-async-pending-count 0
-  "Count of queued async entry_details operations awaiting callbacks.")
+(defvar-local json-log-viewer--trunkator-async-pending-count 0
+  "Count of queued trunkator jobs awaiting callbacks.")
 
 (defvar-local json-log-viewer--entry-count 0
   "Cached count of rendered entry overlays.")
@@ -301,8 +301,8 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
     (sqlite-execute db "PRAGMA journal_mode = WAL")
     (sqlite-execute db "PRAGMA synchronous = NORMAL")
     (sqlite-execute db "PRAGMA busy_timeout = 5000")
-    (sqlite-execute db "CREATE TABLE raw_lines (seq INTEGER PRIMARY KEY AUTOINCREMENT, line TEXT NOT NULL)")
-    (sqlite-execute db "CREATE TABLE entry_details (signature TEXT PRIMARY KEY, filter_text TEXT NOT NULL, fields_json TEXT NOT NULL)")))
+    (sqlite-execute db "CREATE TABLE log_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, json TEXT NOT NULL)")
+    (sqlite-execute db "CREATE INDEX log_entry_timestamp_idx ON log_entry(timestamp, id)")))
 
 (defun json-log-viewer--storage-close ()
   "Close and cleanup current buffer storage resources."
@@ -315,62 +315,52 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
   (setq-local json-log-viewer--sqlite-file nil))
 
 (defun json-log-viewer--storage-reset-entry-details ()
-  "Drop all persisted entry details for current buffer."
+  "Reset sqlite log entries for current buffer."
   (json-log-viewer--ensure-async-queue-running)
-  (json-log-viewer--entry-details-async-submit
-   (json-log-viewer--make-entry-details-async-job 'reset)))
+  (json-log-viewer--async-submit
+   (json-log-viewer--make-log-ingestor-async-job 'reset nil)
+   t))
 
-(defun json-log-viewer--storage-put-entry-details (signature filter-text fields)
-  "Persist entry details keyed by SIGNATURE."
-  (when signature
-    (json-log-viewer--ensure-async-queue-running)
-    (json-log-viewer--entry-details-async-submit
-     (json-log-viewer--make-entry-details-async-job
-      'upsert
-      signature
-      (or filter-text "")
-      (json-log-viewer--fields->storage-json fields)))))
+(defun json-log-viewer--storage-put-entry-details (_signature _filter-text _fields)
+  "Compatibility no-op; entry details are loaded from sqlite on expand.")
 
-(defun json-log-viewer--storage-remove-entry-details-batch (signatures)
-  "Remove persisted entry details identified by SIGNATURES."
-  (when (consp signatures)
-    (json-log-viewer--ensure-async-queue-running)
-    (json-log-viewer--entry-details-async-submit
-     (json-log-viewer--make-entry-details-async-job
-      'delete-many
-      nil nil nil signatures))))
+(defun json-log-viewer--storage-remove-entry-details-batch (_signatures)
+  "Compatibility no-op; truncation is handled by trunkator queue.")
 
 (defun json-log-viewer--storage-entry-filter-text (entry-overlay)
   "Return normalized filter text for ENTRY-OVERLAY."
-  (or (overlay-get entry-overlay 'json-log-viewer-filter-text)
-      (when json-log-viewer--sqlite-db
-        (when-let* ((signature (overlay-get entry-overlay 'json-log-viewer-signature))
-                    (row (car (sqlite-select json-log-viewer--sqlite-db
-                                             "SELECT filter_text FROM entry_details WHERE signature = ?"
-                                             (vector signature)))))
-          (car row)))))
+  (when (and (overlay-buffer entry-overlay)
+             (overlay-start entry-overlay))
+    (with-current-buffer (overlay-buffer entry-overlay)
+      (downcase
+       (buffer-substring-no-properties
+        (overlay-start entry-overlay)
+        (save-excursion
+          (goto-char (overlay-start entry-overlay))
+          (line-end-position)))))))
 
 (defun json-log-viewer--storage-entry-fields (entry-overlay)
   "Return normalized fields for ENTRY-OVERLAY."
-  (or (overlay-get entry-overlay 'json-log-viewer-entry-fields)
-      (when json-log-viewer--sqlite-db
-        (when-let* ((signature (overlay-get entry-overlay 'json-log-viewer-signature))
-                    (row (car (sqlite-select json-log-viewer--sqlite-db
-                                             "SELECT fields_json FROM entry_details WHERE signature = ?"
-                                             (vector signature)))))
-          (json-log-viewer--storage-json->fields (car row))))))
+  (when json-log-viewer--sqlite-db
+    (let ((entry-id (or (overlay-get entry-overlay 'json-log-viewer-log-entry-id)
+                        (let ((signature (overlay-get entry-overlay 'json-log-viewer-signature)))
+                          (when (and (stringp signature)
+                                     (string-match-p "\\`[0-9]+\\'" signature))
+                            (string-to-number signature))))))
+      (when-let* ((row (and entry-id
+                            (car (sqlite-select json-log-viewer--sqlite-db
+                                                "SELECT json FROM log_entry WHERE id = ?"
+                                                (vector entry-id)))))
+                  (json-text (car row)))
+        (json-log-viewer--normalize-fields
+         (json-log-viewer--json-object-fields
+          (json-log-viewer--json-parse-line json-text)
+          json-text
+          json-log-viewer--json-paths))))))
 
-(defun json-log-viewer--storage-matching-signatures (needle)
-  "Return hash table of signatures matching NEEDLE."
-  (let ((matches (make-hash-table :test 'equal)))
-    (when (and json-log-viewer--sqlite-db
-               needle
-               (not (string-empty-p needle)))
-      (dolist (row (sqlite-select json-log-viewer--sqlite-db
-                                  "SELECT signature FROM entry_details WHERE filter_text LIKE ?"
-                                  (vector (concat "%" needle "%"))))
-        (puthash (car row) t matches)))
-    matches))
+(defun json-log-viewer--storage-matching-signatures (_needle)
+  "Return nil so filtering falls back to visible summary text matching."
+  nil)
 
 (defun json-log-viewer--async-worker-file ()
   "Return a readable path to `json-log-viewer-async-worker.el'."
@@ -398,172 +388,185 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
 (defun json-log-viewer--async-await-pending-count (target-count)
   "Wait until pending async count reaches TARGET-COUNT, with timeout."
   (let ((deadline (+ (float-time) 15.0)))
-    (while (and (> json-log-viewer--async-pending-count target-count)
+    (while (and (> json-log-viewer--log-ingestor-async-pending-count target-count)
                 (< (float-time) deadline))
       (accept-process-output nil 0.01))
-    (when (> json-log-viewer--async-pending-count target-count)
+    (when (> json-log-viewer--log-ingestor-async-pending-count target-count)
       (error "Timed out waiting for async queue callback"))))
 
+(defun json-log-viewer--worker-entry->entry (worker-entry)
+  "Normalize WORKER-ENTRY into a renderable entry plist."
+  (let* ((id (plist-get worker-entry :id))
+         (timestamp (or (plist-get worker-entry :timestamp) "-"))
+         (level (or (plist-get worker-entry :level) "-"))
+         (message (or (plist-get worker-entry :message) "-"))
+         (extra-fields (or (plist-get worker-entry :extra-fields)
+                           (plist-get worker-entry :extras)
+                           nil))
+         (sort-key (or (json-log-viewer--parse-time timestamp)
+                       (+ 1000000000000.0 (or id 0)))))
+    (list :id id
+          :sort-key sort-key
+          :timestamp timestamp
+          :level level
+          :message message
+          :extras extra-fields
+          :extra-fields extra-fields
+          :storage-populated t)))
+
 (defun json-log-viewer--async-handle-result (result)
-  "Handle async queue RESULT in current viewer buffer."
+  "Handle log-ingestor queue RESULT in current viewer buffer."
   (if (and (listp result) (eq (car result) :error))
       (message "json-log-viewer async worker error: %s" (or (cadr result) "unknown error"))
-    (let ((op (plist-get result :op))
-          (entries (or (plist-get result :entries) nil))
-          (next-id (plist-get result :next-id))
-          (preserve-filter (plist-get result :preserve-filter)))
-      (when (numberp next-id)
-        (setq json-log-viewer--next-entry-id
-              (max json-log-viewer--next-entry-id next-id)))
-      (cond
-       ((eq op 'replace)
-        (json-log-viewer-replace-entries entries preserve-filter t))
-       ((eq op 'append)
-        (json-log-viewer-append-entries entries))
-       (t
-       (message "json-log-viewer async worker returned unknown op: %S" op))))))
+    (pcase (plist-get result :op)
+      ('reset nil)
+      ('ingest
+       (when-let ((entry (plist-get result :entry)))
+         (json-log-viewer-append-entries
+          (list (json-log-viewer--worker-entry->entry entry)))))
+      (op
+       (message "json-log-viewer async worker returned unknown op: %S" op)))))
 
-(defun json-log-viewer--entry-details-async-handle-result (result)
-  "Handle entry-details async queue RESULT in current viewer buffer."
+(defun json-log-viewer--trunkator-async-handle-result (result)
+  "Handle trunkator async queue RESULT in current viewer buffer."
   (when (and (listp result) (eq (car result) :error))
-    (message "json-log-viewer entry_details worker error: %s"
+    (message "json-log-viewer trunkator worker error: %s"
              (or (cadr result) "unknown error"))))
 
-(defun json-log-viewer--make-main-queue-process-func ()
-  "Return a serialization-safe PROCESS-FUNC for main async queue."
+(defun json-log-viewer--make-log-ingestor-queue-process-func ()
+  "Return a serialization-safe PROCESS-FUNC for log-ingestor queue."
   (eval
    '(lambda (job)
       (let ((worker-file (plist-get job :worker-file)))
         (unless (and (stringp worker-file)
                      (file-readable-p worker-file))
           (error "Async worker file is unreadable: %S" worker-file))
-        (unless (fboundp 'json-log-viewer-async-worker-process-job)
+        (unless (fboundp 'json-log-viewer-async-worker-process-log-ingestor-job)
           (load worker-file nil t)
-          (unless (fboundp 'json-log-viewer-async-worker-process-job)
-            (error "Missing worker entrypoint in %s" worker-file)))
-        (json-log-viewer-async-worker-process-job job)))))
+          (unless (fboundp 'json-log-viewer-async-worker-process-log-ingestor-job)
+            (error "Missing log-ingestor worker entrypoint in %s" worker-file)))
+        (json-log-viewer-async-worker-process-log-ingestor-job job)))))
 
-(defun json-log-viewer--make-entry-details-queue-process-func ()
-  "Return a serialization-safe PROCESS-FUNC for entry_details queue."
+(defun json-log-viewer--make-trunkator-queue-process-func ()
+  "Return a serialization-safe PROCESS-FUNC for trunkator queue."
   (eval
    '(lambda (job)
       (let ((worker-file (plist-get job :worker-file)))
         (unless (and (stringp worker-file)
                      (file-readable-p worker-file))
           (error "Async worker file is unreadable: %S" worker-file))
-        (unless (fboundp 'json-log-viewer-async-worker-process-entry-details-job)
+        (unless (fboundp 'json-log-viewer-async-worker-process-trunkator-job)
           (load worker-file nil t)
-          (unless (fboundp 'json-log-viewer-async-worker-process-entry-details-job)
-            (error "Missing entry-details worker entrypoint in %s" worker-file)))
-        (json-log-viewer-async-worker-process-entry-details-job job)))))
+          (unless (fboundp 'json-log-viewer-async-worker-process-trunkator-job)
+            (error "Missing trunkator worker entrypoint in %s" worker-file)))
+        (json-log-viewer-async-worker-process-trunkator-job job)))))
 
 (defun json-log-viewer--stop-async-queue ()
   "Stop async queue for current buffer."
-  (when json-log-viewer--async-queue
-    (ignore-errors (async-job-queue-stop json-log-viewer--async-queue))
-    (setq json-log-viewer--async-queue nil))
-  (when json-log-viewer--entry-details-async-queue
-    (ignore-errors (async-job-queue-stop json-log-viewer--entry-details-async-queue))
-    (setq json-log-viewer--entry-details-async-queue nil))
-  (setq json-log-viewer--async-pending-count 0)
-  (setq json-log-viewer--entry-details-async-pending-count 0))
+  (when json-log-viewer--log-ingestor-async-queue
+    (ignore-errors (async-job-queue-stop json-log-viewer--log-ingestor-async-queue))
+    (setq json-log-viewer--log-ingestor-async-queue nil))
+  (when json-log-viewer--trunkator-async-queue
+    (ignore-errors (async-job-queue-stop json-log-viewer--trunkator-async-queue))
+    (setq json-log-viewer--trunkator-async-queue nil))
+  (setq json-log-viewer--log-ingestor-async-pending-count 0)
+  (setq json-log-viewer--trunkator-async-pending-count 0))
 
 (defun json-log-viewer--start-async-queue ()
-  "Start async queues for current buffer."
+  "Start log-ingestor and trunkator async queues for current buffer."
   (json-log-viewer--stop-async-queue)
   (let ((buffer (current-buffer)))
-    (setq-local json-log-viewer--async-queue
+    (setq-local json-log-viewer--log-ingestor-async-queue
                 (async-job-queue-create
-                 (json-log-viewer--make-main-queue-process-func)
+                 (json-log-viewer--make-log-ingestor-queue-process-func)
                  (lambda (result)
                    (when (buffer-live-p buffer)
                      (with-current-buffer buffer
-                       (setq json-log-viewer--async-pending-count
-                             (max 0 (1- json-log-viewer--async-pending-count)))
+                       (setq json-log-viewer--log-ingestor-async-pending-count
+                             (max 0 (1- json-log-viewer--log-ingestor-async-pending-count)))
                        (json-log-viewer--async-handle-result result))))))
-    (setq-local json-log-viewer--entry-details-async-queue
+    (setq-local json-log-viewer--trunkator-async-queue
                 (async-job-queue-create
-                 (json-log-viewer--make-entry-details-queue-process-func)
+                 (json-log-viewer--make-trunkator-queue-process-func)
                  (lambda (result)
                    (when (buffer-live-p buffer)
                      (with-current-buffer buffer
-                       (setq json-log-viewer--entry-details-async-pending-count
-                             (max 0 (1- json-log-viewer--entry-details-async-pending-count)))
-                       (json-log-viewer--entry-details-async-handle-result result))))))))
+                       (setq json-log-viewer--trunkator-async-pending-count
+                             (max 0 (1- json-log-viewer--trunkator-async-pending-count)))
+                       (json-log-viewer--trunkator-async-handle-result result))))))))
 
-(defun json-log-viewer--make-async-job (op lines &optional preserve-filter)
-  "Build async queue payload for OP, LINES and PRESERVE-FILTER.
-
-Reserves entry IDs at enqueue time to avoid collisions across queued jobs."
-  (let* ((line-count (length lines))
-         (start-id json-log-viewer--next-entry-id))
-    (setq json-log-viewer--next-entry-id (+ start-id line-count))
-    (list :op op
-          :lines lines
-          :start-id start-id
-          :worker-file (json-log-viewer--async-worker-file)
-          :timestamp-path json-log-viewer--timestamp-path
-          :level-path json-log-viewer--level-path
-          :message-path json-log-viewer--message-path
-          :extra-paths json-log-viewer--extra-paths
-          :json-paths json-log-viewer--json-paths
-          :sqlite-file json-log-viewer--sqlite-file
-          :streaming json-log-viewer--streaming
-          :max-entries json-log-viewer--stream-max-entries
-          :chunk-size (json-log-viewer--stream-chunk-size)
-          :preserve-filter preserve-filter)))
-
-(defun json-log-viewer--make-entry-details-async-job (op
-                                                      &optional
-                                                      signature
-                                                      filter-text
-                                                      fields-json
-                                                      signatures)
-  "Build entry-details async queue payload for OP."
+(defun json-log-viewer--make-log-ingestor-async-job (op line)
+  "Build log-ingestor async queue payload for OP and LINE."
   (list :op op
+        :line line
         :worker-file (json-log-viewer--async-worker-file)
-        :sqlite-file json-log-viewer--sqlite-file
-        :signature signature
-        :filter-text filter-text
-        :fields-json fields-json
-        :signatures signatures))
+        :timestamp-path json-log-viewer--timestamp-path
+        :level-path json-log-viewer--level-path
+        :message-path json-log-viewer--message-path
+        :extra-paths json-log-viewer--extra-paths
+        :sqlite-file json-log-viewer--sqlite-file))
+
+(defun json-log-viewer--make-trunkator-async-job (count)
+  "Build trunkator async queue payload for COUNT."
+  (list :count count
+        :worker-file (json-log-viewer--async-worker-file)
+        :sqlite-file json-log-viewer--sqlite-file))
+
+(defun json-log-viewer--make-async-job (op payload &optional _preserve-filter)
+  "Compatibility wrapper that builds log-ingestor async jobs."
+  (pcase op
+    ('reset
+     (json-log-viewer--make-log-ingestor-async-job 'reset nil))
+    ('ingest
+     (json-log-viewer--make-log-ingestor-async-job 'ingest payload))
+    ('append
+     (json-log-viewer--make-log-ingestor-async-job
+      'ingest
+      (if (listp payload) (car payload) payload)))
+    ('replace
+     (json-log-viewer--make-log-ingestor-async-job 'reset nil))
+    (_
+     (list :op op
+          :worker-file (json-log-viewer--async-worker-file)
+          :sqlite-file json-log-viewer--sqlite-file))))
 
 (defun json-log-viewer--async-submit (job &optional wait-for-callback)
-  "Submit JOB to current buffer queue.
+  "Submit log-ingestor JOB to current buffer queue.
 
 When WAIT-FOR-CALLBACK is non-nil, block until callback has applied."
-  (unless json-log-viewer--async-queue
-    (error "Async queue is not running for this buffer"))
-  (let ((before json-log-viewer--async-pending-count))
-    (setq json-log-viewer--async-pending-count (1+ json-log-viewer--async-pending-count))
-    (async-job-queue-push json-log-viewer--async-queue job)
+  (unless json-log-viewer--log-ingestor-async-queue
+    (error "Log-ingestor queue is not running for this buffer"))
+  (let ((before json-log-viewer--log-ingestor-async-pending-count))
+    (setq json-log-viewer--log-ingestor-async-pending-count
+          (1+ json-log-viewer--log-ingestor-async-pending-count))
+    (async-job-queue-push json-log-viewer--log-ingestor-async-queue job)
     (when (or wait-for-callback noninteractive)
       (json-log-viewer--async-await-pending-count before))))
 
-(defun json-log-viewer--entry-details-async-await-pending-count (target-count)
-  "Wait until entry-details pending async count reaches TARGET-COUNT."
+(defun json-log-viewer--trunkator-async-await-pending-count (target-count)
+  "Wait until trunkator pending async count reaches TARGET-COUNT."
   (let ((deadline (+ (float-time) 15.0)))
-    (while (and (> json-log-viewer--entry-details-async-pending-count target-count)
+    (while (and (> json-log-viewer--trunkator-async-pending-count target-count)
                 (< (float-time) deadline))
       (accept-process-output nil 0.01))
-    (when (> json-log-viewer--entry-details-async-pending-count target-count)
-      (error "Timed out waiting for entry-details async queue callback"))))
+    (when (> json-log-viewer--trunkator-async-pending-count target-count)
+      (error "Timed out waiting for trunkator async queue callback"))))
 
-(defun json-log-viewer--entry-details-async-submit (job &optional wait-for-callback)
-  "Submit entry-details JOB to current buffer queue."
-  (unless json-log-viewer--entry-details-async-queue
-    (error "Entry-details async queue is not running for this buffer"))
-  (let ((before json-log-viewer--entry-details-async-pending-count))
-    (setq json-log-viewer--entry-details-async-pending-count
-          (1+ json-log-viewer--entry-details-async-pending-count))
-    (async-job-queue-push json-log-viewer--entry-details-async-queue job)
+(defun json-log-viewer--trunkator-async-submit (job &optional wait-for-callback)
+  "Submit trunkator JOB to current buffer queue."
+  (unless json-log-viewer--trunkator-async-queue
+    (error "Trunkator async queue is not running for this buffer"))
+  (let ((before json-log-viewer--trunkator-async-pending-count))
+    (setq json-log-viewer--trunkator-async-pending-count
+          (1+ json-log-viewer--trunkator-async-pending-count))
+    (async-job-queue-push json-log-viewer--trunkator-async-queue job)
     (when (or wait-for-callback noninteractive)
-      (json-log-viewer--entry-details-async-await-pending-count before))))
+      (json-log-viewer--trunkator-async-await-pending-count before))))
 
 (defun json-log-viewer--ensure-async-queue-running ()
   "Ensure current buffer has active async queues."
-  (when (or (not json-log-viewer--async-queue)
-            (not json-log-viewer--entry-details-async-queue))
+  (when (or (not json-log-viewer--log-ingestor-async-queue)
+            (not json-log-viewer--trunkator-async-queue))
     (user-error
      "json-log-viewer async queues are not running")))
 
@@ -951,8 +954,10 @@ Returns cons cell (ENTRIES . NEXT-ID)."
                       (json-log-viewer--resolve-path parsed json-log-viewer--message-path)
                       raw
                       "-"))
-         (extras (or (plist-get entry :extras) nil)))
-    (unless extras
+         (extras (or (plist-get entry :extra-fields)
+                     (plist-get entry :extras)
+                     nil)))
+    (unless (or extras (not parsed))
       (dolist (path json-log-viewer--extra-paths)
         (when-let ((value (json-log-viewer--resolve-path parsed path)))
           (push value extras)))
@@ -995,10 +1000,7 @@ Returns cons cell (ENTRIES . NEXT-ID)."
       (let ((new-lines (json-log-viewer--ensure-log-lines
                         refresh-value
                         "json-log-viewer refresh-function return value")))
-        (json-log-viewer--ensure-async-queue-running)
-        (json-log-viewer--async-submit
-         (json-log-viewer--make-async-job
-          'replace new-lines t))
+        (json-log-viewer-replace-log-lines (current-buffer) new-lines t)
         (list :entries nil :replace nil)))))
 
 (defun json-log-viewer--entry-signature (entry)
@@ -1337,7 +1339,7 @@ When VISIBLE-ONLY is non-nil, return only currently visible entries."
   "Return flattened copy of raw lines from sqlite storage."
   (mapcar #'car
           (sqlite-select json-log-viewer--sqlite-db
-                         "SELECT line FROM raw_lines ORDER BY seq")))
+                         "SELECT json FROM log_entry ORDER BY id")))
 
 (defun json-log-viewer--info-line (key value)
   "Return formatted popup info line from KEY and VALUE."
@@ -1536,6 +1538,7 @@ When result size allows it, updates are previewed live while typing."
 (defun json-log-viewer--insert-entry (entry)
   "Insert one foldable ENTRY."
   (let* ((storage-populated (plist-get entry :storage-populated))
+         (entry-id (plist-get entry :id))
          (raw-fields (unless storage-populated
                        (funcall json-log-viewer--entry-fields-function entry)))
          (fields (and raw-fields (json-log-viewer--normalize-fields raw-fields)))
@@ -1547,10 +1550,13 @@ When result size allows it, updates are previewed live while typing."
          (summary-start (point))
          entry-ov)
     (insert (or (json-log-viewer--value->string summary) "-") "\n")
-    (setq entry-ov (make-overlay summary-start (point)))
+    ;; Front-advance keeps older entry overlays stable when a newer line is
+    ;; inserted at the buffer start (non-streaming newest-first updates).
+    (setq entry-ov (make-overlay summary-start (point) nil t nil))
     (overlay-put entry-ov 'json-log-viewer-entry t)
     (overlay-put entry-ov 'json-log-viewer-entry-expanded nil)
     (overlay-put entry-ov 'json-log-viewer-fold-overlay nil)
+    (overlay-put entry-ov 'json-log-viewer-log-entry-id entry-id)
     (unless storage-populated
       (json-log-viewer--storage-put-entry-details signature filter-text fields))
     (overlay-put entry-ov 'json-log-viewer-signature signature)
@@ -1583,14 +1589,12 @@ When result size allows it, updates are previewed live while typing."
                (integerp max-entries)
                (> max-entries 0)
                (> json-log-viewer--entry-count max-entries))
-      (let* ((over (- json-log-viewer--entry-count max-entries))
-             (drop (min json-log-viewer--entry-count
-                        (json-log-viewer--stream-eviction-drop-count over)))
+      (let* ((drop (min json-log-viewer--entry-count
+                        (json-log-viewer--stream-chunk-size)))
              (keep (- json-log-viewer--entry-count drop))
              kept
              victims
-             (victim-folds nil)
-             (victim-signatures nil))
+             (victim-folds nil))
         ;; Avoid `cl-subseq` on long lists to prevent deep recursive list copying.
         (let ((idx 0))
           (dolist (entry-overlay json-log-viewer--entry-overlays)
@@ -1608,8 +1612,7 @@ When result size allows it, updates are previewed live while typing."
             (when (overlayp fold-ov)
               (push fold-ov victim-folds))
             (when sig
-              (remhash sig json-log-viewer--seen-signatures)
-              (push sig victim-signatures))
+              (remhash sig json-log-viewer--seen-signatures))
             (when (and (overlay-buffer entry-overlay)
                        (overlay-start entry-overlay)
                        (overlay-end entry-overlay))
@@ -1622,8 +1625,8 @@ When result size allows it, updates are previewed live while typing."
         (setq json-log-viewer--fold-overlays
               (cl-remove-if (lambda (ov) (memq ov victim-folds))
                             json-log-viewer--fold-overlays))
-        (json-log-viewer--storage-remove-entry-details-batch
-         (nreverse victim-signatures))))))
+        (json-log-viewer--trunkator-async-submit
+         (json-log-viewer--make-trunkator-async-job drop))))))
 
 (defun json-log-viewer-replace-entries (entries &optional preserve-filter storage-prepared)
   "Replace rendered entries with ENTRIES.
@@ -1834,9 +1837,7 @@ Returns the created buffer."
       (json-log-viewer--ensure-async-queue-running)
       (json-log-viewer-replace-entries nil nil t)
       (when normalized-lines
-        (json-log-viewer--async-submit
-         (json-log-viewer--make-async-job
-          'replace normalized-lines nil)))
+        (json-log-viewer-replace-log-lines target normalized-lines nil))
     target)))
 
 (defun json-log-viewer-push (buffer-or-name log-lines)
@@ -1851,9 +1852,9 @@ BUFFER-OR-NAME must identify a live `json-log-viewer-mode` buffer created by
       (let ((normalized-lines (json-log-viewer--ensure-log-lines
                                log-lines "json-log-viewer-push")))
         (json-log-viewer--ensure-async-queue-running)
-        (json-log-viewer--async-submit
-         (json-log-viewer--make-async-job
-          'append normalized-lines nil))))))
+        (dolist (line normalized-lines)
+          (json-log-viewer--async-submit
+           (json-log-viewer--make-log-ingestor-async-job 'ingest line)))))))
 
 (defun json-log-viewer-current-log-lines (buffer-or-name)
   "Return a copy of current raw log lines from BUFFER-OR-NAME."
@@ -1871,8 +1872,12 @@ When PRESERVE-FILTER is non-nil, keep the current active filter."
                                log-lines "json-log-viewer-replace-log-lines")))
         (json-log-viewer--ensure-async-queue-running)
         (json-log-viewer--async-submit
-         (json-log-viewer--make-async-job
-          'replace normalized-lines preserve-filter))))))
+         (json-log-viewer--make-log-ingestor-async-job 'reset nil)
+         t)
+        (json-log-viewer-replace-entries nil preserve-filter t)
+        (dolist (line normalized-lines)
+          (json-log-viewer--async-submit
+           (json-log-viewer--make-log-ingestor-async-job 'ingest line)))))))
 
 (provide 'json-log-viewer)
 ;;; json-log-viewer.el ends here

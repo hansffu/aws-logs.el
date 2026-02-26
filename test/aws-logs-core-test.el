@@ -280,7 +280,7 @@
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
-(ert-deftest json-log-viewer-async-job-reserves-unique-start-ids-test ()
+(ert-deftest json-log-viewer-log-ingestor-job-carries-line-test ()
   (let ((buf (json-log-viewer-make-buffer
               "*json-log-viewer-reserve-ids-test*"
               :log-lines nil
@@ -290,17 +290,14 @@
               :streaming t)))
     (unwind-protect
         (with-current-buffer buf
-          (let* ((job-a (json-log-viewer--make-async-job
-                         'append
-                         '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"a\"}")
-                         nil))
-                 (job-b (json-log-viewer--make-async-job
-                         'append
-                         '("{\"timestamp\":\"2026-01-01T00:00:01Z\",\"msg\":\"b\"}")
-                         nil)))
-            (should (= 0 (plist-get job-a :start-id)))
-            (should (= 1 (plist-get job-b :start-id)))
-            (should (= 2 json-log-viewer--next-entry-id))))
+          (let* ((line-a "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"a\"}")
+                 (line-b "{\"timestamp\":\"2026-01-01T00:00:01Z\",\"msg\":\"b\"}")
+                 (job-a (json-log-viewer--make-log-ingestor-async-job 'ingest line-a))
+                 (job-b (json-log-viewer--make-log-ingestor-async-job 'ingest line-b)))
+            (should (eq (plist-get job-a :op) 'ingest))
+            (should (equal (plist-get job-a :line) line-a))
+            (should (equal (plist-get job-b :line) line-b))
+            (should (stringp (plist-get job-a :worker-file)))))
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
@@ -466,11 +463,14 @@
         (kill-buffer buf)))))
 
 (ert-deftest json-log-viewer-stream-evicts-in-chunks-test ()
-  (let* ((json-log-viewer-stream-chunk-size 100)
+  (let* ((json-log-viewer-stream-chunk-size 50)
          (lines (let (acc)
-                  (dotimes (i 1001)
-                    (push (format "{\"timestamp\":\"2026-01-01T00:00:%02dZ\",\"msg\":\"m-%d\"}"
-                                  (mod i 60) i)
+                  (dotimes (i 301)
+                    (push (format "{\"timestamp\":\"2026-01-01T%02d:%02d:%02dZ\",\"msg\":\"m-%d\"}"
+                                  (mod (/ i 3600) 24)
+                                  (mod (/ i 60) 60)
+                                  (mod i 60)
+                                  i)
                           acc))
                   (nreverse acc)))
          (buf (json-log-viewer-make-buffer
@@ -480,15 +480,15 @@
                :level-path "level"
                :message-path "msg"
                :streaming t
-               :max-entries 1000)))
+               :max-entries 300)))
     (unwind-protect
         (with-current-buffer buf
           (json-log-viewer-push buf lines)
-          (should (= json-log-viewer--entry-count 901))
+          (should (= json-log-viewer--entry-count 251))
           (let ((stored (json-log-viewer-current-log-lines buf)))
-            (should (= (length stored) 901))
-            (should (string-match-p "\"m-100\"" (car stored)))
-            (should (string-match-p "\"m-1000\"" (car (last stored))))))
+            (should (= (length stored) 251))
+            (should (string-match-p "\"m-50\"" (car stored)))
+            (should (string-match-p "\"m-300\"" (car (last stored))))))
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
