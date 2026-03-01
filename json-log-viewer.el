@@ -139,11 +139,8 @@ to `js-mode`."
 (defvar-local json-log-viewer--direction 'newest-first
   "Non-streaming direction: `newest-first' or `oldest-first'.")
 
-(defvar-local json-log-viewer--live-narrow-max-rows 2000
-  "Maximum row count that allows live narrowing updates.")
-
-(defvar-local json-log-viewer--live-narrow-debounce 0.2
-  "Idle seconds before applying live narrowing updates.")
+(defvar-local json-log-viewer--narrow-rebuild-in-progress nil
+  "Non-nil while async narrow/widen rebuild is replacing rendered rows.")
 
 (defvar-local json-log-viewer--sqlite-db nil
   "SQLite database handle for storage backend, or nil.")
@@ -358,9 +355,20 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
           json-text
           json-log-viewer--json-paths))))))
 
-(defun json-log-viewer--storage-matching-signatures (_needle)
-  "Return nil so filtering falls back to visible summary text matching."
-  nil)
+(defun json-log-viewer--storage-matching-signatures (needle)
+  "Return hash table of matching entry signatures for NEEDLE from sqlite storage."
+  (when (and json-log-viewer--sqlite-db
+             (stringp needle)
+             (not (string-empty-p needle)))
+    (let ((matches (make-hash-table :test 'equal)))
+      (dolist (row (sqlite-select json-log-viewer--sqlite-db
+                                  (concat
+                                   "SELECT id FROM log_entry "
+                                   "WHERE instr(lower(json), ?) > 0")
+                                  (vector needle)))
+        (when-let ((id (car row)))
+          (puthash (number-to-string id) t matches)))
+      matches)))
 
 (defun json-log-viewer--async-worker-file ()
   "Return a readable path to `json-log-viewer-async-worker.el'."
@@ -414,16 +422,36 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
           :extra-fields extra-fields
           :storage-populated t)))
 
+(defun json-log-viewer--worker-entries->entries (worker-entries)
+  "Normalize WORKER-ENTRIES list into renderable entry plists."
+  (mapcar #'json-log-viewer--worker-entry->entry (or worker-entries nil)))
+
 (defun json-log-viewer--async-handle-result (result)
   "Handle log-ingestor queue RESULT in current viewer buffer."
   (if (and (listp result) (eq (car result) :error))
-      (message "json-log-viewer async worker error: %s" (or (cadr result) "unknown error"))
+      (progn
+        (setq json-log-viewer--narrow-rebuild-in-progress nil)
+        (message "json-log-viewer async worker error: %s" (or (cadr result) "unknown error")))
     (pcase (plist-get result :op)
       ('reset nil)
       ('ingest
-       (when-let ((entry (plist-get result :entry)))
+       (when (and (not json-log-viewer--narrow-rebuild-in-progress)
+                  (plist-get result :entry))
          (json-log-viewer-append-entries
-          (list (json-log-viewer--worker-entry->entry entry)))))
+          (list (json-log-viewer--worker-entry->entry
+                 (plist-get result :entry))))))
+      ('narrow
+       (setq json-log-viewer--narrow-rebuild-in-progress nil)
+       (json-log-viewer-replace-entries
+        (json-log-viewer--worker-entries->entries (plist-get result :entries))
+        t
+        t))
+      ('widen
+       (setq json-log-viewer--narrow-rebuild-in-progress nil)
+       (json-log-viewer-replace-entries
+        (json-log-viewer--worker-entries->entries (plist-get result :entries))
+        nil
+        t))
       (op
        (message "json-log-viewer async worker returned unknown op: %S" op)))))
 
@@ -495,10 +523,18 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
                              (max 0 (1- json-log-viewer--trunkator-async-pending-count)))
                        (json-log-viewer--trunkator-async-handle-result result))))))))
 
-(defun json-log-viewer--make-log-ingestor-async-job (op line)
+(defun json-log-viewer--normalize-narrow-string (&optional needle)
+  "Normalize NEEDLE into a downcased substring filter, or nil when empty."
+  (let ((normalized (string-trim (or needle ""))))
+    (unless (string-empty-p normalized)
+      (downcase normalized))))
+
+(defun json-log-viewer--make-log-ingestor-async-job (op line &optional narrow-string)
   "Build log-ingestor async queue payload for OP and LINE."
   (list :op op
         :line line
+        :narrow-string (json-log-viewer--normalize-narrow-string
+                        (or narrow-string json-log-viewer--filter-string))
         :worker-file (json-log-viewer--async-worker-file)
         :timestamp-path json-log-viewer--timestamp-path
         :level-path json-log-viewer--level-path
@@ -523,6 +559,10 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
      (json-log-viewer--make-log-ingestor-async-job
       'ingest
       (if (listp payload) (car payload) payload)))
+    ('narrow
+     (json-log-viewer--make-log-ingestor-async-job 'narrow nil payload))
+    ('widen
+     (json-log-viewer--make-log-ingestor-async-job 'widen nil nil))
     ('replace
      (json-log-viewer--make-log-ingestor-async-job 'reset nil))
     (_
@@ -1090,6 +1130,16 @@ Returns cons cell (ENTRIES . NEXT-ID)."
   (setq json-log-viewer--entry-count 0)
   (setq json-log-viewer--current-line-overlay nil))
 
+(defun json-log-viewer--clear-rendered-buffer ()
+  "Clear rendered entries while preserving sqlite storage."
+  (let ((inhibit-read-only t))
+    (json-log-viewer--clear-overlays)
+    (erase-buffer)
+    (setq json-log-viewer--seen-signatures (make-hash-table :test 'equal))
+    (json-log-viewer--refresh-header)
+    (goto-char (point-min))
+    (json-log-viewer--highlight-current-line)))
+
 (defun json-log-viewer--entry-summary-end (entry-overlay)
   "Return end position of ENTRY-OVERLAY summary line."
   (save-excursion
@@ -1259,6 +1309,11 @@ When VISIBLE-ONLY is non-nil, return only currently visible entries."
    (regexp-quote needle)
    (or (json-log-viewer--storage-entry-filter-text entry-overlay) "")))
 
+(defun json-log-viewer--filter-managed-by-ingestor-p ()
+  "Return non-nil when active narrowing is handled by async log ingestor."
+  (and json-log-viewer--sqlite-file
+       json-log-viewer--log-ingestor-async-queue))
+
 (defun json-log-viewer--apply-filter ()
   "Apply active filter to entry overlays in current buffer."
   (let* ((needle (and json-log-viewer--filter-string
@@ -1270,6 +1325,7 @@ When VISIBLE-ONLY is non-nil, return only currently visible entries."
     (dolist (entry-overlay json-log-viewer--entry-overlays)
       (let ((invisible
              (if (and active
+                      (not (json-log-viewer--filter-managed-by-ingestor-p))
                       (if matching-signatures
                           (not (gethash (overlay-get entry-overlay 'json-log-viewer-signature)
                                         matching-signatures))
@@ -1285,11 +1341,17 @@ When VISIBLE-ONLY is non-nil, return only currently visible entries."
   (let* ((needle (and json-log-viewer--filter-string
                       (string-trim json-log-viewer--filter-string)))
          (normalized (and needle (downcase needle)))
-         (active (and normalized (not (string-empty-p normalized)))))
+         (active (and normalized (not (string-empty-p normalized))))
+         (matching-signatures (and active
+                                   (json-log-viewer--storage-matching-signatures normalized))))
     (dolist (entry-overlay overlays)
       (let ((invisible
              (if (and active
-                      (not (json-log-viewer--filter-match-p entry-overlay normalized)))
+                      (not (json-log-viewer--filter-managed-by-ingestor-p))
+                      (if matching-signatures
+                          (not (gethash (overlay-get entry-overlay 'json-log-viewer-signature)
+                                        matching-signatures))
+                        (not (json-log-viewer--filter-match-p entry-overlay normalized))))
                  'json-log-viewer-filter
                nil)))
         (overlay-put entry-overlay 'invisible invisible)
@@ -1304,11 +1366,16 @@ When VISIBLE-ONLY is non-nil, return only currently visible entries."
     (json-log-viewer--apply-filter)
     (json-log-viewer--highlight-current-line)))
 
-(defun json-log-viewer--live-preview-filter (buffer needle)
-  "Apply preview NEEDLE in viewer BUFFER."
-  (when (buffer-live-p buffer)
-    (with-current-buffer buffer
-      (json-log-viewer--set-filter needle))))
+(defun json-log-viewer--request-narrow-rebuild (op &optional needle wait-for-callback)
+  "Request async log-ingestor OP rebuild with NEEDLE.
+
+When WAIT-FOR-CALLBACK is non-nil, block until callback is applied."
+  (json-log-viewer--ensure-async-queue-running)
+  (setq json-log-viewer--narrow-rebuild-in-progress t)
+  (json-log-viewer--clear-rendered-buffer)
+  (json-log-viewer--async-submit
+   (json-log-viewer--make-log-ingestor-async-job op nil needle)
+   wait-for-callback))
 
 (defun json-log-viewer--visible-entry-count ()
   "Return number of visible rendered entries in current buffer."
@@ -1467,64 +1534,25 @@ When VISIBLE-ONLY is non-nil, return only currently visible entries."
                           'face 'json-log-viewer-header-value-face)))
 
 (defun json-log-viewer-narrow ()
-  "Hide entries whose fields do not contain a minibuffer substring.
-
-When result size allows it, updates are previewed live while typing."
+  "Narrow rendered entries to rows whose stored JSON contains a substring."
   (interactive)
-  (let* ((results-buffer (current-buffer))
-         (original-filter json-log-viewer--filter-string)
-         (row-count json-log-viewer--entry-count)
-         (live-enabled (or (null json-log-viewer--live-narrow-max-rows)
-                           (<= row-count json-log-viewer--live-narrow-max-rows)))
-         (debounce (max 0 (or json-log-viewer--live-narrow-debounce 0)))
-         (committed nil)
-         (timer nil)
-         (prompt (if live-enabled
-                     "Narrow to string: "
-                   (format "Narrow to string (live disabled above %d rows): "
-                           json-log-viewer--live-narrow-max-rows))))
-    (unwind-protect
-        (let ((needle
-               (minibuffer-with-setup-hook
-                   (lambda ()
-                     (when live-enabled
-                       (add-hook
-                        'post-command-hook
-                        (lambda ()
-                          (let ((input (string-trim (minibuffer-contents-no-properties))))
-                            (if (<= debounce 0)
-                                (json-log-viewer--live-preview-filter results-buffer input)
-                              (when timer
-                                (cancel-timer timer))
-                              (setq timer
-                                    (run-with-idle-timer
-                                     debounce nil
-                                     #'json-log-viewer--live-preview-filter
-                                     results-buffer input)))))
-                        nil t)))
-                 (read-string prompt (or original-filter "")))))
-          (setq needle (string-trim needle))
-          (when (string-empty-p needle)
-            (json-log-viewer--set-filter original-filter)
-            (user-error "Narrow string cannot be empty"))
-          (json-log-viewer--set-filter needle)
-          (json-log-viewer--refresh-header)
-          (setq committed t)
-          (message "Narrowed to \"%s\" (%d visible row(s))"
-                   needle
-                   (json-log-viewer--visible-entry-count)))
-      (when timer
-        (cancel-timer timer))
-      (unless committed
-        (json-log-viewer--set-filter original-filter)))))
+  (let ((needle (string-trim
+                 (read-string "Narrow to string: "
+                              (or json-log-viewer--filter-string "")))))
+    (when (string-empty-p needle)
+      (user-error "Narrow string cannot be empty"))
+    (setq json-log-viewer--filter-string needle)
+    (json-log-viewer--refresh-header)
+    (json-log-viewer--request-narrow-rebuild 'narrow needle)
+    (message "Narrowing to \"%s\"..." needle)))
 
 (defun json-log-viewer-widen ()
-  "Clear filter and show all entries."
+  "Clear active narrowing and replay all stored entries."
   (interactive)
   (setq json-log-viewer--filter-string nil)
-  (json-log-viewer--apply-filter)
   (json-log-viewer--refresh-header)
-  (message "Narrowing cleared"))
+  (json-log-viewer--request-narrow-rebuild 'widen nil)
+  (message "Widening..."))
 
 (defun json-log-viewer-toggle-auto-follow ()
   "Toggle automatic scrolling to newest entries."
@@ -1763,9 +1791,7 @@ In non-streaming mode the append position follows configured direction."
                                        streaming
                                        (max-entries json-log-viewer-stream-max-entries)
                                        (direction 'newest-first)
-                                       header-lines-function
-                                       (live-narrow-max-rows 2000)
-                                       (live-narrow-debounce 0.2))
+                                       header-lines-function)
   "Create BUFFER-NAME for JSON LOG-LINES.
 
 Summary rendering is configured with explicit JSON paths.
@@ -1818,8 +1844,7 @@ Returns the created buffer."
       (setq-local json-log-viewer--direction normalized-direction)
       (setq-local json-log-viewer--context nil)
       (setq-local json-log-viewer--metadata nil)
-      (setq-local json-log-viewer--live-narrow-max-rows live-narrow-max-rows)
-      (setq-local json-log-viewer--live-narrow-debounce live-narrow-debounce)
+      (setq-local json-log-viewer--narrow-rebuild-in-progress nil)
       (setq-local json-log-viewer--entry-count 0)
       (setq-local json-log-viewer--stream-assume-ordered streaming)
       (setq-local json-log-viewer--stream-max-entries max-entries)

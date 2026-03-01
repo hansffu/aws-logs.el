@@ -89,20 +89,6 @@ message, for example: [service] [class]."
   :type '(choice (const :tag "None" nil) (repeat string))
   :group 'aws-logs)
 
-(defcustom aws-logs-insights-live-narrow-max-rows 2000
-  "Maximum number of Insights rows that allow live narrowing updates.
-
-When an Insights results buffer has more rows than this value, `C-c C-n`
-still prompts for a filter but only applies it once after RET.
-Set to nil to always allow live updates."
-  :type '(choice (const :tag "No limit" nil) integer)
-  :group 'aws-logs)
-
-(defcustom aws-logs-insights-live-narrow-debounce 0.2
-  "Idle seconds to wait before applying live Insights narrowing updates."
-  :type 'number
-  :group 'aws-logs)
-
 (defcustom aws-logs-insights-refresh-overlap-seconds 2
   "Seconds of overlap used for incremental Insights refresh windows.
 

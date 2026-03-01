@@ -329,62 +329,60 @@
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
-(ert-deftest json-log-viewer-toggle-all-respects-current-filter-visibility-test ()
+(ert-deftest json-log-viewer-narrow-replays-matches-from-stored-json-test ()
   (let* ((buf (json-log-viewer-make-buffer
-               "*json-log-viewer-toggle-all-filter-test*"
+               "*json-log-viewer-narrow-replay-test*"
+               :log-lines
+               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"level\":\"info\",\"msg\":\"alpha\",\"payload\":{\"db\":\"orders\"}}"
+                 "{\"timestamp\":\"2026-01-01T00:00:01Z\",\"level\":\"info\",\"msg\":\"hidden-db-hit\",\"payload\":{\"db\":\"needle\"}}"
+                 "{\"timestamp\":\"2026-01-01T00:00:02Z\",\"level\":\"info\",\"msg\":\"needle-visible\",\"payload\":{\"db\":\"payments\"}}")
+               :timestamp-path "timestamp"
+               :level-path "level"
+               :message-path "msg"
+               :streaming t)))
+    (unwind-protect
+        (with-current-buffer buf
+          (setq json-log-viewer--filter-string "needle")
+          (json-log-viewer--request-narrow-rebuild 'narrow "needle" t)
+          (should (= json-log-viewer--entry-count 2))
+          (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+            ;; Verifies narrowing uses stored JSON body, not only visible summary.
+            (should (string-match-p "hidden-db-hit" text))
+            (should (string-match-p "needle-visible" text))
+            (should-not (string-match-p "alpha" text)))
+          (json-log-viewer-push
+           buf
+           '("{\"timestamp\":\"2026-01-01T00:00:03Z\",\"level\":\"info\",\"msg\":\"hidden-db-new\",\"payload\":{\"db\":\"needle\"}}"
+             "{\"timestamp\":\"2026-01-01T00:00:04Z\",\"level\":\"info\",\"msg\":\"ignore-new\",\"payload\":{\"db\":\"payments\"}}"))
+          (should (= json-log-viewer--entry-count 3))
+          (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+            (should (string-match-p "hidden-db-new" text))
+            (should-not (string-match-p "ignore-new" text))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest json-log-viewer-widen-replays-all-stored-json-rows-test ()
+  (let* ((buf (json-log-viewer-make-buffer
+               "*json-log-viewer-widen-replay-test*"
                :log-lines
                '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"level\":\"info\",\"msg\":\"alpha\"}"
-                 "{\"timestamp\":\"2026-01-01T00:00:01Z\",\"level\":\"info\",\"msg\":\"beta\"}"
+                 "{\"timestamp\":\"2026-01-01T00:00:01Z\",\"level\":\"info\",\"msg\":\"hidden-db-hit\",\"payload\":{\"db\":\"needle\"}}"
                  "{\"timestamp\":\"2026-01-01T00:00:02Z\",\"level\":\"info\",\"msg\":\"gamma\"}")
                :timestamp-path "timestamp"
                :level-path "level"
                :message-path "msg"
-               :streaming nil)))
+               :streaming t)))
     (unwind-protect
         (with-current-buffer buf
-          (json-log-viewer--set-filter "beta")
-          (json-log-viewer-toggle-all)
-          (let ((visible 0)
-                (visible-expanded 0)
-                (hidden-expanded 0))
-            (dolist (entry-ov json-log-viewer--entry-overlays)
-              (let ((expanded (overlay-get entry-ov 'json-log-viewer-entry-expanded)))
-                (if (overlay-get entry-ov 'invisible)
-                    (when expanded
-                      (setq hidden-expanded (1+ hidden-expanded)))
-                  (setq visible (1+ visible))
-                  (when expanded
-                    (setq visible-expanded (1+ visible-expanded))))))
-            (should (= visible 1))
-            (should (= visible-expanded 1))
-            (should (= hidden-expanded 0))))
-      (when (buffer-live-p buf)
-        (kill-buffer buf)))))
-
-(ert-deftest json-log-viewer-filter-hides-expanded-fold-overlay-test ()
-  (let* ((buf (json-log-viewer-make-buffer
-               "*json-log-viewer-filter-fold-overlay-test*"
-               :log-lines
-               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"level\":\"info\",\"msg\":\"alpha\"}"
-                 "{\"timestamp\":\"2026-01-01T00:00:01Z\",\"level\":\"info\",\"msg\":\"beta\"}")
-               :timestamp-path "timestamp"
-               :level-path "level"
-               :message-path "msg"
-               :direction 'oldest-first
-               :streaming nil)))
-    (unwind-protect
-        (with-current-buffer buf
-          (goto-char (point-min))
-          (json-log-viewer-toggle-entry)
-          (let ((first (car (json-log-viewer--entry-overlays-in-buffer-order)))
-                (second (cadr (json-log-viewer--entry-overlays-in-buffer-order))))
-            (should (overlay-get first 'json-log-viewer-entry-expanded))
-            (json-log-viewer--set-filter "beta")
-            (should (eq (overlay-get first 'invisible) 'json-log-viewer-filter))
-            (should-not (overlay-get second 'invisible))
-            (let ((fold-ov (overlay-get first 'json-log-viewer-fold-overlay)))
-              (should (overlayp fold-ov))
-              (should (eq (overlay-get fold-ov 'invisible) 'json-log-viewer-filter)))))
+          (setq json-log-viewer--filter-string "needle")
+          (json-log-viewer--request-narrow-rebuild 'narrow "needle" t)
+          (should (= json-log-viewer--entry-count 1))
+          (json-log-viewer-widen)
+          (should (= json-log-viewer--entry-count 3))
+          (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+            (should (string-match-p "alpha" text))
+            (should (string-match-p "hidden-db-hit" text))
+            (should (string-match-p "gamma" text))))
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 

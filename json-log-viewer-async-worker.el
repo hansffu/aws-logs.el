@@ -25,6 +25,12 @@
    ((null value) nil)
    (t (format "%s" value))))
 
+(defun json-log-viewer-async-worker--normalize-narrow-string (needle)
+  "Normalize NEEDLE into downcased substring matching text, or nil."
+  (let ((normalized (string-trim (or needle ""))))
+    (unless (string-empty-p normalized)
+      (downcase normalized))))
+
 (defun json-log-viewer-async-worker--parse-line (line)
   "Parse JSON LINE into an alist/list structure, or nil."
   (when (stringp line)
@@ -374,8 +380,15 @@ Use `\\.' in PATH for literal dots in JSON keys."
           :message message
           :extra-fields (nreverse extra-fields))))
 
-(defun json-log-viewer-async-worker--sqlite-insert-log-entry (db line config)
-  "Insert one LINE into DB and return summary plist."
+(defun json-log-viewer-async-worker--json-matches-narrow-p (json-text narrow-string)
+  "Return non-nil when JSON-TEXT contains NARROW-STRING."
+  (or (null narrow-string)
+      (and (stringp json-text)
+           (string-match-p (regexp-quote narrow-string)
+                           (downcase json-text)))))
+
+(defun json-log-viewer-async-worker--sqlite-insert-log-entry (db line config &optional narrow-string)
+  "Insert one LINE into DB and return summary plist when it matches NARROW-STRING."
   (let* ((summary (json-log-viewer-async-worker--line->summary line config))
          (parsed (plist-get summary :parsed))
          (timestamp-epoch (plist-get summary :timestamp-epoch))
@@ -385,11 +398,42 @@ Use `\\.' in PATH for literal dots in JSON keys."
      "INSERT INTO log_entry(timestamp, json) VALUES (?, ?)"
      (vector timestamp-epoch storage-json))
     (let ((id (car (car (sqlite-select db "SELECT last_insert_rowid()")))))
-      (list :id id
-            :timestamp (plist-get summary :timestamp)
-            :level (plist-get summary :level)
-            :message (plist-get summary :message)
-            :extra-fields (plist-get summary :extra-fields)))))
+      (when (json-log-viewer-async-worker--json-matches-narrow-p storage-json narrow-string)
+        (list :id id
+              :timestamp (plist-get summary :timestamp)
+              :level (plist-get summary :level)
+              :message (plist-get summary :message)
+              :extra-fields (plist-get summary :extra-fields))))))
+
+(defun json-log-viewer-async-worker--json-text->entry (id json-text config)
+  "Build summary entry for DB row ID and JSON-TEXT using CONFIG."
+  (let ((summary (json-log-viewer-async-worker--line->summary json-text config)))
+    (list :id id
+          :timestamp (plist-get summary :timestamp)
+          :level (plist-get summary :level)
+          :message (plist-get summary :message)
+          :extra-fields (plist-get summary :extra-fields))))
+
+(defun json-log-viewer-async-worker--sqlite-select-entries (db config &optional narrow-string)
+  "Return ordered summary entries from DB using CONFIG and NARROW-STRING."
+  (let* ((rows (if narrow-string
+                   (sqlite-select
+                    db
+                    (concat
+                     "SELECT id, json FROM log_entry "
+                     "WHERE instr(lower(json), ?) > 0 "
+                     "ORDER BY id")
+                    (vector narrow-string))
+                 (sqlite-select
+                  db
+                  "SELECT id, json FROM log_entry ORDER BY id")))
+         entries)
+    (dolist (row rows)
+      (let ((id (nth 0 row))
+            (json-text (nth 1 row)))
+        (push (json-log-viewer-async-worker--json-text->entry id json-text config)
+              entries)))
+    (nreverse entries)))
 
 (defun json-log-viewer-async-worker--sqlite-truncate-oldest (db count)
   "Delete COUNT oldest rows from DB ordered by timestamp then id."
@@ -462,7 +506,9 @@ Use `\\.' in PATH for literal dots in JSON keys."
   "Process one LOG-INGESTOR JOB payload."
   (let* ((op (or (plist-get job :op) 'ingest))
          (sqlite-file (plist-get job :sqlite-file))
-         (config (json-log-viewer-async-worker--config-from-job job)))
+         (config (json-log-viewer-async-worker--config-from-job job))
+         (narrow-string (json-log-viewer-async-worker--normalize-narrow-string
+                         (plist-get job :narrow-string))))
     (unless sqlite-file
       (error "Log-ingestor worker missing sqlite support"))
     (pcase op
@@ -482,7 +528,25 @@ Use `\\.' in PATH for literal dots in JSON keys."
                 sqlite-file
                 (lambda (db)
                   (json-log-viewer-async-worker--sqlite-insert-log-entry
-                   db line config))))))
+                   db line config narrow-string))))))
+      ('narrow
+       (unless narrow-string
+         (error "Log-ingestor narrow op requires :narrow-string"))
+       (list :op 'narrow
+             :entries
+             (json-log-viewer-async-worker--sqlite-run-transaction
+              sqlite-file
+              (lambda (db)
+                (json-log-viewer-async-worker--sqlite-select-entries
+                 db config narrow-string)))))
+      ('widen
+       (list :op 'widen
+             :entries
+             (json-log-viewer-async-worker--sqlite-run-transaction
+              sqlite-file
+              (lambda (db)
+                (json-log-viewer-async-worker--sqlite-select-entries
+                 db config nil)))))
       (_
        (error "Unknown log-ingestor op: %S" op)))))
 
