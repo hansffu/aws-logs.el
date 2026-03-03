@@ -77,6 +77,21 @@ When non-nil, output is piped through grep with this regex."
   :type '(choice (const :tag "No filter" nil) string)
   :group 'kube-logs)
 
+(defcustom kube-logs-level-path nil
+  "Path to the level"
+  :type 'string
+  :group 'kube-logs)
+
+(defcustom kube-logs-message-path nil
+  "Path to the message"
+  :type 'string
+  :group 'kube-logs)
+
+(defcustom kube-logs-extra-paths '()
+  "Path to the extra tags"
+  :type '(repeat string)
+  :group 'kube-logs)
+
 (defgroup kube-logs nil
   "Kubernetes logs transient UI and rendering."
   :group 'tools)
@@ -238,11 +253,14 @@ Signals `user-error' on failure."
   (append
    (kube-logs--context-args)
    (list "logs" (kube-logs--target-ref))
+   (when (equal kube-logs-target-kind "deployment")
+     (list "--all-pods"))
    (when kube-logs-namespace-enabled
      (progn
        (when (or (null kube-logs-namespace) (string-empty-p kube-logs-namespace))
          (user-error "Set a namespace first or disable namespace override with -n"))
        (list "--namespace" kube-logs-namespace)))
+   (list "--prefix")
    (list "--timestamps")
    (when kube-logs-follow
      (list "--follow"))
@@ -250,6 +268,17 @@ Signals `user-error' on failure."
      (list (format "--tail=%s" kube-logs-tail-lines)))
    (when (and kube-logs-since (not (string-empty-p kube-logs-since)))
      (list (format "--since=%s" kube-logs-since)))))
+
+(defun kube-logs--strip-kubectl-prefix (line)
+  "Drop kubectl --prefix fields from LINE by finding the first timestamp token."
+  (let* ((tokens (split-string line "[[:space:]]+" t))
+         (rest tokens))
+    (while (and rest
+                (not (ignore-errors (date-to-time (car rest)))))
+      (setq rest (cdr rest)))
+    (if (and rest (not (eq rest tokens)))
+        (string-join rest " ")
+      line)))
 
 (defun kube-logs--target-description ()
   "Return one-line target description for transient."
@@ -278,12 +307,12 @@ Signals `user-error' on failure."
           kube-logs--viewer-namespace-enabled
           kube-logs--viewer-namespace))
    (cons "Target" (format "%s/%s"
-                           (or kube-logs--viewer-target-kind "-")
-                           (or kube-logs--viewer-target "-")))
+                          (or kube-logs--viewer-target-kind "-")
+                          (or kube-logs--viewer-target "-")))
    (cons "Follow" (if kube-logs--viewer-follow "yes" "no"))
    (cons "Tail" (if kube-logs--viewer-tail
-                     (number-to-string kube-logs--viewer-tail)
-                   "none"))
+                    (number-to-string kube-logs--viewer-tail)
+                  "none"))
    (cons "Since" (or kube-logs--viewer-since "none"))
    (cons "Filter" (or kube-logs-filter "none"))))
 
@@ -346,9 +375,9 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
            buffer-name
            :log-lines (or initial-lines nil)
            :timestamp-path "timestamp"
-           :level-path "level"
-           :message-path "message"
-           :extra-paths '("namespace" "target" "kind")
+           :level-path kube-logs-level-path
+           :message-path kube-logs-message-path
+           :extra-paths kube-logs-extra-paths
            :streaming streaming
            :direction 'oldest-first
            :header-lines-function #'kube-logs--viewer-header-lines))
@@ -377,33 +406,6 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
                            :null-object nil :false-object :false)
       (error nil))))
 
-(defun kube-logs--value->string (value)
-  "Convert VALUE into a display string."
-  (cond
-   ((stringp value) value)
-   ((numberp value) (number-to-string value))
-   ((eq value t) "true")
-   ((eq value :false) "false")
-   ((null value) nil)
-   (t (format "%s" value))))
-
-(defun kube-logs--alist-get-any (node key)
-  "Return KEY from alist-like NODE using string/symbol lookup."
-  (when (listp node)
-    (or (alist-get key node nil nil #'equal)
-        (when-let ((sym (intern-soft key)))
-          (alist-get sym node)))))
-
-(defun kube-logs--extract-first-field (node candidates)
-  "Extract first non-empty field from NODE matching CANDIDATES."
-  (catch 'found
-    (dolist (candidate candidates)
-      (when-let ((value (kube-logs--value->string
-                         (kube-logs--alist-get-any node candidate))))
-        (unless (string-empty-p value)
-          (throw 'found value))))
-    nil))
-
 (defun kube-logs--split-timestamp-prefix (line)
   "Split LINE into (TIMESTAMP . MESSAGE) when timestamp prefix exists."
   (if (and (stringp line)
@@ -419,32 +421,19 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
   "Convert one kubectl log LINE into one JSON line for json-log-viewer."
   (let* ((clean (string-trim-right (or line "") "\r")))
     (unless (string-empty-p clean)
-      (let* ((split (kube-logs--split-timestamp-prefix clean))
+      (let* ((without-prefix (kube-logs--strip-kubectl-prefix clean))
+             (split (kube-logs--split-timestamp-prefix without-prefix))
              (timestamp (car split))
              (message (or (cdr split) ""))
              (parsed (kube-logs--parse-json-maybe message))
-             (level (and parsed
-                         (kube-logs--extract-first-field
-                          parsed
-                          '("level" "severity" "logLevel" "lvl"))))
-             (display-message
-              (or (and parsed
-                       (kube-logs--extract-first-field
-                        parsed
-                        '("message" "msg" "log" "@message")))
-                  message))
              (obj (make-hash-table :test 'equal)))
         (when timestamp
           (puthash "timestamp" timestamp obj))
-        (puthash "message" (or display-message "") obj)
-        (when level
-          (puthash "level" level obj))
-        (puthash "raw" clean obj)
+        (puthash "raw" without-prefix obj)
         (puthash "namespace" (or kube-logs--viewer-namespace kube-logs-namespace "") obj)
         (puthash "target" (or kube-logs--viewer-target kube-logs-target "") obj)
         (puthash "kind" (or kube-logs--viewer-target-kind kube-logs-target-kind "") obj)
-        (when parsed
-          (puthash "payload" parsed obj))
+        (puthash "payload" (or parsed message) obj)
         (json-serialize obj)))))
 
 (defun kube-logs--lines->json-lines (lines)

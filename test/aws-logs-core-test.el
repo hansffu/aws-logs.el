@@ -4,6 +4,7 @@
 (require 'cl-lib)
 
 (require 'json-log-viewer)
+(require 'json-log-viewer-async-worker)
 (require 'aws-logs-insights)
 (require 'aws-logs-tail)
 
@@ -109,6 +110,54 @@
     (should (= 10 (plist-get (car entries) :id)))
     (should (= 11 (plist-get (cadr entries) :id)))))
 
+(ert-deftest json-log-viewer-resolve-path-renders-json-on-one-line-test ()
+  (let* ((parsed (json-parse-string
+                  "{\"payload\":{\"data\":{\"name\":\"alice\"},\"events\":[{\"id\":1},{\"id\":2}]}}"
+                  :object-type 'alist
+                  :array-type 'list))
+         (payload (json-log-viewer--resolve-path parsed "payload"))
+         (data (json-log-viewer--resolve-path parsed "payload.data"))
+         (events (json-log-viewer--resolve-path parsed "payload.events"))
+         (name (json-log-viewer--resolve-path parsed "payload.data.name")))
+    (should (string-match-p "\\`{.*}\\'" payload))
+    (should (string-match-p "\"name\":\"alice\"" payload))
+    (should-not (string-match-p "\n" payload))
+    (should (string-match-p "\\`{.*}\\'" data))
+    (should (string-match-p "\"name\":\"alice\"" data))
+    (should-not (string-match-p "\n" data))
+    (should (string-match-p "\\`\\[.*\\]\\'" events))
+    (should (string-match-p "\"id\":1" events))
+    (should-not (string-match-p "\n" events))
+    (should (equal name "alice"))))
+
+(ert-deftest json-log-viewer-resolve-path-supports-escaped-dot-keys-test ()
+  (let* ((parsed (json-parse-string
+                  "{\"payload\":{\"@timestamp\":\"2026-02-25T16:14:14.455Z\",\"log.level\":\"INFO\",\"service.name\":\"my-service\",\"log.logger\":\"com.example.MyClass\",\"log\":{\"origin\":{\"file\":{\"name\":\"MyClass.kt\"}}}}}"
+                  :object-type 'alist
+                  :array-type 'list))
+         (level (json-log-viewer--resolve-path parsed "payload.log\\.level"))
+         (service (json-log-viewer--resolve-path parsed "payload.service\\.name"))
+         (logger (json-log-viewer--resolve-path parsed "payload.log\\.logger"))
+         (origin-file (json-log-viewer--resolve-path parsed "payload.log.origin.file.name")))
+    (should (equal level "INFO"))
+    (should (equal service "my-service"))
+    (should (equal logger "com.example.MyClass"))
+    (should (equal origin-file "MyClass.kt"))))
+
+(ert-deftest json-log-viewer-async-worker-resolves-escaped-dot-keys-test ()
+  (let* ((line "{\"timestamp\":\"2026-02-25T16:14:14.455Z\",\"payload\":{\"log.level\":\"INFO\",\"message\":\"This is the log message\",\"service.name\":\"my-service\",\"log.logger\":\"com.example.MyClass\"}}")
+         (config '(:timestamp-path "timestamp"
+                   :level-path "payload.log\\.level"
+                   :message-path "payload.message"
+                   :extra-paths ("payload.service\\.name" "payload.log\\.logger")
+                   :json-paths nil))
+         (pair (json-log-viewer-async-worker--line->entry+detail line 42 config))
+         (entry (car pair)))
+    (should (equal (plist-get entry :level) "INFO"))
+    (should (equal (plist-get entry :message) "This is the log message"))
+    (should (equal (plist-get entry :extras)
+                   '("my-service" "com.example.MyClass")))))
+
 (ert-deftest json-log-viewer-parse-time-preserves-subsecond-order-test ()
   (let ((t1 (json-log-viewer--parse-time "2026-01-01T00:00:00.123Z"))
         (t2 (json-log-viewer--parse-time "2026-01-01T00:00:00.124Z")))
@@ -117,6 +166,52 @@
     (should (< t1 t2))
     (should (> (- t2 t1) 0.0009))
     (should (< (- t2 t1) 0.0011))))
+
+(ert-deftest json-log-viewer-json-syntax-mode-default-test ()
+  (should (eq json-log-viewer-json-syntax-mode 'json-ts-mode)))
+
+(ert-deftest json-log-viewer-json-syntax-mode-fallback-test ()
+  (let ((json-log-viewer-json-syntax-mode 'definitely-not-a-real-mode))
+    (let ((value (json-log-viewer--json-value->pretty-string
+                  '((service . "orders") (log . ((level . "ERROR")))))))
+      (should (string-match-p "\"service\": \"orders\"" value))
+      (should (get-text-property 0 'json-log-viewer-json-block value)))
+    (let ((value (json-log-viewer--json-value->pretty-string
+                  '(((externalTransactionId . "c12345d6789")
+                     (loyaltyAccountId . 1))))))
+      (should (string-match-p "\"externalTransactionId\": \"c12345d6789\"" value))
+      (should (string-match-p "\"loyaltyAccountId\": 1" value))
+      (should (get-text-property 0 'json-log-viewer-json-block value)))))
+
+(ert-deftest json-log-viewer-sqlite-storage-offloads-hidden-data-test ()
+  (let* ((buf (json-log-viewer-make-buffer
+               "*json-log-viewer-sqlite-storage-test*"
+               :log-lines
+               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"hello\",\"payload\":{\"service\":\"orders\",\"log\":{\"level\":\"ERROR\"}}}")
+               :timestamp-path "timestamp"
+               :level-path "payload.log.level"
+               :message-path "msg"
+               :json-paths '("payload")
+               :streaming t))
+         sqlite-file)
+    (unwind-protect
+        (with-current-buffer buf
+          (setq sqlite-file json-log-viewer--sqlite-file)
+          (should (stringp sqlite-file))
+          (should (file-exists-p sqlite-file))
+          (let ((entry-ov (car json-log-viewer--entry-overlays)))
+            (should entry-ov)
+            (should-not (overlay-get entry-ov 'json-log-viewer-entry-fields))
+            (should-not (overlay-get entry-ov 'json-log-viewer-filter-text))
+            (json-log-viewer-toggle-entry)
+            (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+              (should (string-match-p "payload:\n{" text))
+              (should (string-match-p "\"service\": \"orders\"" text))))
+          (should (= (length (json-log-viewer-current-log-lines buf)) 1)))
+      (when (buffer-live-p buf)
+        (kill-buffer buf))
+      (when sqlite-file
+        (should-not (file-exists-p sqlite-file))))))
 
 (ert-deftest json-log-viewer-json-refresh-async-sentinel-test ()
   (let* ((buf (json-log-viewer-make-buffer
@@ -162,12 +257,218 @@
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
+(ert-deftest json-log-viewer-stream-message-path-object-renders-json-test ()
+  (let* ((buf (json-log-viewer-make-buffer
+               "*json-log-viewer-stream-message-path-test*"
+               :log-lines nil
+               :timestamp-path "timestamp"
+               :level-path "level"
+               :message-path "payload.data"
+               :streaming t)))
+    (unwind-protect
+        (with-current-buffer buf
+          (json-log-viewer-push
+           buf
+           '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"payload\":{\"data\":{\"name\":\"alice\",\"roles\":[\"admin\"]}}}"))
+          (goto-char (point-min))
+          (let ((summary (buffer-substring-no-properties
+                          (line-beginning-position)
+                          (line-end-position))))
+            (should (string-match-p "\"name\":\"alice\"" summary))
+            (should (string-match-p "\"roles\":\\[\"admin\"\\]" summary))
+            (should-not (string-match-p "\n" summary))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest json-log-viewer-log-ingestor-job-carries-line-test ()
+  (let ((buf (json-log-viewer-make-buffer
+              "*json-log-viewer-reserve-ids-test*"
+              :log-lines nil
+              :timestamp-path "timestamp"
+              :level-path "level"
+              :message-path "msg"
+              :streaming t)))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((line-a "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"a\"}")
+                 (line-b "{\"timestamp\":\"2026-01-01T00:00:01Z\",\"msg\":\"b\"}")
+                 (job-a (json-log-viewer--make-log-ingestor-async-job 'ingest line-a))
+                 (job-b (json-log-viewer--make-log-ingestor-async-job 'ingest line-b)))
+            (should (eq (plist-get job-a :op) 'ingest))
+            (should (equal (plist-get job-a :line) line-a))
+            (should (equal (plist-get job-b :line) line-b))
+            (should (stringp (plist-get job-a :worker-file)))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest json-log-viewer-lazy-details-render-on-toggle-test ()
+  (let* ((buf (json-log-viewer-make-buffer
+               "*json-log-viewer-lazy-details-test*"
+               :log-lines
+               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"level\":\"info\",\"msg\":\"hello\",\"meta\":{\"service\":\"orders\"}}")
+               :timestamp-path "timestamp"
+               :level-path "level"
+               :message-path "msg"
+               :streaming nil)))
+    (unwind-protect
+        (with-current-buffer buf
+          (goto-char (point-min))
+          (let ((entry-ov (car json-log-viewer--entry-overlays)))
+            (should entry-ov)
+            (should-not (overlay-get entry-ov 'json-log-viewer-entry-expanded))
+            (should-not (string-match-p "meta\\.service: orders"
+                                        (buffer-substring-no-properties (point-min) (point-max))))
+            (json-log-viewer-toggle-entry)
+            (should (overlay-get entry-ov 'json-log-viewer-entry-expanded))
+            (should (string-match-p "meta\\.service: orders"
+                                    (buffer-substring-no-properties (point-min) (point-max))))
+            (json-log-viewer-toggle-entry)
+            (should-not (overlay-get entry-ov 'json-log-viewer-entry-expanded))
+            (should-not (string-match-p "meta\\.service: orders"
+                                        (buffer-substring-no-properties (point-min) (point-max))))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest json-log-viewer-narrow-replays-matches-from-stored-json-test ()
+  (let* ((buf (json-log-viewer-make-buffer
+               "*json-log-viewer-narrow-replay-test*"
+               :log-lines
+               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"level\":\"info\",\"msg\":\"alpha\",\"payload\":{\"db\":\"orders\"}}"
+                 "{\"timestamp\":\"2026-01-01T00:00:01Z\",\"level\":\"info\",\"msg\":\"hidden-db-hit\",\"payload\":{\"db\":\"needle\"}}"
+                 "{\"timestamp\":\"2026-01-01T00:00:02Z\",\"level\":\"info\",\"msg\":\"needle-visible\",\"payload\":{\"db\":\"payments\"}}")
+               :timestamp-path "timestamp"
+               :level-path "level"
+               :message-path "msg"
+               :streaming t)))
+    (unwind-protect
+        (with-current-buffer buf
+          (setq json-log-viewer--filter-string "needle")
+          (json-log-viewer--request-narrow-rebuild 'narrow "needle" t)
+          (should (= json-log-viewer--entry-count 2))
+          (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+            ;; Verifies narrowing uses stored JSON body, not only visible summary.
+            (should (string-match-p "hidden-db-hit" text))
+            (should (string-match-p "needle-visible" text))
+            (should-not (string-match-p "alpha" text)))
+          (json-log-viewer-push
+           buf
+           '("{\"timestamp\":\"2026-01-01T00:00:03Z\",\"level\":\"info\",\"msg\":\"hidden-db-new\",\"payload\":{\"db\":\"needle\"}}"
+             "{\"timestamp\":\"2026-01-01T00:00:04Z\",\"level\":\"info\",\"msg\":\"ignore-new\",\"payload\":{\"db\":\"payments\"}}"))
+          (should (= json-log-viewer--entry-count 3))
+          (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+            (should (string-match-p "hidden-db-new" text))
+            (should-not (string-match-p "ignore-new" text))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest json-log-viewer-widen-replays-all-stored-json-rows-test ()
+  (let* ((buf (json-log-viewer-make-buffer
+               "*json-log-viewer-widen-replay-test*"
+               :log-lines
+               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"level\":\"info\",\"msg\":\"alpha\"}"
+                 "{\"timestamp\":\"2026-01-01T00:00:01Z\",\"level\":\"info\",\"msg\":\"hidden-db-hit\",\"payload\":{\"db\":\"needle\"}}"
+                 "{\"timestamp\":\"2026-01-01T00:00:02Z\",\"level\":\"info\",\"msg\":\"gamma\"}")
+               :timestamp-path "timestamp"
+               :level-path "level"
+               :message-path "msg"
+               :streaming t)))
+    (unwind-protect
+        (with-current-buffer buf
+          (setq json-log-viewer--filter-string "needle")
+          (json-log-viewer--request-narrow-rebuild 'narrow "needle" t)
+          (should (= json-log-viewer--entry-count 1))
+          (json-log-viewer-widen)
+          (should (= json-log-viewer--entry-count 3))
+          (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+            (should (string-match-p "alpha" text))
+            (should (string-match-p "hidden-db-hit" text))
+            (should (string-match-p "gamma" text))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest json-log-viewer-json-path-renders-payload-block-test ()
+  (let* ((buf (json-log-viewer-make-buffer
+               "*json-log-viewer-json-path-payload-test*"
+               :log-lines
+               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"hello\",\"payload\":\"{\\\"service\\\":\\\"orders\\\",\\\"log\\\":{\\\"level\\\":\\\"ERROR\\\"}}\"}")
+               :timestamp-path "timestamp"
+               :level-path "payload.log.level"
+               :message-path "msg"
+               :extra-paths '("payload.service")
+               :json-paths '("payload")
+               :streaming nil)))
+    (unwind-protect
+        (with-current-buffer buf
+          (goto-char (point-min))
+          (let ((summary-line (buffer-substring-no-properties
+                               (line-beginning-position)
+                               (line-end-position))))
+            (should (string-match-p "ERROR" summary-line))
+            (should (string-match-p "\\[orders\\]" summary-line)))
+          (json-log-viewer-toggle-entry)
+          (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+            (should (string-match-p "payload:\n{" text))
+            (should (string-match-p "\"service\": \"orders\"" text))
+            (should-not (string-match-p "payload\\.service:" text))
+            (should-not (string-match-p "payload\\.log\\.level:" text))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest json-log-viewer-json-path-renders-nested-block-test ()
+  (let* ((buf (json-log-viewer-make-buffer
+               "*json-log-viewer-json-path-nested-test*"
+               :log-lines
+               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"hello\",\"payload\":{\"service\":\"orders\",\"log\":{\"level\":\"ERROR\"}}}")
+               :timestamp-path "timestamp"
+               :level-path "payload.log.level"
+               :message-path "msg"
+               :json-paths '("payload.log")
+               :streaming nil)))
+    (unwind-protect
+        (with-current-buffer buf
+          (goto-char (point-min))
+          (let ((summary-line (buffer-substring-no-properties
+                               (line-beginning-position)
+                               (line-end-position))))
+            (should (string-match-p "ERROR" summary-line)))
+          (json-log-viewer-toggle-entry)
+          (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+            (should (string-match-p "payload\\.log:\n{" text))
+            (should (string-match-p "\"level\": \"ERROR\"" text))
+            (should-not (string-match-p "payload\\.log\\.level:" text))
+            (should (string-match-p "payload\\.service: orders" text))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest json-log-viewer-json-path-renders-array-block-test ()
+  (let* ((buf (json-log-viewer-make-buffer
+               "*json-log-viewer-json-path-array-test*"
+               :log-lines
+               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"hello\",\"payload\":[{\"externalTransactionId\":\"c12345d6789\",\"loyaltyAccountId\":1}]}")
+               :timestamp-path "timestamp"
+               :message-path "msg"
+               :json-paths '("payload")
+               :streaming nil)))
+    (unwind-protect
+        (with-current-buffer buf
+          (goto-char (point-min))
+          (json-log-viewer-toggle-entry)
+          (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+            (should (string-match-p "payload:\n\\[" text))
+            (should (string-match-p "\"externalTransactionId\": \"c12345d6789\"" text))
+            (should (string-match-p "\"loyaltyAccountId\": 1" text))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
 (ert-deftest json-log-viewer-stream-evicts-in-chunks-test ()
-  (let* ((json-log-viewer-stream-chunk-size 100)
+  (let* ((json-log-viewer-stream-chunk-size 50)
          (lines (let (acc)
-                  (dotimes (i 1001)
-                    (push (format "{\"timestamp\":\"2026-01-01T00:00:%02dZ\",\"msg\":\"m-%d\"}"
-                                  (mod i 60) i)
+                  (dotimes (i 301)
+                    (push (format "{\"timestamp\":\"2026-01-01T%02d:%02d:%02dZ\",\"msg\":\"m-%d\"}"
+                                  (mod (/ i 3600) 24)
+                                  (mod (/ i 60) 60)
+                                  (mod i 60)
+                                  i)
                           acc))
                   (nreverse acc)))
          (buf (json-log-viewer-make-buffer
@@ -177,13 +478,15 @@
                :level-path "level"
                :message-path "msg"
                :streaming t
-               :max-entries 1000)))
+               :max-entries 300)))
     (unwind-protect
         (with-current-buffer buf
           (json-log-viewer-push buf lines)
-          (should (= json-log-viewer--entry-count 901))
-          (should (= json-log-viewer--raw-log-lines-count 901))
-          (should (= (length json-log-viewer--raw-log-line-chunks) 10)))
+          (should (= json-log-viewer--entry-count 251))
+          (let ((stored (json-log-viewer-current-log-lines buf)))
+            (should (= (length stored) 251))
+            (should (string-match-p "\"m-50\"" (car stored)))
+            (should (string-match-p "\"m-300\"" (car (last stored))))))
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 

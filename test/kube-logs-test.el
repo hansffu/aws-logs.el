@@ -39,7 +39,9 @@
     (should (equal (kube-logs--logs-args)
                    '("--context=prod-cluster"
                      "logs" "deployment/payments-api"
+                     "--all-pods"
                      "--namespace" "payments"
+                     "--prefix"
                      "--timestamps"
                      "--follow"
                      "--tail=150"
@@ -57,7 +59,36 @@
     (should (equal (kube-logs--logs-args)
                    '("--context=prod-cluster"
                      "logs" "deployment/payments-api"
+                     "--all-pods"
+                     "--prefix"
                      "--timestamps")))))
+
+(ert-deftest kube-logs-make-viewer-buffer-uses-fixed-summary-paths-test ()
+  (let ((kube-logs-context "dev-cluster")
+        (kube-logs-namespace "payments")
+        (kube-logs-namespace-enabled t)
+        (kube-logs-target-kind "deployment")
+        (kube-logs-target "payments-api")
+        (kube-logs-follow t)
+        (kube-logs-tail-lines 200)
+        (kube-logs-since "10m")
+        captured
+        created-buffer)
+    (unwind-protect
+        (cl-letf (((symbol-function 'json-log-viewer-make-buffer)
+                   (lambda (&rest args)
+                     (setq captured args)
+                     (setq created-buffer (get-buffer-create "*kube-logs-test-viewer*"))))
+                  ((symbol-function 'kube-logs--install-viewer-keymap)
+                   (lambda () nil)))
+          (let ((buf (kube-logs--make-viewer-buffer nil t)))
+            (should (bufferp buf))
+            (should (equal (plist-get (cdr captured) :level-path) "payload.log\\.level"))
+            (should (equal (plist-get (cdr captured) :message-path) "payload.message"))
+            (should (equal (plist-get (cdr captured) :extra-paths)
+                           '("payload.service\\.name" "payload.log\\.logger")))))
+      (when (buffer-live-p created-buffer)
+        (kill-buffer created-buffer)))))
 
 (ert-deftest kube-logs-line->json-line-json-message-test ()
   (with-temp-buffer
@@ -66,12 +97,32 @@
     (setq-local kube-logs--viewer-target "payments-api")
     (let* ((line "2026-01-01T12:00:00Z {\"level\":\"warn\",\"message\":\"boom\"}")
            (json-line (kube-logs--line->json-line line))
-           (parsed (json-parse-string json-line :object-type 'alist)))
+           (parsed (json-parse-string json-line :object-type 'alist))
+           (payload (alist-get 'payload parsed)))
       (should (equal (alist-get 'timestamp parsed) "2026-01-01T12:00:00Z"))
-      (should (equal (alist-get 'level parsed) "warn"))
-      (should (equal (alist-get 'message parsed) "boom"))
+      (should-not (alist-get 'level parsed))
+      (should-not (alist-get 'message parsed))
+      (should (equal (alist-get 'level payload) "warn"))
+      (should (equal (alist-get 'message payload) "boom"))
       (should (equal (alist-get 'namespace parsed) "payments"))
       (should (equal (alist-get 'target parsed) "payments-api")))))
+
+(ert-deftest kube-logs-line->json-line-strips-kubectl-prefix-test ()
+  (with-temp-buffer
+    (setq-local kube-logs--viewer-namespace "payments")
+    (setq-local kube-logs--viewer-target-kind "deployment")
+    (setq-local kube-logs--viewer-target "payments-api")
+    (let* ((line "payments-api-7bbf4c app 2026-01-01T12:00:00Z {\"level\":\"info\",\"message\":\"ok\"}")
+           (json-line (kube-logs--line->json-line line))
+           (parsed (json-parse-string json-line :object-type 'alist))
+           (payload (alist-get 'payload parsed)))
+      (should (equal (alist-get 'timestamp parsed) "2026-01-01T12:00:00Z"))
+      (should-not (alist-get 'level parsed))
+      (should-not (alist-get 'message parsed))
+      (should (equal (alist-get 'level payload) "info"))
+      (should (equal (alist-get 'message payload) "ok"))
+      (should (equal (alist-get 'raw parsed)
+                     "2026-01-01T12:00:00Z {\"level\":\"info\",\"message\":\"ok\"}")))))
 
 (ert-deftest kube-logs-line->json-line-plain-test ()
   (with-temp-buffer
@@ -82,7 +133,8 @@
            (json-line (kube-logs--line->json-line line))
            (parsed (json-parse-string json-line :object-type 'alist)))
       (should-not (alist-get 'timestamp parsed))
-      (should (equal (alist-get 'message parsed) "plain message"))
+      (should-not (alist-get 'message parsed))
+      (should (equal (alist-get 'payload parsed) "plain message"))
       (should (equal (alist-get 'raw parsed) "plain message"))
       (should (equal (alist-get 'kind parsed) "pod")))))
 

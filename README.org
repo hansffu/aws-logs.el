@@ -1,9 +1,10 @@
 #+title: aws-logs.el repository
 
-This repository contains three related Emacs Lisp packages:
+This repository contains four related Emacs Lisp packages:
 
 - ~aws-logs~: transient-driven CloudWatch Logs tooling (tail + Logs Insights).
 - ~kube-logs~: transient-driven Kubernetes logs tooling (pods/deployments via ~kubectl~).
+- ~kafka-logs~: transient-driven Kafka message viewer (via ~kcat~).
 - ~json-log-viewer~: generic foldable JSON log viewer used by ~aws-logs~ and usable standalone.
 
 * Package: aws-logs
@@ -150,6 +151,7 @@ It is callback-driven, keeps runtime state buffer-local, and supports:
  :level-path "level"
  :message-path "msg"
  :extra-paths '("meta.service" "meta.env")
+ :json-paths '("payload" "payload.log")
  :refresh-function (lambda (old-log-lines) old-log-lines)
  :streaming nil
  :direction 'newest-first
@@ -162,6 +164,10 @@ Notes:
 - ~:refresh-function~ receives old raw lines and may return:
   - a new full list of JSON strings (synchronous refresh), or
   - the symbol ~:async~ (caller will update later via ~json-log-viewer-replace-log-lines~ or ~json-log-viewer-push~).
+- ~:json-paths~ renders matching detail paths as pretty JSON blocks with syntax highlighting
+  and suppresses flattened descendant fields for those paths.
+- JSON block highlighting uses ~json-log-viewer-json-syntax-mode~ (default
+  ~json-ts-mode~, with fallback to ~js-mode~ if unavailable).
 - ~:streaming~ controls append semantics:
   - ~nil~: non-streaming order follows ~:direction~.
   - non-~nil~: pushes append to bottom.
@@ -329,3 +335,89 @@ Main transient keys:
 - ~-s~ since
 - ~-f~ toggle follow
 - ~RET~ run logs
+
+* Package: kafka-logs
+
+~kafka-logs~ provides a transient UI for Kafka message consumption via ~kcat~,
+rendered in ~json-log-viewer~.
+
+** Features
+
+- Select a preconfigured connection.
+- Resolve credentials through ~auth-source~.
+- Select topics from cluster metadata.
+- Stream new messages from topic end.
+- Look up messages in a FROM/TO time span.
+- Optional regex filtering with ~grep~.
+- Optional payload decoding mode for JSON message bodies.
+- Configurable summary message JSON path (including nested paths).
+- Configurable summary extra JSON paths.
+- Optional JSON-path detail rendering (for example ~payload~ as pretty JSON block).
+- SQLite-backed hidden-data storage to reduce in-memory growth.
+
+** File
+
+- ~kafka-logs.el~
+
+** Installation
+
+Put ~kafka-logs.el~ and ~json-log-viewer.el~ on your ~load-path~.
+
+** use-package example
+
+#+begin_src emacs-lisp
+(use-package kafka-logs
+  :load-path "~/dev/emacs/aws-logs.el"
+  :commands (kafka-logs)
+  :custom
+  (kafka-logs-kcat "kcat")
+  (kafka-logs-default-connection "prod")
+  (kafka-logs-default-topic "orders.events")
+  (kafka-logs-default-stream t)
+  (kafka-logs-default-message-path "payload.data.name")
+  (kafka-logs-default-extra-paths '("connection" "topic" "partition"))
+  (kafka-logs-default-payload-format 'json)
+  (kafka-logs-default-json-paths '("payload"))
+  :config
+  ;; auth-source lookup (example entry source):
+  ;; machine kafka-prod login app-user password s3cr3t port 9093
+  (kafka-logs-make-connection
+   "prod"
+   :brokers "kafka-prod:9093"
+   :security-protocol "SASL_SSL"
+   :sasl-mechanisms "SCRAM-SHA-512"
+   :auth-source t
+   :properties '(("client.id" . "emacs-kafka-logs"))))
+#+end_src
+
+You can provide explicit auth-source query settings with ~:auth-source~ plist:
+
+#+begin_src emacs-lisp
+(kafka-logs-make-connection
+ "staging"
+ :brokers "kafka-staging:9093"
+ :security-protocol "SASL_SSL"
+ :sasl-mechanisms "PLAIN"
+ :auth-source '(:host "kafka-staging" :port 9093 :user "staging-user"))
+#+end_src
+
+** Usage
+
+Run ~M-x kafka-logs~.
+
+Main transient keys:
+
+- ~c~ select connection
+- ~t~ select topic
+- ~-f~ toggle stream/time-span mode
+- ~a~ set FROM time (time-span mode)
+- ~z~ set TO time (time-span mode)
+- ~-F~ set regex filter
+- ~-M~ set summary message path (for example ~payload~, ~payload.data.name~)
+- ~-j~ set json detail paths (comma-separated, e.g. ~payload,payload.log~)
+- ~-p~ toggle payload format (string/json)
+- ~-m~ set max message count for time-span mode
+- ~RET~ run logs
+
+When the selected message path resolves to a JSON object or array, it is
+rendered as compact one-line JSON in the summary line.

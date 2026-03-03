@@ -89,20 +89,6 @@ message, for example: [service] [class]."
   :type '(choice (const :tag "None" nil) (repeat string))
   :group 'aws-logs)
 
-(defcustom aws-logs-insights-live-narrow-max-rows 2000
-  "Maximum number of Insights rows that allow live narrowing updates.
-
-When an Insights results buffer has more rows than this value, `C-c C-n`
-still prompts for a filter but only applies it once after RET.
-Set to nil to always allow live updates."
-  :type '(choice (const :tag "No limit" nil) integer)
-  :group 'aws-logs)
-
-(defcustom aws-logs-insights-live-narrow-debounce 0.2
-  "Idle seconds to wait before applying live Insights narrowing updates."
-  :type 'number
-  :group 'aws-logs)
-
 (defcustom aws-logs-insights-refresh-overlap-seconds 2
   "Seconds of overlap used for incremental Insights refresh windows.
 
@@ -133,9 +119,46 @@ When non-nil, tail output is piped through grep with this regex."
   :type 'number
   :group 'aws-logs)
 
-(defcustom aws-logs-tail-ecs-batch-max-lines 200
+(defcustom aws-logs-tail-ecs-batch-max-lines 30
   "Maximum queued ECS follow lines before forcing an immediate flush."
   :type 'integer
+  :group 'aws-logs)
+
+(defcustom aws-logs-tail-ecs-normalize-batch-lines 50
+  "Maximum raw ECS lines normalized per idle batch.
+
+Lower values improve UI responsiveness under heavy throughput, while higher
+values maximize throughput."
+  :type 'integer
+  :group 'aws-logs)
+
+(defcustom aws-logs-tail-ecs-chunk-batch-size 3
+  "Maximum process output chunks consumed per idle batch in ECS follow mode.
+
+Lower values reduce single-run latency in the main thread, while higher values
+improve throughput when output arrives very quickly."
+  :type 'integer
+  :group 'aws-logs)
+
+(defcustom aws-logs-tail-ecs-backpressure-high-watermark 800
+  "Pause ECS tail process when pending queue size reaches this threshold.
+
+Set to nil to disable process-level backpressure."
+  :type '(choice (const :tag "Disabled" nil) integer)
+  :group 'aws-logs)
+
+(defcustom aws-logs-tail-ecs-backpressure-low-watermark 200
+  "Resume ECS tail process when pending queue size drops to this threshold.
+
+Should be lower than `aws-logs-tail-ecs-backpressure-high-watermark`."
+  :type 'integer
+  :group 'aws-logs)
+
+(defcustom aws-logs-tail-ecs-work-interval 0.02
+  "Delay in seconds between ECS follow pipeline work batches.
+
+Using a small positive delay avoids deep timer re-entrancy under heavy load."
+  :type 'number
   :group 'aws-logs)
 
 (defcustom aws-logs-default-since aws-logs-since

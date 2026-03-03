@@ -25,8 +25,6 @@
 (defvar aws-logs-summary-level-field)
 (defvar aws-logs-summary-message-field)
 (defvar aws-logs-summary-extra-fields)
-(defvar aws-logs-insights-live-narrow-max-rows)
-(defvar aws-logs-insights-live-narrow-debounce)
 (defvar aws-logs-insights-refresh-overlap-seconds)
 
 (defface aws-logs-insights-timestamp-face
@@ -697,9 +695,7 @@ ON-SUCCESS is called with (QUERY-ID PAYLOAD)."
            :refresh-function #'aws-logs--insights-refresh-dispatch
            :streaming nil
            :direction 'newest-first
-           :header-lines-function #'aws-logs--insights-header-lines
-           :live-narrow-max-rows aws-logs-insights-live-narrow-max-rows
-           :live-narrow-debounce aws-logs-insights-live-narrow-debounce)))
+           :header-lines-function #'aws-logs--insights-header-lines)))
     (with-current-buffer buffer
       (add-hook 'kill-buffer-hook #'aws-logs--insights-cancel-active-request nil t)
       (aws-logs--insights-cancel-active-request)
