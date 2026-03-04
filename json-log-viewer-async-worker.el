@@ -13,167 +13,15 @@
 (require 'sqlite)
 (require 'subr-x)
 
-(declare-function json-pretty-print-buffer "json" ())
+(require 'json-log-viewer-shared)
 
-(defun json-log-viewer-async-worker--value->string (value)
-  "Convert VALUE into worker-safe string or nil."
-  (cond
-   ((stringp value) value)
-   ((numberp value) (number-to-string value))
-   ((eq value t) "true")
-   ((eq value :false) "false")
-   ((null value) nil)
-   (t (format "%s" value))))
+(declare-function json-pretty-print-buffer "json" ())
 
 (defun json-log-viewer-async-worker--normalize-narrow-string (needle)
   "Normalize NEEDLE into downcased substring matching text, or nil."
   (let ((normalized (string-trim (or needle ""))))
     (unless (string-empty-p normalized)
       (downcase normalized))))
-
-(defun json-log-viewer-async-worker--parse-line (line)
-  "Parse JSON LINE into an alist/list structure, or nil."
-  (when (stringp line)
-    (condition-case nil
-        (json-parse-string line :object-type 'alist :array-type 'list
-                           :null-object nil :false-object :false)
-      (error nil))))
-
-(defun json-log-viewer-async-worker--parse-maybe (value)
-  "Parse VALUE when it looks like JSON text."
-  (when (and (stringp value)
-             (string-match-p "\\`[[:space:]\n\r\t]*[{\\[]" value))
-    (json-log-viewer-async-worker--parse-line value)))
-
-(defun json-log-viewer-async-worker--normalize-json-value-for-serialize (value)
-  "Normalize VALUE into a shape `json-serialize' can encode reliably."
-  (cond
-   ((hash-table-p value)
-    (let ((normalized (make-hash-table :test 'equal)))
-      (maphash
-       (lambda (key child)
-         (when-let ((name (json-log-viewer-async-worker--value->string key)))
-           (puthash name
-                    (json-log-viewer-async-worker--normalize-json-value-for-serialize child)
-                    normalized)))
-       value)
-      normalized))
-   ((json-log-viewer-async-worker--alist-like-p value)
-    (let ((normalized (make-hash-table :test 'equal)))
-      (dolist (pair value)
-        (when (consp pair)
-          (when-let ((name (json-log-viewer-async-worker--value->string (car pair))))
-            (puthash name
-                     (json-log-viewer-async-worker--normalize-json-value-for-serialize (cdr pair))
-                     normalized))))
-      normalized))
-   ((vectorp value)
-    (vconcat
-     (mapcar #'json-log-viewer-async-worker--normalize-json-value-for-serialize
-             (append value nil))))
-   ((listp value)
-    (vconcat
-     (mapcar #'json-log-viewer-async-worker--normalize-json-value-for-serialize value)))
-   (t value)))
-
-(defun json-log-viewer-async-worker--value->summary-string (value)
-  "Convert resolved path VALUE into one-line summary text."
-  (cond
-   ((or (hash-table-p value)
-        (vectorp value)
-        (json-log-viewer-async-worker--alist-like-p value)
-        (and (listp value) (not (null value))))
-    (let ((json (condition-case nil
-                    (json-serialize
-                     (json-log-viewer-async-worker--normalize-json-value-for-serialize value)
-                     :null-object nil
-                     :false-object :false)
-                  (error nil))))
-      (or json (json-log-viewer-async-worker--value->string value))))
-   (t
-    (json-log-viewer-async-worker--value->string value))))
-
-(defun json-log-viewer-async-worker--array-index (key)
-  "Return numeric array index for KEY string, or nil."
-  (when (and (stringp key)
-             (string-match-p "\\`[0-9]+\\'" key))
-    (string-to-number key)))
-
-(defun json-log-viewer-async-worker--split-path (path)
-  "Split PATH into segments, allowing escaped dots.
-
-Use `\\.' to represent a literal dot within a key segment."
-  (let ((idx 0)
-        (len (length path))
-        (current "")
-        parts)
-    (while (< idx len)
-      (let ((ch (aref path idx)))
-        (cond
-         ((= ch ?\\)
-          (setq idx (1+ idx))
-          (setq current
-                (concat current
-                        (if (< idx len)
-                            (string (aref path idx))
-                          "\\"))))
-         ((= ch ?.)
-          (push current parts)
-          (setq current ""))
-         (t
-          (setq current (concat current (string ch))))))
-      (setq idx (1+ idx)))
-    (push current parts)
-    (nreverse parts)))
-
-(defun json-log-viewer-async-worker--alist-like-p (node)
-  "Return non-nil when NODE behaves like a JSON object alist."
-  (and (listp node)
-       (or (null node)
-           (let ((first (car node)))
-             (and (consp first)
-                  (or (stringp (car first))
-                      (symbolp (car first))))))))
-
-(defun json-log-viewer-async-worker--get-child (node key)
-  "Return child value KEY from NODE."
-  (cond
-   ((hash-table-p node)
-    (or (gethash key node)
-        (gethash (intern-soft key) node)))
-   ((json-log-viewer-async-worker--alist-like-p node)
-    (or (alist-get key node nil nil #'equal)
-        (when-let ((sym (intern-soft key)))
-          (alist-get sym node))))
-   ((listp node)
-    (when-let ((idx (json-log-viewer-async-worker--array-index key)))
-      (nth idx node)))
-   (t nil)))
-
-(defun json-log-viewer-async-worker--get-path (node path)
-  "Return value at dot-separated PATH in NODE.
-
-Use `\\.' in PATH for literal dots in JSON keys."
-  (let ((parts (json-log-viewer-async-worker--split-path path))
-        (current node)
-        (failed nil))
-    (while (and parts (not failed))
-      (when-let ((parsed (json-log-viewer-async-worker--parse-maybe current)))
-        (setq current parsed))
-      (setq current (json-log-viewer-async-worker--get-child current (car parts)))
-      (unless current
-        (setq failed t))
-      (setq parts (cdr parts)))
-    (unless failed
-      current)))
-
-(defun json-log-viewer-async-worker--resolve-path (parsed path)
-  "Resolve string PATH from PARSED JSON object."
-  (when (and parsed
-             (stringp path)
-             (not (string-empty-p path)))
-    (json-log-viewer-async-worker--value->summary-string
-     (json-log-viewer-async-worker--get-path parsed path))))
 
 (defun json-log-viewer-async-worker--parse-time (value)
   "Return epoch seconds parsed from VALUE, or nil."
@@ -194,25 +42,19 @@ Use `\\.' in PATH for literal dots in JSON keys."
 
 (defun json-log-viewer-async-worker--json-value->pretty-string (value)
   "Render VALUE as pretty JSON text when possible."
-  (let* ((parsed (or (json-log-viewer-async-worker--parse-maybe value) value))
-         (normalized (json-log-viewer-async-worker--normalize-json-value-for-serialize parsed))
+  (let* ((parsed (or (json-log-viewer-shared--parse-json-maybe value) value))
+         (normalized (json-log-viewer-shared--normalize-json-value-for-serialize parsed))
          (json (condition-case nil
                    (json-serialize normalized :null-object nil :false-object :false)
                  (error nil))))
     (if (not json)
-        (or (json-log-viewer-async-worker--value->string parsed) "")
+        (or (json-log-viewer-shared--value->string parsed) "")
       (condition-case nil
           (with-temp-buffer
             (insert json)
             (json-pretty-print-buffer)
             (string-trim-right (buffer-string)))
         (error json)))))
-
-(defun json-log-viewer-async-worker--join-path (prefix part)
-  "Join PREFIX and PART using dot notation."
-  (if (and prefix (not (string-empty-p prefix)))
-      (concat prefix "." part)
-    part))
 
 (defun json-log-viewer-async-worker--flatten-node (node json-path-list &optional prefix)
   "Flatten NODE into row plist objects honoring JSON-PATH-LIST and PREFIX."
@@ -224,7 +66,7 @@ Use `\\.' in PATH for literal dots in JSON keys."
    ((hash-table-p node)
     (let (rows keys)
       (maphash (lambda (key _value)
-                 (when-let ((k (json-log-viewer-async-worker--value->string key)))
+                 (when-let ((k (json-log-viewer-shared--value->string key)))
                    (push k keys)))
                node)
       (setq keys (sort keys #'string-lessp))
@@ -238,21 +80,21 @@ Use `\\.' in PATH for literal dots in JSON keys."
                              (when-let ((sym (intern-soft key)))
                                (gethash sym node)))
                          json-path-list
-                         (json-log-viewer-async-worker--join-path prefix key)))))
+                         (json-log-viewer-shared--join-path prefix key)))))
         rows)))
-   ((json-log-viewer-async-worker--alist-like-p node)
+   ((json-log-viewer-shared--alist-like-p node)
     (if (null node)
         (when prefix (list (list :k prefix :v "")))
       (let (rows)
         (dolist (pair node)
           (when (consp pair)
-            (when-let ((k (json-log-viewer-async-worker--value->string (car pair))))
+            (when-let ((k (json-log-viewer-shared--value->string (car pair))))
               (setq rows
                     (append rows
                             (json-log-viewer-async-worker--flatten-node
                              (cdr pair)
                              json-path-list
-                             (json-log-viewer-async-worker--join-path prefix k)))))))
+                             (json-log-viewer-shared--join-path prefix k)))))))
         rows)))
    ((listp node)
     (let ((base (or prefix "value")))
@@ -271,7 +113,7 @@ Use `\\.' in PATH for literal dots in JSON keys."
           rows))))
    (t
     (list (list :k (or prefix "value")
-                :v (or (json-log-viewer-async-worker--value->string node) ""))))))
+                :v (or (json-log-viewer-shared--value->string node) ""))))))
 
 (defun json-log-viewer-async-worker--json-object-rows (parsed raw-line json-path-list)
   "Return flattened rows from PARSED JSON, or RAW-LINE fallback row."
@@ -304,16 +146,18 @@ Use `\\.' in PATH for literal dots in JSON keys."
 
 (defun json-log-viewer-async-worker--line->entry+detail (line id config)
   "Build one entry/detail pair for LINE with synthetic ID using CONFIG."
-  (let* ((parsed (json-log-viewer-async-worker--parse-line line))
-         (timestamp (json-log-viewer-async-worker--resolve-path
-                     parsed (plist-get config :timestamp-path)))
+  (let* ((parsed (json-log-viewer-shared--parse-json-line line))
+         (flattened (and parsed
+                         (json-log-viewer-shared--flatten-path-values parsed)))
+         (timestamp (json-log-viewer-shared--resolve-path
+                     parsed (plist-get config :timestamp-path) flattened))
          (timestamp-epoch (json-log-viewer-async-worker--parse-time timestamp))
          (sort-key (or timestamp-epoch (+ 1000000000000.0 id)))
-         (level (or (json-log-viewer-async-worker--resolve-path
-                     parsed (plist-get config :level-path))
+         (level (or (json-log-viewer-shared--resolve-path
+                     parsed (plist-get config :level-path) flattened)
                     "-"))
-         (message (or (json-log-viewer-async-worker--resolve-path
-                       parsed (plist-get config :message-path))
+         (message (or (json-log-viewer-shared--resolve-path
+                       parsed (plist-get config :message-path) flattened)
                       line
                       "-"))
          (extras nil)
@@ -323,7 +167,7 @@ Use `\\.' in PATH for literal dots in JSON keys."
          (fields-json (json-log-viewer-async-worker--rows->storage-json rows))
          (signature (number-to-string id)))
     (dolist (path (plist-get config :extra-paths))
-      (when-let ((value (json-log-viewer-async-worker--resolve-path parsed path)))
+      (when-let ((value (json-log-viewer-shared--resolve-path parsed path flattened)))
         (push value extras)))
     (cons
      (list :id id
@@ -341,13 +185,13 @@ Use `\\.' in PATH for literal dots in JSON keys."
   (let ((normalized
          (cond
           ((or (hash-table-p parsed)
-               (json-log-viewer-async-worker--alist-like-p parsed))
-           (json-log-viewer-async-worker--normalize-json-value-for-serialize parsed))
+               (json-log-viewer-shared--alist-like-p parsed))
+           (json-log-viewer-shared--normalize-json-value-for-serialize parsed))
           ((or (listp parsed) (vectorp parsed))
            (let ((obj (make-hash-table :test 'equal)))
              (puthash
               "value"
-              (json-log-viewer-async-worker--normalize-json-value-for-serialize parsed)
+              (json-log-viewer-shared--normalize-json-value-for-serialize parsed)
               obj)
              obj))
           (t
@@ -358,20 +202,22 @@ Use `\\.' in PATH for literal dots in JSON keys."
 
 (defun json-log-viewer-async-worker--line->summary (line config)
   "Return summary plist derived from LINE using CONFIG."
-  (let* ((parsed (json-log-viewer-async-worker--parse-line line))
-         (timestamp (json-log-viewer-async-worker--resolve-path
-                     parsed (plist-get config :timestamp-path)))
+  (let* ((parsed (json-log-viewer-shared--parse-json-line line))
+         (flattened (and parsed
+                         (json-log-viewer-shared--flatten-path-values parsed)))
+         (timestamp (json-log-viewer-shared--resolve-path
+                     parsed (plist-get config :timestamp-path) flattened))
          (timestamp-epoch (json-log-viewer-async-worker--parse-time timestamp))
-         (level (or (json-log-viewer-async-worker--resolve-path
-                     parsed (plist-get config :level-path))
+         (level (or (json-log-viewer-shared--resolve-path
+                     parsed (plist-get config :level-path) flattened)
                     "-"))
-         (message (or (json-log-viewer-async-worker--resolve-path
-                       parsed (plist-get config :message-path))
+         (message (or (json-log-viewer-shared--resolve-path
+                       parsed (plist-get config :message-path) flattened)
                       line
                       "-"))
          (extra-fields nil))
     (dolist (path (plist-get config :extra-paths))
-      (when-let ((value (json-log-viewer-async-worker--resolve-path parsed path)))
+      (when-let ((value (json-log-viewer-shared--resolve-path parsed path flattened)))
         (push value extra-fields)))
     (list :parsed parsed
           :timestamp (or timestamp "-")

@@ -115,10 +115,10 @@
                   "{\"payload\":{\"data\":{\"name\":\"alice\"},\"events\":[{\"id\":1},{\"id\":2}]}}"
                   :object-type 'alist
                   :array-type 'list))
-         (payload (json-log-viewer--resolve-path parsed "payload"))
-         (data (json-log-viewer--resolve-path parsed "payload.data"))
-         (events (json-log-viewer--resolve-path parsed "payload.events"))
-         (name (json-log-viewer--resolve-path parsed "payload.data.name")))
+         (payload (json-log-viewer-shared--resolve-path parsed "payload"))
+         (data (json-log-viewer-shared--resolve-path parsed "payload.data"))
+         (events (json-log-viewer-shared--resolve-path parsed "payload.events"))
+         (name (json-log-viewer-shared--resolve-path parsed "payload.data.name")))
     (should (string-match-p "\\`{.*}\\'" payload))
     (should (string-match-p "\"name\":\"alice\"" payload))
     (should-not (string-match-p "\n" payload))
@@ -135,14 +135,26 @@
                   "{\"payload\":{\"@timestamp\":\"2026-02-25T16:14:14.455Z\",\"log.level\":\"INFO\",\"service.name\":\"my-service\",\"log.logger\":\"com.example.MyClass\",\"log\":{\"origin\":{\"file\":{\"name\":\"MyClass.kt\"}}}}}"
                   :object-type 'alist
                   :array-type 'list))
-         (level (json-log-viewer--resolve-path parsed "payload.log\\.level"))
-         (service (json-log-viewer--resolve-path parsed "payload.service\\.name"))
-         (logger (json-log-viewer--resolve-path parsed "payload.log\\.logger"))
-         (origin-file (json-log-viewer--resolve-path parsed "payload.log.origin.file.name")))
+         (level (json-log-viewer-shared--resolve-path parsed "payload.log\\.level"))
+         (service (json-log-viewer-shared--resolve-path parsed "payload.service\\.name"))
+         (logger (json-log-viewer-shared--resolve-path parsed "payload.log\\.logger"))
+         (origin-file (json-log-viewer-shared--resolve-path parsed "payload.log.origin.file.name")))
     (should (equal level "INFO"))
     (should (equal service "my-service"))
     (should (equal logger "com.example.MyClass"))
     (should (equal origin-file "MyClass.kt"))))
+
+(ert-deftest json-log-viewer-resolve-path-matches-details-path-for-dotted-keys-test ()
+  (let* ((dotted (json-parse-string
+                  "{\"payload\":{\"log.level\":\"INFO\"}}"
+                  :object-type 'alist
+                  :array-type 'list))
+         (nested (json-parse-string
+                  "{\"payload\":{\"log\":{\"level\":\"INFO\"}}}"
+                  :object-type 'alist
+                  :array-type 'list)))
+    (should (equal (json-log-viewer-shared--resolve-path dotted "payload.log.level") "INFO"))
+    (should (equal (json-log-viewer-shared--resolve-path nested "payload.log.level") "INFO"))))
 
 (ert-deftest json-log-viewer-async-worker-resolves-escaped-dot-keys-test ()
   (let* ((line "{\"timestamp\":\"2026-02-25T16:14:14.455Z\",\"payload\":{\"log.level\":\"INFO\",\"message\":\"This is the log message\",\"service.name\":\"my-service\",\"log.logger\":\"com.example.MyClass\"}}")
@@ -157,6 +169,25 @@
     (should (equal (plist-get entry :message) "This is the log message"))
     (should (equal (plist-get entry :extras)
                    '("my-service" "com.example.MyClass")))))
+
+(ert-deftest json-log-viewer-async-worker-resolves-unescaped-dotted-keys-test ()
+  (let* ((config '(:timestamp-path "timestamp"
+                   :level-path "payload.log.level"
+                   :message-path "payload.message"
+                   :extra-paths nil
+                   :json-paths nil))
+         (entry-dotted
+          (car (json-log-viewer-async-worker--line->entry+detail
+                "{\"timestamp\":\"2026-02-25T16:14:14.455Z\",\"payload\":{\"log.level\":\"INFO\",\"message\":\"msg\"}}"
+                1
+                config)))
+         (entry-nested
+          (car (json-log-viewer-async-worker--line->entry+detail
+                "{\"timestamp\":\"2026-02-25T16:14:14.455Z\",\"payload\":{\"log\":{\"level\":\"INFO\"},\"message\":\"msg\"}}"
+                2
+                config))))
+    (should (equal (plist-get entry-dotted :level) "INFO"))
+    (should (equal (plist-get entry-nested :level) "INFO"))))
 
 (ert-deftest json-log-viewer-parse-time-preserves-subsecond-order-test ()
   (let ((t1 (json-log-viewer--parse-time "2026-01-01T00:00:00.123Z"))
