@@ -213,6 +213,12 @@ to `js-mode`."
 (defvar json-log-viewer--keybindings-function nil
   "Optional callback returning popup keybindings for `json-log-viewer-show-info`.")
 
+(defconst json-log-viewer--self-subscriber-id :json-log-viewer-self
+  "Reserved subscriber id used for viewer self-subscription.")
+
+(defvar-local json-log-viewer--subscribers nil
+  "Alist of (ID . CALLBACK) subscribers for current viewer buffer.")
+
 (defun json-log-viewer-get-buffer (buffer-name)
   "Return validated json-log-viewer buffer from BUFFER-NAME.
 
@@ -227,6 +233,29 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
       (unless (derived-mode-p 'json-log-viewer-mode)
         (user-error "Not a json-log-viewer buffer: %s" (buffer-name buffer))))
     buffer))
+
+(defun json-log-viewer-subscribe (id callback)
+  "Subscribe ID with CALLBACK in current viewer buffer.
+
+CALLBACK is called as (ACTION SOURCE-BUFFER ENTRY-OVERLAYS)."
+  (unless (derived-mode-p 'json-log-viewer-mode)
+    (user-error "Not a json-log-viewer buffer: %s" (buffer-name (current-buffer))))
+  (unless id
+    (user-error "Subscriber id cannot be nil"))
+  (unless (functionp callback)
+    (user-error "Subscriber callback must be a function, got: %S" callback))
+  (setq-local json-log-viewer--subscribers
+              (assoc-delete-all id json-log-viewer--subscribers))
+  (push (cons id callback) json-log-viewer--subscribers)
+  id)
+
+(defun json-log-viewer-unsubscribe (id)
+  "Unsubscribe ID from current viewer buffer."
+  (unless (derived-mode-p 'json-log-viewer-mode)
+    (user-error "Not a json-log-viewer buffer: %s" (buffer-name (current-buffer))))
+  (setq-local json-log-viewer--subscribers
+              (assoc-delete-all id json-log-viewer--subscribers))
+  id)
 
 (defun json-log-viewer--value->string (value)
   "Convert VALUE into a display string."
@@ -336,24 +365,46 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
           (goto-char (overlay-start entry-overlay))
           (line-end-position)))))))
 
+(defun json-log-viewer--entry-storage-buffer (entry-overlay)
+  "Return storage buffer used by ENTRY-OVERLAY."
+  (let ((storage-buffer (overlay-get entry-overlay 'json-log-viewer-storage-buffer)))
+    (if (buffer-live-p storage-buffer)
+        storage-buffer
+      (overlay-buffer entry-overlay))))
+
+(defun json-log-viewer--entry-storage-id (entry-overlay)
+  "Return storage entry id used by ENTRY-OVERLAY, or nil."
+  (let ((entry-id (or (overlay-get entry-overlay 'json-log-viewer-storage-entry-id)
+                      (overlay-get entry-overlay 'json-log-viewer-log-entry-id))))
+    (cond
+     ((integerp entry-id) entry-id)
+     ((and (stringp entry-id)
+           (string-match-p "\\`[0-9]+\\'" entry-id))
+      (string-to-number entry-id))
+     (t
+      (let ((signature (or (overlay-get entry-overlay 'json-log-viewer-storage-signature)
+                           (overlay-get entry-overlay 'json-log-viewer-signature))))
+        (when (and (stringp signature)
+                   (string-match-p "\\`[0-9]+\\'" signature))
+          (string-to-number signature)))))))
+
 (defun json-log-viewer--storage-entry-fields (entry-overlay)
   "Return normalized fields for ENTRY-OVERLAY."
-  (when json-log-viewer--sqlite-db
-    (let ((entry-id (or (overlay-get entry-overlay 'json-log-viewer-log-entry-id)
-                        (let ((signature (overlay-get entry-overlay 'json-log-viewer-signature)))
-                          (when (and (stringp signature)
-                                     (string-match-p "\\`[0-9]+\\'" signature))
-                            (string-to-number signature))))))
-      (when-let* ((row (and entry-id
-                            (car (sqlite-select json-log-viewer--sqlite-db
-                                                "SELECT json FROM log_entry WHERE id = ?"
-                                                (vector entry-id)))))
-                  (json-text (car row)))
-        (json-log-viewer--normalize-fields
-         (json-log-viewer--json-object-fields
-          (json-log-viewer--json-parse-line json-text)
-          json-text
-          json-log-viewer--json-paths))))))
+  (let ((storage-buffer (json-log-viewer--entry-storage-buffer entry-overlay))
+        (entry-id (json-log-viewer--entry-storage-id entry-overlay)))
+    (when (and (buffer-live-p storage-buffer)
+               entry-id)
+      (with-current-buffer storage-buffer
+        (when-let* ((row (and json-log-viewer--sqlite-db
+                              (car (sqlite-select json-log-viewer--sqlite-db
+                                                  "SELECT json FROM log_entry WHERE id = ?"
+                                                  (vector entry-id)))))
+                    (json-text (car row)))
+          (json-log-viewer--normalize-fields
+           (json-log-viewer--json-object-fields
+            (json-log-viewer--json-parse-line json-text)
+            json-text
+            json-log-viewer--json-paths)))))))
 
 (defun json-log-viewer--storage-matching-signatures (needle)
   "Return hash table of matching entry signatures for NEEDLE from sqlite storage."
@@ -1088,6 +1139,23 @@ Returns cons cell (ENTRIES . NEXT-ID)."
         :row-count json-log-viewer--entry-count
         :visible-row-count (json-log-viewer--visible-entry-count)))
 
+(defun json-log-viewer--self-subscriber (_action _source-buffer _entry-overlays)
+  "Default no-op subscriber used for self-subscription.")
+
+(defun json-log-viewer--publish (action entry-overlays)
+  "Publish ACTION and ENTRY-OVERLAYS to current buffer subscribers."
+  (let ((source-buffer (current-buffer)))
+    (dolist (subscriber (append json-log-viewer--subscribers nil))
+      (let ((id (car subscriber))
+            (callback (cdr subscriber)))
+        (when (functionp callback)
+          (condition-case err
+              (funcall callback action source-buffer entry-overlays)
+            (error
+             (message "json-log-viewer subscriber %S failed: %s"
+                      id
+                      (error-message-string err)))))))))
+
 (defun json-log-viewer--set-point-to-latest-entry ()
   "Move point and all visible windows for current buffer to latest entry."
   (let ((target (point-max)))
@@ -1585,9 +1653,12 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback is applied."
     (overlay-put entry-ov 'json-log-viewer-entry-expanded nil)
     (overlay-put entry-ov 'json-log-viewer-fold-overlay nil)
     (overlay-put entry-ov 'json-log-viewer-log-entry-id entry-id)
+    (overlay-put entry-ov 'json-log-viewer-storage-buffer (current-buffer))
+    (overlay-put entry-ov 'json-log-viewer-storage-entry-id entry-id)
     (unless storage-populated
       (json-log-viewer--storage-put-entry-details signature filter-text fields))
     (overlay-put entry-ov 'json-log-viewer-signature signature)
+    (overlay-put entry-ov 'json-log-viewer-storage-signature signature)
     (push entry-ov json-log-viewer--entry-overlays)
     entry-ov))
 
@@ -1663,7 +1734,8 @@ When PRESERVE-FILTER is non-nil, keep the current active filter.
 When STORAGE-PREPARED is non-nil, skip resetting sqlite entry-details."
   (let ((active-filter (and preserve-filter json-log-viewer--filter-string))
         (inhibit-read-only t)
-        (ordered (json-log-viewer--sort-entries entries)))
+        (ordered (json-log-viewer--sort-entries entries))
+        (inserted-overlays nil))
     (setq json-log-viewer--filter-string active-filter)
     (json-log-viewer--clear-overlays)
     (unless storage-prepared
@@ -1672,7 +1744,9 @@ When STORAGE-PREPARED is non-nil, skip resetting sqlite entry-details."
     (erase-buffer)
     (if (null ordered)
         (insert "No results.\n")
-      (mapc #'json-log-viewer--insert-entry ordered))
+      (dolist (entry ordered)
+        (push (json-log-viewer--insert-entry entry) inserted-overlays)))
+    (setq inserted-overlays (nreverse inserted-overlays))
     (setq json-log-viewer--entry-count (length ordered))
     (json-log-viewer--mark-seen-entries ordered)
     (json-log-viewer--apply-filter)
@@ -1680,7 +1754,8 @@ When STORAGE-PREPARED is non-nil, skip resetting sqlite entry-details."
     (if json-log-viewer--auto-follow
         (json-log-viewer--set-point-to-latest-entry)
       (goto-char (point-min)))
-    (json-log-viewer--highlight-current-line)))
+    (json-log-viewer--highlight-current-line)
+    (json-log-viewer--publish 'replace inserted-overlays)))
 
 (defun json-log-viewer-append-entries (entries)
   "Append ENTRIES into current viewer buffer.
@@ -1716,7 +1791,8 @@ In non-streaming mode the append position follows configured direction."
       (json-log-viewer--refresh-header)
       (when (and json-log-viewer--auto-follow append-at-bottom)
         (json-log-viewer--set-point-to-latest-entry))
-      (json-log-viewer--highlight-current-line))
+      (json-log-viewer--highlight-current-line)
+      (json-log-viewer--publish 'append inserted-overlays))
     ordered))
 
 (defun json-log-viewer-refresh ()
@@ -1857,6 +1933,9 @@ Returns the created buffer."
       (setq-local json-log-viewer--json-refresh-log-lines-function refresh-function)
       (setq-local json-log-viewer--json-header-lines-function header-lines-function)
       (setq-local json-log-viewer--seen-signatures (make-hash-table :test 'equal))
+      (setq-local json-log-viewer--subscribers nil)
+      (json-log-viewer-subscribe json-log-viewer--self-subscriber-id
+                                 #'json-log-viewer--self-subscriber)
       (json-log-viewer--storage-init)
       (json-log-viewer--start-async-queue)
       (json-log-viewer--ensure-async-queue-running)
