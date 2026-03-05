@@ -319,8 +319,18 @@ CALLBACK is called as (ACTION SOURCE-BUFFER ENTRY-OVERLAYS)."
     (sqlite-execute db "PRAGMA journal_mode = WAL")
     (sqlite-execute db "PRAGMA synchronous = NORMAL")
     (sqlite-execute db "PRAGMA busy_timeout = 5000")
-    (sqlite-execute db "CREATE TABLE log_entry (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, json TEXT NOT NULL)")
-    (sqlite-execute db "CREATE INDEX log_entry_timestamp_idx ON log_entry(timestamp, id)")))
+    (sqlite-execute
+     db
+     (concat
+      "CREATE TABLE log_entry ("
+      "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+      "timestamp_epoch REAL, "
+      "timestamp TEXT, "
+      "level_path TEXT, "
+      "message_path TEXT, "
+      "extra_paths TEXT, "
+      "json TEXT NOT NULL)"))
+    (sqlite-execute db "CREATE INDEX log_entry_timestamp_idx ON log_entry(timestamp_epoch, id)")))
 
 (defun json-log-viewer--storage-close ()
   "Close and cleanup current buffer storage resources."
@@ -454,7 +464,8 @@ CALLBACK is called as (ACTION SOURCE-BUFFER ENTRY-OVERLAYS)."
          (extra-fields (or (plist-get worker-entry :extra-fields)
                            (plist-get worker-entry :extras)
                            nil))
-         (sort-key (or (json-log-viewer--parse-time timestamp)
+         (sort-key (or (plist-get worker-entry :sort-key)
+                       (json-log-viewer--parse-time timestamp)
                        (+ 1000000000000.0 (or id 0)))))
     (list :id id
           :sort-key sort-key
@@ -589,6 +600,17 @@ CALLBACK is called as (ACTION SOURCE-BUFFER ENTRY-OVERLAYS)."
         :level-path json-log-viewer--level-path
         :message-path json-log-viewer--message-path
         :extra-paths json-log-viewer--extra-paths
+        :sqlite-file json-log-viewer--sqlite-file))
+
+(defun json-log-viewer--make-log-ingestor-async-stored-job (line stored-entry)
+  "Build log-ingestor async payload for LINE with STORED-ENTRY summary.
+
+STORED-ENTRY is a plist with keys:
+`:sort-key', `:timestamp', `:level-path', `:message-path', and `:extra-paths'."
+  (list :op 'ingest-stored
+        :line line
+        :stored-entry stored-entry
+        :worker-file (json-log-viewer--async-worker-file)
         :sqlite-file json-log-viewer--sqlite-file))
 
 (defun json-log-viewer--make-trunkator-async-job (count)
@@ -1354,21 +1376,21 @@ Return value is always sorted in ascending order and each row is a plist:
           (cond
            ((and timestamp limit)
             ;; Query newest-first to apply LIMIT, then reverse to ascending.
-            (nreverse
+           (nreverse
              (sqlite-select
               json-log-viewer--sqlite-db
               (concat
-               "SELECT id, timestamp, json FROM log_entry "
-               "WHERE timestamp < ? "
-               "ORDER BY timestamp DESC, id DESC LIMIT ?")
+               "SELECT id, timestamp_epoch, json FROM log_entry "
+               "WHERE timestamp_epoch < ? "
+               "ORDER BY timestamp_epoch DESC, id DESC LIMIT ?")
               (vector timestamp limit))))
            (timestamp
             (sqlite-select
              json-log-viewer--sqlite-db
              (concat
-              "SELECT id, timestamp, json FROM log_entry "
-              "WHERE timestamp < ? "
-              "ORDER BY timestamp ASC, id ASC")
+              "SELECT id, timestamp_epoch, json FROM log_entry "
+              "WHERE timestamp_epoch < ? "
+              "ORDER BY timestamp_epoch ASC, id ASC")
              (vector timestamp)))
            (limit
             ;; Query newest-first to apply LIMIT, then reverse to ascending.
@@ -1376,19 +1398,19 @@ Return value is always sorted in ascending order and each row is a plist:
              (sqlite-select
               json-log-viewer--sqlite-db
               (concat
-               "SELECT id, timestamp, json FROM log_entry "
+               "SELECT id, timestamp_epoch, json FROM log_entry "
                "ORDER BY "
-               "CASE WHEN timestamp IS NULL THEN 1 ELSE 0 END, "
-               "timestamp DESC, id DESC LIMIT ?")
+               "CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, "
+               "timestamp_epoch DESC, id DESC LIMIT ?")
               (vector limit))))
            (t
             (sqlite-select
              json-log-viewer--sqlite-db
              (concat
-              "SELECT id, timestamp, json FROM log_entry "
+              "SELECT id, timestamp_epoch, json FROM log_entry "
               "ORDER BY "
-              "CASE WHEN timestamp IS NULL THEN 1 ELSE 0 END, "
-              "timestamp ASC, id ASC"))))))
+              "CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, "
+              "timestamp_epoch ASC, id ASC"))))))
     (mapcar
      (lambda (row)
        (list :id (nth 0 row)

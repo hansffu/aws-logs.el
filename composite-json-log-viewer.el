@@ -15,8 +15,8 @@
 (require 'subr-x)
 (require 'async)
 
-(declare-function json-log-viewer--make-log-ingestor-async-job "json-log-viewer"
-                  (op line &optional narrow-string))
+(declare-function json-log-viewer--make-log-ingestor-async-stored-job "json-log-viewer"
+                  (line stored-entry))
 (declare-function json-log-viewer--async-submit "json-log-viewer" (job &optional wait-for-callback))
 (declare-function json-log-viewer--request-narrow-rebuild "json-log-viewer"
                   (op &optional needle wait-for-callback))
@@ -84,21 +84,29 @@
       (string-to-number entry-id))
      (t nil))))
 
-(defun composite-json-log-viewer--source-json-by-id (source-buffer entry-id)
-  "Return stored source JSON text from SOURCE-BUFFER ENTRY-ID."
+(defun composite-json-log-viewer--source-entry-by-id (source-buffer entry-id)
+  "Return stored source entry data from SOURCE-BUFFER ENTRY-ID."
   (when (and (buffer-live-p source-buffer)
              (integerp entry-id))
     (with-current-buffer source-buffer
       (when json-log-viewer--sqlite-db
         (when-let ((row (car (sqlite-select json-log-viewer--sqlite-db
-                                            "SELECT json FROM log_entry WHERE id = ?"
+                                            (concat
+                                             "SELECT timestamp_epoch, timestamp, level_path, "
+                                             "message_path, extra_paths, json "
+                                             "FROM log_entry WHERE id = ?")
                                             (vector entry-id)))))
-          (car row))))))
+          (list :sort-key (nth 0 row)
+                :timestamp (nth 1 row)
+                :level-path (nth 2 row)
+                :message-path (nth 3 row)
+                :extra-paths (nth 4 row)
+                :json (nth 5 row)))))))
 
-(defun composite-json-log-viewer--enqueue-source-entry (source-buffer entry-id &optional line)
+(defun composite-json-log-viewer--enqueue-source-entry (source-buffer entry-id &optional stored-entry)
   "Enqueue SOURCE-BUFFER ENTRY-ID into current composite ingestion queue.
 
-When LINE is non-nil, skip source sqlite lookup and ingest LINE directly."
+When STORED-ENTRY is non-nil, skip source sqlite lookup and ingest it directly."
   (when (and (integerp entry-id)
              (buffer-live-p source-buffer))
     (let* ((seen (or composite-json-log-viewer--ingested-source-entries
@@ -107,11 +115,19 @@ When LINE is non-nil, skip source sqlite lookup and ingest LINE directly."
            (key (cons source-buffer entry-id)))
       (unless (gethash key seen)
         (puthash key t seen)
-        (when-let ((json-line (or line
-                                  (composite-json-log-viewer--source-json-by-id
-                                   source-buffer entry-id))))
+        (when-let* ((entry (or stored-entry
+                               (composite-json-log-viewer--source-entry-by-id
+                                source-buffer entry-id)))
+                    (json-line (plist-get entry :json))
+                    (summary (list :sort-key (plist-get entry :sort-key)
+                                   :timestamp (plist-get entry :timestamp)
+                                   :level-path (plist-get entry :level-path)
+                                   :message-path (plist-get entry :message-path)
+                                   :extra-paths (plist-get entry :extra-paths))))
           (json-log-viewer--async-submit
-           (json-log-viewer--make-log-ingestor-async-job 'ingest json-line)))))))
+           (json-log-viewer--make-log-ingestor-async-stored-job
+            json-line
+            summary)))))))
 
 (defun composite-json-log-viewer--source-max-entry-id (source-buffer)
   "Return max sqlite entry id currently present in SOURCE-BUFFER."
@@ -174,8 +190,12 @@ CALLBACK receives plist (:copied N :next-after-id ID) on success or
                               (sqlite-execute
                                db
                                (concat
-                                "INSERT INTO log_entry(id, timestamp, json) "
-                                "SELECT NULL, timestamp, json FROM source_db.log_entry "
+                                "INSERT INTO log_entry("
+                                "id, timestamp_epoch, timestamp, level_path, "
+                                "message_path, extra_paths, json) "
+                                "SELECT NULL, timestamp_epoch, timestamp, level_path, "
+                                "message_path, extra_paths, json "
+                                "FROM source_db.log_entry "
                                 "WHERE id > ? AND id <= ? "
                                 "ORDER BY id LIMIT ?")
                                (vector ,after-id
