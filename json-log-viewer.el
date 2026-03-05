@@ -1331,6 +1331,71 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback is applied."
           (sqlite-select json-log-viewer--sqlite-db
                          "SELECT json FROM log_entry ORDER BY id")))
 
+(defun json-log-viewer--get-logs-since (timestamp limit)
+  "Return stored log rows before TIMESTAMP from current buffer sqlite storage.
+
+TIMESTAMP is an epoch float upper bound and rows are returned strictly
+before it.
+When TIMESTAMP is nil, all stored rows are eligible.
+
+LIMIT controls how many of the newest matching rows are returned.  When LIMIT
+is nil, all matching rows are returned.
+
+Return value is always sorted in ascending order and each row is a plist:
+  (:id INTEGER :timestamp NUMBER-OR-NIL :json STRING)."
+  (unless json-log-viewer--sqlite-db
+    (user-error "No sqlite storage is active for this buffer"))
+  (unless (or (null timestamp) (numberp timestamp))
+    (user-error "TIMESTAMP must be a number or nil, got: %S" timestamp))
+  (unless (or (null limit)
+              (and (integerp limit) (> limit 0)))
+    (user-error "LIMIT must be a positive integer or nil, got: %S" limit))
+  (let* ((rows
+          (cond
+           ((and timestamp limit)
+            ;; Query newest-first to apply LIMIT, then reverse to ascending.
+            (nreverse
+             (sqlite-select
+              json-log-viewer--sqlite-db
+              (concat
+               "SELECT id, timestamp, json FROM log_entry "
+               "WHERE timestamp < ? "
+               "ORDER BY timestamp DESC, id DESC LIMIT ?")
+              (vector timestamp limit))))
+           (timestamp
+            (sqlite-select
+             json-log-viewer--sqlite-db
+             (concat
+              "SELECT id, timestamp, json FROM log_entry "
+              "WHERE timestamp < ? "
+              "ORDER BY timestamp ASC, id ASC")
+             (vector timestamp)))
+           (limit
+            ;; Query newest-first to apply LIMIT, then reverse to ascending.
+            (nreverse
+             (sqlite-select
+              json-log-viewer--sqlite-db
+              (concat
+               "SELECT id, timestamp, json FROM log_entry "
+               "ORDER BY "
+               "CASE WHEN timestamp IS NULL THEN 1 ELSE 0 END, "
+               "timestamp DESC, id DESC LIMIT ?")
+              (vector limit))))
+           (t
+            (sqlite-select
+             json-log-viewer--sqlite-db
+             (concat
+              "SELECT id, timestamp, json FROM log_entry "
+              "ORDER BY "
+              "CASE WHEN timestamp IS NULL THEN 1 ELSE 0 END, "
+              "timestamp ASC, id ASC"))))))
+    (mapcar
+     (lambda (row)
+       (list :id (nth 0 row)
+             :timestamp (nth 1 row)
+             :json (nth 2 row)))
+     rows)))
+
 (defun json-log-viewer--info-line (key value)
   "Return formatted popup info line from KEY and VALUE."
   (concat

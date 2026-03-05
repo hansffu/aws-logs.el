@@ -244,6 +244,33 @@
       (when sqlite-file
         (should-not (file-exists-p sqlite-file))))))
 
+(ert-deftest json-log-viewer-get-logs-since-returns-sorted-tail-test ()
+  (let* ((buf (json-log-viewer-make-buffer
+               "*json-log-viewer-get-logs-since-test*"
+               :log-lines
+               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"m0\"}"
+                 "{\"timestamp\":\"2026-01-01T00:00:01Z\",\"msg\":\"m1\"}"
+                 "{\"timestamp\":\"2026-01-01T00:00:02Z\",\"msg\":\"m2\"}")
+               :timestamp-path "timestamp"
+               :level-path "level"
+               :message-path "msg"
+               :streaming t))
+         rows)
+    (unwind-protect
+        (with-current-buffer buf
+          (json-log-viewer--async-await-pending-count 0)
+          (setq rows (json-log-viewer--get-logs-since
+                      (json-log-viewer--parse-time "2026-01-01T00:00:03Z")
+                      2))
+          (should (= (length rows) 2))
+          (should (equal (mapcar (lambda (row) (plist-get row :timestamp)) rows)
+                         (list (json-log-viewer--parse-time "2026-01-01T00:00:01Z")
+                               (json-log-viewer--parse-time "2026-01-01T00:00:02Z"))))
+          (should (string-match-p "\"m1\"" (plist-get (car rows) :json)))
+          (should (string-match-p "\"m2\"" (plist-get (cadr rows) :json))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
 (ert-deftest json-log-viewer-json-refresh-async-sentinel-test ()
   (let* ((buf (json-log-viewer-make-buffer
                "*json-log-viewer-test*"

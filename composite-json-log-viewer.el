@@ -5,24 +5,25 @@
 ;;; Commentary:
 ;;
 ;; Builds a composite json-log-viewer buffer by subscribing to other
-;; json-log-viewer buffers and copying rendered summary rows.
+;; json-log-viewer buffers and mirroring their sqlite-backed rows into the
+;; composite buffer database.
 ;;
 ;;; Code:
 
 (require 'json-log-viewer)
+(require 'sqlite)
 (require 'subr-x)
+(require 'async)
 
-(declare-function json-log-viewer--delete-no-results-placeholder "json-log-viewer" ())
-(declare-function json-log-viewer--evict-oldest-entries-if-needed "json-log-viewer" ())
-(declare-function json-log-viewer--apply-filter-to-overlays "json-log-viewer" (overlays))
-(declare-function json-log-viewer--refresh-header "json-log-viewer" ())
-(declare-function json-log-viewer--set-point-to-latest-entry "json-log-viewer" ())
-(declare-function json-log-viewer--highlight-current-line "json-log-viewer" ())
+(declare-function json-log-viewer--make-log-ingestor-async-job "json-log-viewer"
+                  (op line &optional narrow-string))
+(declare-function json-log-viewer--async-submit "json-log-viewer" (job &optional wait-for-callback))
+(declare-function json-log-viewer--request-narrow-rebuild "json-log-viewer"
+                  (op &optional needle wait-for-callback))
 
-(defvar json-log-viewer--entry-overlays)
-(defvar json-log-viewer--entry-count)
-(defvar json-log-viewer--seen-signatures)
-(defvar json-log-viewer--auto-follow)
+(defvar json-log-viewer--sqlite-db)
+(defvar json-log-viewer--sqlite-file)
+(defvar json-log-viewer--narrow-rebuild-in-progress)
 
 (defvar-local composite-json-log-viewer--is-composite nil
   "Non-nil in composite json-log-viewer buffers.")
@@ -36,8 +37,16 @@
 (defvar-local composite-json-log-viewer--source-buffers nil
   "Source viewer buffers currently subscribed by this composite.")
 
-(defvar-local composite-json-log-viewer--next-signature-id 0
-  "Next synthetic signature id for composite overlays.")
+(defvar-local composite-json-log-viewer--backfill-pending-count 0
+  "Count of source backfill tasks still running.")
+
+(defvar-local composite-json-log-viewer--ingested-source-entries nil
+  "Hash table of source-entry keys already enqueued for ingestion.")
+
+(defcustom composite-json-log-viewer-backfill-async-chunk-size 200
+  "Maximum number of rows fetched per async backfill chunk per source."
+  :type 'integer
+  :group 'json-log-viewer)
 
 (defun composite-json-log-viewer--source-candidates ()
   "Return live non-composite `json-log-viewer-mode' buffers."
@@ -64,87 +73,211 @@
               (push buffer buffers))))))
     (nreverse (delete-dups buffers))))
 
-(defun composite-json-log-viewer--next-signature ()
-  "Return next unique signature for current composite buffer."
-  (setq composite-json-log-viewer--next-signature-id
-        (1+ composite-json-log-viewer--next-signature-id))
-  (format "composite:%d" composite-json-log-viewer--next-signature-id))
+(defun composite-json-log-viewer--source-entry-id (source-overlay)
+  "Return source entry id from SOURCE-OVERLAY, or nil."
+  (let ((entry-id (or (overlay-get source-overlay 'json-log-viewer-storage-entry-id)
+                      (overlay-get source-overlay 'json-log-viewer-log-entry-id))))
+    (cond
+     ((integerp entry-id) entry-id)
+     ((and (stringp entry-id)
+           (string-match-p "\\`[0-9]+\\'" entry-id))
+      (string-to-number entry-id))
+     (t nil))))
 
-(defun composite-json-log-viewer--overlay-snapshot (source-buffer source-overlay)
-  "Return rendered snapshot for SOURCE-OVERLAY in SOURCE-BUFFER."
-  (when (buffer-live-p source-buffer)
+(defun composite-json-log-viewer--source-json-by-id (source-buffer entry-id)
+  "Return stored source JSON text from SOURCE-BUFFER ENTRY-ID."
+  (when (and (buffer-live-p source-buffer)
+             (integerp entry-id))
     (with-current-buffer source-buffer
-      (when (and (overlay-buffer source-overlay)
-                 (overlay-start source-overlay)
-                 (overlay-end source-overlay))
-        (list :text (buffer-substring (overlay-start source-overlay)
-                                      (overlay-end source-overlay))
-              :entry-id (or (overlay-get source-overlay 'json-log-viewer-storage-entry-id)
-                            (overlay-get source-overlay 'json-log-viewer-log-entry-id))
-              :storage-signature
-              (or (overlay-get source-overlay 'json-log-viewer-storage-signature)
-                  (overlay-get source-overlay 'json-log-viewer-signature)))))))
+      (when json-log-viewer--sqlite-db
+        (when-let ((row (car (sqlite-select json-log-viewer--sqlite-db
+                                            "SELECT json FROM log_entry WHERE id = ?"
+                                            (vector entry-id)))))
+          (car row))))))
 
-(defun composite-json-log-viewer--insert-snapshot (source-buffer snapshot)
-  "Insert SNAPSHOT from SOURCE-BUFFER into current composite buffer."
-  (let ((text (plist-get snapshot :text))
-        (entry-id (plist-get snapshot :entry-id))
-        (storage-signature (plist-get snapshot :storage-signature)))
-    (when (and (stringp text) (> (length text) 0))
-      (let ((start (point))
-            (signature (composite-json-log-viewer--next-signature))
-            entry-ov)
-        (insert text)
-        (unless (string-suffix-p "\n" text)
-          (insert "\n"))
-        (setq entry-ov (make-overlay start (point) nil t nil))
-        (overlay-put entry-ov 'json-log-viewer-entry t)
-        (overlay-put entry-ov 'json-log-viewer-entry-expanded nil)
-        (overlay-put entry-ov 'json-log-viewer-fold-overlay nil)
-        (overlay-put entry-ov 'json-log-viewer-log-entry-id entry-id)
-        (overlay-put entry-ov 'json-log-viewer-signature signature)
-        (overlay-put entry-ov 'json-log-viewer-storage-buffer source-buffer)
-        (overlay-put entry-ov 'json-log-viewer-storage-entry-id entry-id)
-        (overlay-put entry-ov 'json-log-viewer-storage-signature storage-signature)
-        (puthash signature t json-log-viewer--seen-signatures)
-        (push entry-ov json-log-viewer--entry-overlays)
-        entry-ov))))
+(defun composite-json-log-viewer--enqueue-source-entry (source-buffer entry-id &optional line)
+  "Enqueue SOURCE-BUFFER ENTRY-ID into current composite ingestion queue.
 
-(defun composite-json-log-viewer--append-source-overlays (source-buffer source-overlays)
-  "Append SOURCE-OVERLAYS from SOURCE-BUFFER into current composite."
-  (let ((inhibit-read-only t)
-        (inserted-overlays nil))
-    (when source-overlays
-      (save-excursion
-        (json-log-viewer--delete-no-results-placeholder)
-        (goto-char (point-max))
-        (dolist (source-overlay source-overlays)
-          (when-let ((snapshot (composite-json-log-viewer--overlay-snapshot
-                                source-buffer source-overlay)))
-            (when-let ((entry-ov (composite-json-log-viewer--insert-snapshot
-                                  source-buffer snapshot)))
-              (push entry-ov inserted-overlays)))))
-      (setq inserted-overlays (nreverse inserted-overlays))
-      (when inserted-overlays
-        (setq json-log-viewer--entry-count
-              (+ json-log-viewer--entry-count (length inserted-overlays)))
-        (json-log-viewer--evict-oldest-entries-if-needed)
-        (json-log-viewer--apply-filter-to-overlays inserted-overlays)
-        (json-log-viewer--refresh-header)
-        (when json-log-viewer--auto-follow
-          (json-log-viewer--set-point-to-latest-entry))
-        (json-log-viewer--highlight-current-line)))))
+When LINE is non-nil, skip source sqlite lookup and ingest LINE directly."
+  (when (and (integerp entry-id)
+             (buffer-live-p source-buffer))
+    (let* ((seen (or composite-json-log-viewer--ingested-source-entries
+                     (setq-local composite-json-log-viewer--ingested-source-entries
+                                 (make-hash-table :test 'equal))))
+           (key (cons source-buffer entry-id)))
+      (unless (gethash key seen)
+        (puthash key t seen)
+        (when-let ((json-line (or line
+                                  (composite-json-log-viewer--source-json-by-id
+                                   source-buffer entry-id))))
+          (json-log-viewer--async-submit
+           (json-log-viewer--make-log-ingestor-async-job 'ingest json-line)))))))
+
+(defun composite-json-log-viewer--source-max-entry-id (source-buffer)
+  "Return max sqlite entry id currently present in SOURCE-BUFFER."
+  (with-current-buffer source-buffer
+    (if json-log-viewer--sqlite-db
+        (or (car (car (sqlite-select json-log-viewer--sqlite-db
+                                     "SELECT COALESCE(MAX(id), 0) FROM log_entry")))
+            0)
+      0)))
+
+(defun composite-json-log-viewer--backfill-chunk-size ()
+  "Return normalized row count per backfill chunk."
+  (max 1 (or composite-json-log-viewer-backfill-async-chunk-size 1)))
+
+(defun composite-json-log-viewer--copy-source-rows-async-chunk
+    (source-sqlite-file target-sqlite-file after-id max-id callback)
+  "Copy one source row chunk into target sqlite and invoke CALLBACK.
+
+Rows are copied from SOURCE-SQLITE-FILE into TARGET-SQLITE-FILE for ids in
+\(AFTER-ID, MAX-ID], bounded by `composite-json-log-viewer--backfill-chunk-size`.
+CALLBACK receives plist (:copied N :next-after-id ID) on success or
+(:error MESSAGE) on failure."
+  (async-start
+   `(lambda ()
+      (require 'sqlite)
+      (condition-case err
+          (let ((attempt 0)
+                (result nil)
+                done)
+            (while (not done)
+              (setq attempt (1+ attempt))
+              (condition-case copy-err
+                  (let ((db (sqlite-open ,target-sqlite-file))
+                        (attached nil))
+                    (unwind-protect
+                        (progn
+                          (sqlite-execute db "PRAGMA journal_mode = WAL")
+                          (sqlite-execute db "PRAGMA synchronous = NORMAL")
+                          (sqlite-execute db "PRAGMA busy_timeout = 5000")
+                          (sqlite-execute db
+                                          "ATTACH DATABASE ? AS source_db"
+                                          (vector ,source-sqlite-file))
+                          (setq attached t)
+                          (let* ((meta-row
+                                  (car
+                                   (sqlite-select
+                                    db
+                                    (concat
+                                     "SELECT COALESCE(MAX(id), ?), COUNT(*) FROM ("
+                                     "SELECT id FROM source_db.log_entry "
+                                     "WHERE id > ? AND id <= ? "
+                                     "ORDER BY id LIMIT ?)")
+                                    (vector ,after-id
+                                            ,after-id
+                                            ,max-id
+                                            ,(composite-json-log-viewer--backfill-chunk-size)))))
+                                 (next-after-id (or (nth 0 meta-row) ,after-id))
+                                 (copied (or (nth 1 meta-row) 0)))
+                            (when (> copied 0)
+                              (sqlite-execute
+                               db
+                               (concat
+                                "INSERT INTO log_entry(id, timestamp, json) "
+                                "SELECT NULL, timestamp, json FROM source_db.log_entry "
+                                "WHERE id > ? AND id <= ? "
+                                "ORDER BY id LIMIT ?")
+                               (vector ,after-id
+                                       ,max-id
+                                       ,(composite-json-log-viewer--backfill-chunk-size))))
+                            (setq result (list :copied copied
+                                               :next-after-id next-after-id))
+                            (setq done t)))
+                      (when attached
+                        (ignore-errors (sqlite-execute db "DETACH DATABASE source_db")))
+                      (ignore-errors (sqlite-close db))))
+                (error
+                 (let ((msg (downcase (error-message-string copy-err))))
+                   (if (and (< attempt 12)
+                            (or (string-match-p "database is locked" msg)
+                                (string-match-p "database is busy" msg)
+                                (string-match-p "sqlite_busy" msg)
+                                (string-match-p "sqlite_locked" msg)))
+                       (sleep-for (* 0.02 attempt))
+                     (signal (car copy-err) (cdr copy-err)))))))
+            result)
+        (error
+         (list :error (error-message-string err)))))
+   callback))
+
+(defun composite-json-log-viewer--finish-backfill-source ()
+  "Mark one source backfill as completed in current composite buffer."
+  (setq composite-json-log-viewer--backfill-pending-count
+        (max 0 (1- composite-json-log-viewer--backfill-pending-count)))
+  (when (= composite-json-log-viewer--backfill-pending-count 0)
+    ;; Render everything already stored in composite sqlite, including updates
+    ;; received while backfill was running.
+    (json-log-viewer--request-narrow-rebuild 'widen nil)))
+
+(defun composite-json-log-viewer--continue-backfill-source
+    (composite-buffer source-buffer source-sqlite-file target-sqlite-file max-id after-id)
+  "Continue async chunked backfill for SOURCE-BUFFER into COMPOSITE-BUFFER."
+  (composite-json-log-viewer--copy-source-rows-async-chunk
+   source-sqlite-file target-sqlite-file after-id max-id
+   (lambda (result)
+     (when (buffer-live-p composite-buffer)
+       (with-current-buffer composite-buffer
+         (when composite-json-log-viewer--is-composite
+           (if-let ((err (plist-get result :error)))
+               (progn
+                 (message "composite-json-log-viewer backfill failed for %s: %s"
+                          (buffer-name source-buffer) err)
+                 (composite-json-log-viewer--finish-backfill-source))
+             (let ((copied (or (plist-get result :copied) 0))
+                   (next-after-id (or (plist-get result :next-after-id) after-id)))
+               (if (< copied (composite-json-log-viewer--backfill-chunk-size))
+                   (composite-json-log-viewer--finish-backfill-source)
+                 (composite-json-log-viewer--continue-backfill-source
+                  composite-buffer
+                  source-buffer
+                  source-sqlite-file
+                  target-sqlite-file
+                  max-id
+                  next-after-id))))))))))
+
+(defun composite-json-log-viewer--start-backfill (source-buffers)
+  "Start initial sqlite backfill for SOURCE-BUFFERS into current composite."
+  (let (source-snapshots)
+    (dolist (source-buffer source-buffers)
+      (when (buffer-live-p source-buffer)
+        (with-current-buffer source-buffer
+          (when (and json-log-viewer--sqlite-file
+                     (file-readable-p json-log-viewer--sqlite-file))
+            (push (list source-buffer
+                        json-log-viewer--sqlite-file
+                        (composite-json-log-viewer--source-max-entry-id source-buffer))
+                  source-snapshots)))))
+    (setq-local composite-json-log-viewer--backfill-pending-count (length source-snapshots))
+    (if (null source-snapshots)
+        (json-log-viewer--request-narrow-rebuild 'widen nil)
+      (let ((composite-buffer (current-buffer)))
+        (dolist (snapshot source-snapshots)
+          (let ((source-buffer (nth 0 snapshot))
+                (source-sqlite-file (nth 1 snapshot))
+                (max-id (nth 2 snapshot)))
+            (composite-json-log-viewer--continue-backfill-source
+             composite-buffer
+             source-buffer
+             source-sqlite-file
+             json-log-viewer--sqlite-file
+             max-id
+             0)))))))
 
 (defun composite-json-log-viewer--make-source-callback (composite-buffer)
   "Return source subscriber callback for COMPOSITE-BUFFER."
-  (lambda (_action source-buffer entry-overlays)
+  (lambda (action source-buffer entry-overlays)
     (when (and (buffer-live-p composite-buffer)
                (buffer-live-p source-buffer)
+               (eq action 'append)
                entry-overlays)
       (with-current-buffer composite-buffer
         (when composite-json-log-viewer--is-composite
-          (composite-json-log-viewer--append-source-overlays
-           source-buffer entry-overlays))))))
+          (dolist (entry-overlay entry-overlays)
+            (when-let ((entry-id
+                        (composite-json-log-viewer--source-entry-id entry-overlay)))
+              (composite-json-log-viewer--enqueue-source-entry
+               source-buffer entry-id))))))))
 
 (defun composite-json-log-viewer--unsubscribe-source (source-buffer subscription-id)
   "Unsubscribe SUBSCRIPTION-ID from SOURCE-BUFFER."
@@ -158,7 +291,8 @@
   (let ((subscription-id composite-json-log-viewer--subscription-id))
     (dolist (source-buffer (append composite-json-log-viewer--source-buffers nil))
       (composite-json-log-viewer--unsubscribe-source source-buffer subscription-id)))
-  (setq-local composite-json-log-viewer--source-buffers nil))
+  (setq-local composite-json-log-viewer--source-buffers nil)
+  (setq-local composite-json-log-viewer--backfill-pending-count 0))
 
 (defun composite-json-log-viewer-add-source (composite-buffer-or-name source-buffer-or-name)
   "Subscribe COMPOSITE-BUFFER-OR-NAME to SOURCE-BUFFER-OR-NAME."
@@ -190,9 +324,7 @@
     source-buffer))
 
 (defun composite-json-log-viewer-create (buffer-name source-buffers)
-  "Create composite BUFFER-NAME from SOURCE-BUFFERS.
-
-Existing source data is intentionally ignored in this first iteration."
+  "Create composite BUFFER-NAME from SOURCE-BUFFERS."
   (when-let ((existing (get-buffer buffer-name)))
     (with-current-buffer existing
       (when composite-json-log-viewer--is-composite
@@ -200,19 +332,26 @@ Existing source data is intentionally ignored in this first iteration."
   (let ((buffer (json-log-viewer-make-buffer
                  buffer-name
                  :log-lines nil
+                 :timestamp-path "timestamp"
+                 :level-path "level"
+                 :message-path "message"
                  :streaming t
                  :direction 'oldest-first)))
     (with-current-buffer buffer
       (setq-local composite-json-log-viewer--is-composite t)
       (setq-local composite-json-log-viewer--source-buffers nil)
-      (setq-local composite-json-log-viewer--next-signature-id 0)
       (setq-local composite-json-log-viewer--subscription-id
                   (list 'composite-json-log-viewer buffer))
       (setq-local composite-json-log-viewer--source-callback
                   (composite-json-log-viewer--make-source-callback buffer))
+      (setq-local composite-json-log-viewer--ingested-source-entries
+                  (make-hash-table :test 'equal))
+      ;; Keep ingest callbacks from rendering until the initial backfill ends.
+      (setq-local json-log-viewer--narrow-rebuild-in-progress t)
       (add-hook 'kill-buffer-hook #'composite-json-log-viewer--cleanup nil t)
       (dolist (source-buffer source-buffers)
-        (composite-json-log-viewer-add-source buffer source-buffer)))
+        (composite-json-log-viewer-add-source buffer source-buffer))
+      (composite-json-log-viewer--start-backfill source-buffers))
     (display-buffer buffer)
     buffer))
 
