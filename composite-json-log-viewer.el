@@ -11,9 +11,9 @@
 ;;; Code:
 
 (require 'json-log-viewer)
-(require 'sqlite)
 (require 'subr-x)
 (require 'async)
+(require 'json-log-viewer-repository)
 
 (declare-function json-log-viewer--make-log-ingestor-async-stored-job "json-log-viewer"
                   (line stored-entry))
@@ -90,18 +90,9 @@
              (integerp entry-id))
     (with-current-buffer source-buffer
       (when json-log-viewer--sqlite-db
-        (when-let ((row (car (sqlite-select json-log-viewer--sqlite-db
-                                            (concat
-                                             "SELECT timestamp_epoch, timestamp, level_path, "
-                                             "message_path, extra_paths, json "
-                                             "FROM log_entry WHERE id = ?")
-                                            (vector entry-id)))))
-          (list :sort-key (nth 0 row)
-                :timestamp (nth 1 row)
-                :level-path (nth 2 row)
-                :message-path (nth 3 row)
-                :extra-paths (nth 4 row)
-                :json (nth 5 row)))))))
+        (json-log-viewer-repository-select-entry-by-id
+         json-log-viewer--sqlite-db
+         entry-id)))))
 
 (defun composite-json-log-viewer--enqueue-source-entry (source-buffer entry-id &optional stored-entry)
   "Enqueue SOURCE-BUFFER ENTRY-ID into current composite ingestion queue.
@@ -133,9 +124,7 @@ When STORED-ENTRY is non-nil, skip source sqlite lookup and ingest it directly."
   "Return max sqlite entry id currently present in SOURCE-BUFFER."
   (with-current-buffer source-buffer
     (if json-log-viewer--sqlite-db
-        (or (car (car (sqlite-select json-log-viewer--sqlite-db
-                                     "SELECT COALESCE(MAX(id), 0) FROM log_entry")))
-            0)
+        (json-log-viewer-repository-select-max-id json-log-viewer--sqlite-db)
       0)))
 
 (defun composite-json-log-viewer--backfill-chunk-size ()
@@ -150,76 +139,35 @@ Rows are copied from SOURCE-SQLITE-FILE into TARGET-SQLITE-FILE for ids in
 \(AFTER-ID, MAX-ID], bounded by `composite-json-log-viewer--backfill-chunk-size`.
 CALLBACK receives plist (:copied N :next-after-id ID) on success or
 (:error MESSAGE) on failure."
-  (async-start
-   `(lambda ()
-      (require 'sqlite)
-      (condition-case err
-          (let ((attempt 0)
-                (result nil)
-                done)
-            (while (not done)
-              (setq attempt (1+ attempt))
-              (condition-case copy-err
-                  (let ((db (sqlite-open ,target-sqlite-file))
-                        (attached nil))
-                    (unwind-protect
-                        (progn
-                          (sqlite-execute db "PRAGMA journal_mode = WAL")
-                          (sqlite-execute db "PRAGMA synchronous = NORMAL")
-                          (sqlite-execute db "PRAGMA busy_timeout = 5000")
-                          (sqlite-execute db
-                                          "ATTACH DATABASE ? AS source_db"
-                                          (vector ,source-sqlite-file))
-                          (setq attached t)
-                          (let* ((meta-row
-                                  (car
-                                   (sqlite-select
-                                    db
-                                    (concat
-                                     "SELECT COALESCE(MAX(id), ?), COUNT(*) FROM ("
-                                     "SELECT id FROM source_db.log_entry "
-                                     "WHERE id > ? AND id <= ? "
-                                     "ORDER BY id LIMIT ?)")
-                                    (vector ,after-id
-                                            ,after-id
-                                            ,max-id
-                                            ,(composite-json-log-viewer--backfill-chunk-size)))))
-                                 (next-after-id (or (nth 0 meta-row) ,after-id))
-                                 (copied (or (nth 1 meta-row) 0)))
-                            (when (> copied 0)
-                              (sqlite-execute
-                               db
-                               (concat
-                                "INSERT INTO log_entry("
-                                "id, timestamp_epoch, timestamp, level_path, "
-                                "message_path, extra_paths, json) "
-                                "SELECT NULL, timestamp_epoch, timestamp, level_path, "
-                                "message_path, extra_paths, json "
-                                "FROM source_db.log_entry "
-                                "WHERE id > ? AND id <= ? "
-                                "ORDER BY id LIMIT ?")
-                               (vector ,after-id
-                                       ,max-id
-                                       ,(composite-json-log-viewer--backfill-chunk-size))))
-                            (setq result (list :copied copied
-                                               :next-after-id next-after-id))
-                            (setq done t)))
-                      (when attached
-                        (ignore-errors (sqlite-execute db "DETACH DATABASE source_db")))
-                      (ignore-errors (sqlite-close db))))
-                (error
-                 (let ((msg (downcase (error-message-string copy-err))))
-                   (if (and (< attempt 12)
-                            (or (string-match-p "database is locked" msg)
-                                (string-match-p "database is busy" msg)
-                                (string-match-p "sqlite_busy" msg)
-                                (string-match-p "sqlite_locked" msg)))
-                       (sleep-for (* 0.02 attempt))
-                     (signal (car copy-err) (cdr copy-err)))))))
-            result)
-        (error
-         (list :error (error-message-string err)))))
-   callback))
+  (let* ((repo-file
+          (or (locate-library "json-log-viewer-repository")
+              (when-let ((composite-file (locate-library "composite-json-log-viewer")))
+                (expand-file-name "json-log-viewer-repository.el"
+                                  (file-name-directory composite-file)))
+              (when (file-readable-p "json-log-viewer-repository.el")
+                (expand-file-name "json-log-viewer-repository.el"))))
+         (repo-dir (and repo-file (file-name-directory repo-file))))
+    (async-start
+     `(lambda ()
+        (when ,repo-dir
+          (add-to-list 'load-path ,repo-dir))
+        (unless (fboundp 'json-log-viewer-repository-run-transaction)
+          (unless (or (require 'json-log-viewer-repository nil t)
+                      (and ,repo-file (file-readable-p ,repo-file) (load ,repo-file nil t)))
+            (error "Cannot load json-log-viewer-repository in async backfill worker")))
+        (condition-case err
+            (json-log-viewer-repository-run-transaction
+             ,target-sqlite-file
+             (lambda (db)
+               (json-log-viewer-repository-copy-source-chunk
+                db
+                ,source-sqlite-file
+                ,after-id
+                ,max-id
+                ,(composite-json-log-viewer--backfill-chunk-size))))
+          (error
+           (list :error (error-message-string err)))))
+     callback)))
 
 (defun composite-json-log-viewer--finish-backfill-source ()
   "Mark one source backfill as completed in current composite buffer."

@@ -10,10 +10,10 @@
 
 (require 'cl-lib)
 (require 'json)
-(require 'sqlite)
 (require 'subr-x)
 
 (require 'json-log-viewer-shared)
+(require 'json-log-viewer-repository)
 
 (declare-function json-pretty-print-buffer "json" ())
 
@@ -260,14 +260,14 @@
                        (plist-get summary :extra-fields)))
          (timestamp-epoch (plist-get summary :timestamp-epoch))
          (storage-json (json-log-viewer-async-worker--line->storage-json line parsed)))
-    (sqlite-execute
-     db
-     (concat
-      "INSERT INTO log_entry("
-      "timestamp_epoch, timestamp, level_path, message_path, extra_paths, json) "
-      "VALUES (?, ?, ?, ?, ?, ?)")
-     (vector timestamp-epoch timestamp-text level-path message-path extra-paths storage-json))
-    (let ((id (car (car (sqlite-select db "SELECT last_insert_rowid()")))))
+    (let ((id (json-log-viewer-repository-insert-entry
+               db
+               timestamp-epoch
+               timestamp-text
+               level-path
+               message-path
+               extra-paths
+               storage-json)))
       (when (json-log-viewer-async-worker--json-matches-narrow-p storage-json narrow-string)
         (list :id id
               :sort-key (or sort-key (+ 1000000000000.0 id))
@@ -285,14 +285,14 @@
          (message-path (or (plist-get stored-entry :message-path) "-"))
          (extra-paths (or (plist-get stored-entry :extra-paths) ""))
          (storage-json (or line "")))
-    (sqlite-execute
-     db
-     (concat
-      "INSERT INTO log_entry("
-      "timestamp_epoch, timestamp, level_path, message_path, extra_paths, json) "
-      "VALUES (?, ?, ?, ?, ?, ?)")
-     (vector sort-key timestamp-text level-path message-path extra-paths storage-json))
-    (let ((id (car (car (sqlite-select db "SELECT last_insert_rowid()")))))
+    (let ((id (json-log-viewer-repository-insert-entry
+               db
+               sort-key
+               timestamp-text
+               level-path
+               message-path
+               extra-paths
+               storage-json)))
       (when (json-log-viewer-async-worker--json-matches-narrow-p storage-json narrow-string)
         (list :id id
               :sort-key (or sort-key (+ 1000000000000.0 id))
@@ -302,13 +302,13 @@
               :extra-fields (json-log-viewer-async-worker--csv->extra-fields extra-paths))))))
 
 (defun json-log-viewer-async-worker--stored-row->entry (row)
-  "Build summary entry from sqlite ROW."
-  (let ((id (nth 0 row))
-        (sort-key (nth 1 row))
-        (timestamp-text (nth 2 row))
-        (level-path (nth 3 row))
-        (message-path (nth 4 row))
-        (extra-paths (nth 5 row)))
+  "Build summary entry from sqlite ROW plist."
+  (let ((id (plist-get row :id))
+        (sort-key (plist-get row :sort-key))
+        (timestamp-text (plist-get row :timestamp))
+        (level-path (plist-get row :level-path))
+        (message-path (plist-get row :message-path))
+        (extra-paths (plist-get row :extra-paths)))
     (list :id id
           :sort-key (or sort-key (+ 1000000000000.0 (or id 0)))
           :timestamp (or timestamp-text "-")
@@ -318,83 +318,30 @@
 
 (defun json-log-viewer-async-worker--sqlite-select-entries (db _config &optional narrow-string)
   "Return ordered summary entries from DB using CONFIG and NARROW-STRING."
-  (let* ((rows (if narrow-string
-                   (sqlite-select
-                    db
-                    (concat
-                     "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths "
-                     "FROM log_entry "
-                     "WHERE instr(lower(json), ?) > 0 "
-                     "ORDER BY id")
-                    (vector narrow-string))
-                 (sqlite-select
-                  db
-                  (concat
-                   "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths "
-                   "FROM log_entry ORDER BY id"))))
-         entries)
+  (let ((rows (json-log-viewer-repository-select-summary-entries db narrow-string))
+        entries)
     (dolist (row rows)
       (push (json-log-viewer-async-worker--stored-row->entry row) entries))
     (nreverse entries)))
 
 (defun json-log-viewer-async-worker--sqlite-truncate-oldest (db count)
   "Delete COUNT oldest rows from DB ordered by timestamp then id."
-  (when (> count 0)
-    (sqlite-execute
-     db
-     (concat
-      "DELETE FROM log_entry "
-      "WHERE id IN ("
-      "SELECT id FROM log_entry "
-      "ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, timestamp_epoch, id "
-      "LIMIT ?)")
-     (vector count)))
-  count)
+  (json-log-viewer-repository-truncate-oldest db count))
 
 (defconst json-log-viewer-async-worker--sqlite-lock-retries 12
   "Maximum retries when sqlite reports lock contention.")
 
 (defun json-log-viewer-async-worker--sqlite-setup (db)
   "Apply sqlite settings for DB used by async workers."
-  ;; WAL allows concurrent reader/writer connections, and busy timeout avoids
-  ;; immediate failure when the other async worker holds the write lock.
-  (sqlite-execute db "PRAGMA journal_mode = WAL")
-  (sqlite-execute db "PRAGMA synchronous = NORMAL")
-  (sqlite-execute db "PRAGMA busy_timeout = 5000"))
+  (json-log-viewer-repository-setup-db db))
 
 (defun json-log-viewer-async-worker--sqlite-lock-error-p (err)
   "Return non-nil when ERR indicates sqlite lock contention."
-  (string-match-p
-   "\\(database is locked\\|database is busy\\|sqlite_busy\\|sqlite_locked\\)"
-   (downcase (error-message-string err))))
+  (json-log-viewer-repository-lock-error-p err))
 
 (defun json-log-viewer-async-worker--sqlite-run-transaction (sqlite-file body-fn)
   "Run BODY-FN inside a sqlite transaction for SQLITE-FILE with lock retries."
-  (let ((attempt 0)
-        result
-        done)
-    (while (not done)
-      (setq attempt (1+ attempt))
-      (let ((db (sqlite-open sqlite-file))
-            (committed nil))
-        (unwind-protect
-            (condition-case err
-                (progn
-                  (json-log-viewer-async-worker--sqlite-setup db)
-                  (sqlite-execute db "BEGIN IMMEDIATE")
-                  (setq result (funcall body-fn db))
-                  (sqlite-execute db "COMMIT")
-                  (setq committed t)
-                  (setq done t))
-              (error
-               (unless committed
-                 (ignore-errors (sqlite-execute db "ROLLBACK")))
-               (if (and (< attempt json-log-viewer-async-worker--sqlite-lock-retries)
-                        (json-log-viewer-async-worker--sqlite-lock-error-p err))
-                   (sleep-for (* 0.02 attempt))
-                 (signal (car err) (cdr err)))))
-          (ignore-errors (sqlite-close db)))))
-    result))
+  (json-log-viewer-repository-run-transaction sqlite-file body-fn))
 
 (defun json-log-viewer-async-worker--config-from-job (job)
   "Extract reusable config plist from JOB."
@@ -418,7 +365,7 @@
        (json-log-viewer-async-worker--sqlite-run-transaction
         sqlite-file
         (lambda (db)
-          (sqlite-execute db "DELETE FROM log_entry")))
+          (json-log-viewer-repository-reset-log-entries db)))
        (list :op 'reset))
       ('ingest
        (let ((line (plist-get job :line)))

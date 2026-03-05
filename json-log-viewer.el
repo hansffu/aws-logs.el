@@ -15,6 +15,7 @@
 (require 'async-job-queue)
 
 (require 'json-log-viewer-shared)
+(require 'json-log-viewer-repository)
 
 (declare-function json-pretty-print-buffer "json" ())
 (declare-function async-job-queue-create "async-job-queue" (process-func callback-func))
@@ -315,22 +316,8 @@ CALLBACK is called as (ACTION SOURCE-BUFFER ENTRY-OVERLAYS)."
          (db (sqlite-open file)))
     (setq-local json-log-viewer--sqlite-file file)
     (setq-local json-log-viewer--sqlite-db db)
-    ;; Keep UI reads responsive while async worker connections write.
-    (sqlite-execute db "PRAGMA journal_mode = WAL")
-    (sqlite-execute db "PRAGMA synchronous = NORMAL")
-    (sqlite-execute db "PRAGMA busy_timeout = 5000")
-    (sqlite-execute
-     db
-     (concat
-      "CREATE TABLE log_entry ("
-      "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-      "timestamp_epoch REAL, "
-      "timestamp TEXT, "
-      "level_path TEXT, "
-      "message_path TEXT, "
-      "extra_paths TEXT, "
-      "json TEXT NOT NULL)"))
-    (sqlite-execute db "CREATE INDEX log_entry_timestamp_idx ON log_entry(timestamp_epoch, id)")))
+    (json-log-viewer-repository-setup-db db)
+    (json-log-viewer-repository-create-schema db)))
 
 (defun json-log-viewer--storage-close ()
   "Close and cleanup current buffer storage resources."
@@ -397,11 +384,10 @@ CALLBACK is called as (ACTION SOURCE-BUFFER ENTRY-OVERLAYS)."
     (when (and (buffer-live-p storage-buffer)
                entry-id)
       (with-current-buffer storage-buffer
-        (when-let* ((row (and json-log-viewer--sqlite-db
-                              (car (sqlite-select json-log-viewer--sqlite-db
-                                                  "SELECT json FROM log_entry WHERE id = ?"
-                                                  (vector entry-id)))))
-                    (json-text (car row)))
+        (when-let* ((json-text (and json-log-viewer--sqlite-db
+                                    (json-log-viewer-repository-select-entry-json-by-id
+                                     json-log-viewer--sqlite-db
+                                     entry-id))))
           (json-log-viewer--normalize-fields
            (json-log-viewer--json-object-fields
             (json-log-viewer-shared--parse-json-line json-text)
@@ -414,13 +400,10 @@ CALLBACK is called as (ACTION SOURCE-BUFFER ENTRY-OVERLAYS)."
              (stringp needle)
              (not (string-empty-p needle)))
     (let ((matches (make-hash-table :test 'equal)))
-      (dolist (row (sqlite-select json-log-viewer--sqlite-db
-                                  (concat
-                                   "SELECT id FROM log_entry "
-                                   "WHERE instr(lower(json), ?) > 0")
-                                  (vector needle)))
-        (when-let ((id (car row)))
-          (puthash (number-to-string id) t matches)))
+      (dolist (id (json-log-viewer-repository-select-matching-ids
+                   json-log-viewer--sqlite-db
+                   needle))
+        (puthash (number-to-string id) t matches))
       matches)))
 
 (defun json-log-viewer--async-worker-file ()
@@ -1349,9 +1332,7 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback is applied."
 
 (defun json-log-viewer--raw-lines-list ()
   "Return flattened copy of raw lines from sqlite storage."
-  (mapcar #'car
-          (sqlite-select json-log-viewer--sqlite-db
-                         "SELECT json FROM log_entry ORDER BY id")))
+  (json-log-viewer-repository-select-all-json-lines json-log-viewer--sqlite-db))
 
 (defun json-log-viewer--get-logs-since (timestamp limit)
   "Return stored log rows before TIMESTAMP from current buffer sqlite storage.
@@ -1372,51 +1353,10 @@ Return value is always sorted in ascending order and each row is a plist:
   (unless (or (null limit)
               (and (integerp limit) (> limit 0)))
     (user-error "LIMIT must be a positive integer or nil, got: %S" limit))
-  (let* ((rows
-          (cond
-           ((and timestamp limit)
-            ;; Query newest-first to apply LIMIT, then reverse to ascending.
-           (nreverse
-             (sqlite-select
-              json-log-viewer--sqlite-db
-              (concat
-               "SELECT id, timestamp_epoch, json FROM log_entry "
-               "WHERE timestamp_epoch < ? "
-               "ORDER BY timestamp_epoch DESC, id DESC LIMIT ?")
-              (vector timestamp limit))))
-           (timestamp
-            (sqlite-select
-             json-log-viewer--sqlite-db
-             (concat
-              "SELECT id, timestamp_epoch, json FROM log_entry "
-              "WHERE timestamp_epoch < ? "
-              "ORDER BY timestamp_epoch ASC, id ASC")
-             (vector timestamp)))
-           (limit
-            ;; Query newest-first to apply LIMIT, then reverse to ascending.
-            (nreverse
-             (sqlite-select
-              json-log-viewer--sqlite-db
-              (concat
-               "SELECT id, timestamp_epoch, json FROM log_entry "
-               "ORDER BY "
-               "CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, "
-               "timestamp_epoch DESC, id DESC LIMIT ?")
-              (vector limit))))
-           (t
-            (sqlite-select
-             json-log-viewer--sqlite-db
-             (concat
-              "SELECT id, timestamp_epoch, json FROM log_entry "
-              "ORDER BY "
-              "CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, "
-              "timestamp_epoch ASC, id ASC"))))))
-    (mapcar
-     (lambda (row)
-       (list :id (nth 0 row)
-             :timestamp (nth 1 row)
-             :json (nth 2 row)))
-     rows)))
+  (json-log-viewer-repository-select-logs-before
+   json-log-viewer--sqlite-db
+   timestamp
+   limit))
 
 (defun json-log-viewer--info-line (key value)
   "Return formatted popup info line from KEY and VALUE."
