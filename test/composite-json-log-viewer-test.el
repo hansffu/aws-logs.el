@@ -137,5 +137,59 @@
       (when (buffer-live-p source-b)
         (kill-buffer source-b)))))
 
+(ert-deftest composite-json-log-viewer-live-ingest-uses-source-summary-paths-test ()
+  (let ((source nil)
+        (composite nil))
+    (unwind-protect
+        (progn
+          (setq source
+                (json-log-viewer-make-buffer
+                 "*json-log-viewer-source-paths-test*"
+                 :log-lines nil
+                 :timestamp-path "meta.ts"
+                 :level-path "meta.level"
+                 :message-path "payload.msg"
+                 :streaming t
+                 :direction 'oldest-first))
+          (json-log-viewer-push
+           source
+           '("{\"meta\":{\"ts\":\"2026-01-01T00:00:00Z\",\"level\":\"info\"},\"payload\":{\"msg\":\"old\"}}"))
+          (with-current-buffer source
+            (json-log-viewer--async-await-pending-count 0))
+          (setq composite
+                (composite-json-log-viewer-create
+                 "*composite-json-log-viewer-paths-test*"
+                 (list source)))
+          (should (composite-json-log-viewer-test--wait-for
+                   (lambda ()
+                     (with-current-buffer composite
+                       (= (length json-log-viewer--entry-overlays) 1)))))
+          (json-log-viewer-push
+           source
+           '("{\"meta\":{\"ts\":\"2026-01-01T00:00:01Z\",\"level\":\"warn\"},\"payload\":{\"msg\":\"live\"}}"))
+          (with-current-buffer source
+            (json-log-viewer--async-await-pending-count 0))
+          (should (composite-json-log-viewer-test--wait-for
+                   (lambda ()
+                     (with-current-buffer composite
+                       (= (length json-log-viewer--entry-overlays) 2)))))
+          (with-current-buffer composite
+            (let* ((entry (car (last (sort (append json-log-viewer--entry-overlays nil)
+                                           (lambda (a b)
+                                             (< (overlay-start a)
+                                                (overlay-start b)))))))
+                   (summary (save-excursion
+                              (goto-char (overlay-start entry))
+                              (buffer-substring-no-properties
+                               (line-beginning-position)
+                               (line-end-position)))))
+              (should (string-match-p "2026-01-01T00:00:01Z" summary))
+              (should (string-match-p " WARN " summary))
+              (should (string-match-p " live$" summary)))))
+      (when (buffer-live-p composite)
+        (kill-buffer composite))
+      (when (buffer-live-p source)
+        (kill-buffer source)))))
+
 (provide 'composite-json-log-viewer-test)
 ;;; composite-json-log-viewer-test.el ends here

@@ -15,8 +15,8 @@
 (require 'async)
 (require 'json-log-viewer-repository)
 
-(declare-function json-log-viewer--make-log-ingestor-async-stored-job "json-log-viewer"
-                  (line stored-entry))
+(declare-function json-log-viewer--make-log-ingestor-async-job "json-log-viewer"
+                  (op line &optional narrow-string))
 (declare-function json-log-viewer--async-submit "json-log-viewer" (job &optional wait-for-callback))
 (declare-function json-log-viewer--request-narrow-rebuild "json-log-viewer"
                   (op &optional needle wait-for-callback))
@@ -24,6 +24,10 @@
 (defvar json-log-viewer--sqlite-db)
 (defvar json-log-viewer--sqlite-file)
 (defvar json-log-viewer--narrow-rebuild-in-progress)
+(defvar json-log-viewer--timestamp-path)
+(defvar json-log-viewer--level-path)
+(defvar json-log-viewer--message-path)
+(defvar json-log-viewer--extra-paths)
 
 (defvar-local composite-json-log-viewer--is-composite nil
   "Non-nil in composite json-log-viewer buffers.")
@@ -84,20 +88,27 @@
       (string-to-number entry-id))
      (t nil))))
 
-(defun composite-json-log-viewer--source-entry-by-id (source-buffer entry-id)
-  "Return stored source entry data from SOURCE-BUFFER ENTRY-ID."
+(defun composite-json-log-viewer--source-entry-json-by-id (source-buffer entry-id)
+  "Return stored source JSON text from SOURCE-BUFFER ENTRY-ID."
   (when (and (buffer-live-p source-buffer)
              (integerp entry-id))
     (with-current-buffer source-buffer
       (when json-log-viewer--sqlite-db
-        (json-log-viewer-repository-select-entry-by-id
+        (json-log-viewer-repository-select-entry-json-by-id
          json-log-viewer--sqlite-db
          entry-id)))))
 
-(defun composite-json-log-viewer--enqueue-source-entry (source-buffer entry-id &optional stored-entry)
-  "Enqueue SOURCE-BUFFER ENTRY-ID into current composite ingestion queue.
+(defun composite-json-log-viewer--source-summary-config (source-buffer)
+  "Return summary path config plist from SOURCE-BUFFER."
+  (when (buffer-live-p source-buffer)
+    (with-current-buffer source-buffer
+      (list :timestamp-path json-log-viewer--timestamp-path
+            :level-path json-log-viewer--level-path
+            :message-path json-log-viewer--message-path
+            :extra-paths (append json-log-viewer--extra-paths nil)))))
 
-When STORED-ENTRY is non-nil, skip source sqlite lookup and ingest it directly."
+(defun composite-json-log-viewer--enqueue-source-entry (source-buffer entry-id)
+  "Enqueue SOURCE-BUFFER ENTRY-ID into current composite ingestion queue."
   (when (and (integerp entry-id)
              (buffer-live-p source-buffer))
     (let* ((seen (or composite-json-log-viewer--ingested-source-entries
@@ -105,20 +116,19 @@ When STORED-ENTRY is non-nil, skip source sqlite lookup and ingest it directly."
                                  (make-hash-table :test 'equal))))
            (key (cons source-buffer entry-id)))
       (unless (gethash key seen)
-        (puthash key t seen)
-        (when-let* ((entry (or stored-entry
-                               (composite-json-log-viewer--source-entry-by-id
-                                source-buffer entry-id)))
-                    (json-line (plist-get entry :json))
-                    (summary (list :sort-key (plist-get entry :sort-key)
-                                   :timestamp (plist-get entry :timestamp)
-                                   :level-path (plist-get entry :level-path)
-                                   :message-path (plist-get entry :message-path)
-                                   :extra-paths (plist-get entry :extra-paths))))
-          (json-log-viewer--async-submit
-           (json-log-viewer--make-log-ingestor-async-stored-job
-            json-line
-            summary)))))))
+       (puthash key t seen)
+        (when-let* ((json-line (composite-json-log-viewer--source-entry-json-by-id
+                                source-buffer entry-id))
+                    (source-config (composite-json-log-viewer--source-summary-config
+                                    source-buffer)))
+          (let ((job (json-log-viewer--make-log-ingestor-async-job 'ingest json-line)))
+            ;; Keep composite queue/db/filter behavior but parse summary fields
+            ;; using source buffer paths so live and backfilled rows match.
+            (setq job (plist-put job :timestamp-path (plist-get source-config :timestamp-path)))
+            (setq job (plist-put job :level-path (plist-get source-config :level-path)))
+            (setq job (plist-put job :message-path (plist-get source-config :message-path)))
+            (setq job (plist-put job :extra-paths (plist-get source-config :extra-paths)))
+            (json-log-viewer--async-submit job)))))))
 
 (defun composite-json-log-viewer--source-max-entry-id (source-buffer)
   "Return max sqlite entry id currently present in SOURCE-BUFFER."

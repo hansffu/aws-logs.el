@@ -585,17 +585,6 @@ CALLBACK is called as (ACTION SOURCE-BUFFER ENTRY-OVERLAYS)."
         :extra-paths json-log-viewer--extra-paths
         :sqlite-file json-log-viewer--sqlite-file))
 
-(defun json-log-viewer--make-log-ingestor-async-stored-job (line stored-entry)
-  "Build log-ingestor async payload for LINE with STORED-ENTRY summary.
-
-STORED-ENTRY is a plist with keys:
-`:sort-key', `:timestamp', `:level-path', `:message-path', and `:extra-paths'."
-  (list :op 'ingest-stored
-        :line line
-        :stored-entry stored-entry
-        :worker-file (json-log-viewer--async-worker-file)
-        :sqlite-file json-log-viewer--sqlite-file))
-
 (defun json-log-viewer--make-trunkator-async-job (count)
   "Build trunkator async queue payload for COUNT."
   (list :count count

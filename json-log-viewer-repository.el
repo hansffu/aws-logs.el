@@ -196,6 +196,23 @@ Returned rows are ascending plists of shape
        "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths "
        "FROM log_entry ORDER BY id")))))
 
+(defun json-log-viewer-repository-select-summary-entry-by-id (db entry-id)
+  "Return summary row plist for ENTRY-ID from DB."
+  (when-let ((row
+              (car
+               (sqlite-select
+                db
+                (concat
+                 "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths "
+                 "FROM log_entry WHERE id = ?")
+                (vector entry-id)))))
+    (list :id (nth 0 row)
+          :sort-key (nth 1 row)
+          :timestamp (nth 2 row)
+          :level-path (nth 3 row)
+          :message-path (nth 4 row)
+          :extra-paths (nth 5 row))))
+
 (defun json-log-viewer-repository-reset-log-entries (db)
   "Delete all log rows in DB."
   (sqlite-execute db "DELETE FROM log_entry"))

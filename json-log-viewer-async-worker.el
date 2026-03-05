@@ -16,6 +16,8 @@
 (require 'json-log-viewer-repository)
 
 (declare-function json-pretty-print-buffer "json" ())
+(declare-function json-log-viewer-repository-select-summary-entry-by-id
+                  "json-log-viewer-repository" (db entry-id))
 
 (defun json-log-viewer-async-worker--normalize-narrow-string (needle)
   "Normalize NEEDLE into downcased substring matching text, or nil."
@@ -252,7 +254,6 @@
   "Insert one LINE into DB and return summary plist when it matches NARROW-STRING."
   (let* ((summary (json-log-viewer-async-worker--line->summary line config))
          (parsed (plist-get summary :parsed))
-         (sort-key (plist-get summary :sort-key))
          (timestamp-text (plist-get summary :timestamp))
          (level-path (plist-get summary :level))
          (message-path (plist-get summary :message))
@@ -269,37 +270,8 @@
                extra-paths
                storage-json)))
       (when (json-log-viewer-async-worker--json-matches-narrow-p storage-json narrow-string)
-        (list :id id
-              :sort-key (or sort-key (+ 1000000000000.0 id))
-              :timestamp timestamp-text
-              :level level-path
-              :message message-path
-              :extra-fields (plist-get summary :extra-fields))))))
-
-(defun json-log-viewer-async-worker--sqlite-insert-stored-entry
-    (db line stored-entry &optional narrow-string)
-  "Insert one precomputed LINE/STORED-ENTRY row into DB."
-  (let* ((sort-key (or (plist-get stored-entry :sort-key) nil))
-         (timestamp-text (or (plist-get stored-entry :timestamp) "-"))
-         (level-path (or (plist-get stored-entry :level-path) "-"))
-         (message-path (or (plist-get stored-entry :message-path) "-"))
-         (extra-paths (or (plist-get stored-entry :extra-paths) ""))
-         (storage-json (or line "")))
-    (let ((id (json-log-viewer-repository-insert-entry
-               db
-               sort-key
-               timestamp-text
-               level-path
-               message-path
-               extra-paths
-               storage-json)))
-      (when (json-log-viewer-async-worker--json-matches-narrow-p storage-json narrow-string)
-        (list :id id
-              :sort-key (or sort-key (+ 1000000000000.0 id))
-              :timestamp timestamp-text
-              :level level-path
-              :message message-path
-              :extra-fields (json-log-viewer-async-worker--csv->extra-fields extra-paths))))))
+        (json-log-viewer-async-worker--stored-row->entry
+         (json-log-viewer-repository-select-summary-entry-by-id db id))))))
 
 (defun json-log-viewer-async-worker--stored-row->entry (row)
   "Build summary entry from sqlite ROW plist."
@@ -378,20 +350,6 @@
                 (lambda (db)
                   (json-log-viewer-async-worker--sqlite-insert-log-entry
                    db line config narrow-string))))))
-      ('ingest-stored
-       (let ((line (plist-get job :line))
-             (stored-entry (plist-get job :stored-entry)))
-         (unless (stringp line)
-           (error "Log-ingestor job :line must be a string"))
-         (unless (listp stored-entry)
-           (error "Log-ingestor job :stored-entry must be a plist"))
-         (list :op 'ingest
-               :entry
-               (json-log-viewer-async-worker--sqlite-run-transaction
-                sqlite-file
-                (lambda (db)
-                  (json-log-viewer-async-worker--sqlite-insert-stored-entry
-                   db line stored-entry narrow-string))))))
       ('narrow
        (unless narrow-string
          (error "Log-ingestor narrow op requires :narrow-string"))
