@@ -30,6 +30,10 @@
 (declare-function json-log-viewer-replace-log-lines "json-log-viewer"
                   (buffer-or-name log-lines &optional preserve-filter))
 
+(define-derived-mode kafka-logs-viewer-mode json-log-viewer-mode "Kafka-Logs"
+  "Major mode for Kafka log buffers rendered with `json-log-viewer`."
+  :group 'kafka-logs)
+
 (defgroup kafka-logs nil
   "Kafka logs transient UI and rendering."
   :group 'tools)
@@ -763,6 +767,7 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
            :message-path message-path
            :extra-paths extra-paths
            :json-paths kafka-logs-json-paths
+           :mode #'kafka-logs-viewer-mode
            :streaming streaming
            :direction 'oldest-first
            :header-lines-function #'kafka-logs--viewer-header-lines))

@@ -17,6 +17,10 @@
 
 (require 'json-log-viewer)
 
+(define-derived-mode kube-logs-viewer-mode json-log-viewer-mode "Kube-Logs"
+  "Major mode for Kubernetes log buffers rendered with `json-log-viewer`."
+  :group 'kube-logs)
+
 (defcustom kube-logs-kubectl "kubectl"
   "Kubectl executable used by kube-logs."
   :type 'string
@@ -378,6 +382,7 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
            :level-path kube-logs-level-path
            :message-path kube-logs-message-path
            :extra-paths kube-logs-extra-paths
+           :mode #'kube-logs-viewer-mode
            :streaming streaming
            :direction 'oldest-first
            :header-lines-function #'kube-logs--viewer-header-lines))

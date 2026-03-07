@@ -93,6 +93,10 @@
   :group 'aws-logs
   (read-only-mode 1))
 
+(define-derived-mode aws-logs-tail-viewer-mode json-log-viewer-mode "AWS-Logs-Tail"
+  "Major mode for AWS tail buffers rendered with `json-log-viewer`."
+  :group 'aws-logs)
+
 (defun aws-logs-tail-quit-process-and-window ()
   "Stop the current tail process (if any) and close the window."
   (interactive)
@@ -335,6 +339,7 @@ When STREAMING is non-nil, buffer is configured for incremental pushes."
            :timestamp-path "@timestamp"
            :level-path "log.level"
            :message-path "message"
+           :mode #'aws-logs-tail-viewer-mode
            :streaming streaming
            :direction 'oldest-first
            :header-lines-function #'aws-logs--tail-header-lines))

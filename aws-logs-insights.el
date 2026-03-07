@@ -98,6 +98,10 @@
 (defconst aws-logs--insights-poll-delay 1
   "Seconds between async poll attempts for one Insights query.")
 
+(define-derived-mode aws-logs-insights-viewer-mode json-log-viewer-mode "AWS-Logs-Insights"
+  "Major mode for AWS Logs Insights buffers rendered with `json-log-viewer`."
+  :group 'aws-logs)
+
 (defun aws-logs--insights-global-args ()
   "Build common AWS CLI arguments from current backing fields."
   (delq nil
@@ -685,13 +689,14 @@ ON-SUCCESS is called with (QUERY-ID PAYLOAD)."
          (extra-paths (aws-logs--insights-extra-summary-paths extra-fields))
          (buffer-name (format "*AWS insights - %s*" aws-logs-log-group))
          (buffer
-          (json-log-viewer-make-buffer
+         (json-log-viewer-make-buffer
            buffer-name
            :log-lines nil
            :timestamp-path "__summary_timestamp"
            :level-path "__summary_level"
            :message-path "__summary_message"
            :extra-paths extra-paths
+           :mode #'aws-logs-insights-viewer-mode
            :refresh-function #'aws-logs--insights-refresh-dispatch
            :streaming nil
            :direction 'newest-first

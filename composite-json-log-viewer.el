@@ -52,6 +52,10 @@
   :type 'integer
   :group 'json-log-viewer)
 
+(define-derived-mode composite-json-log-viewer-mode json-log-viewer-mode "Composite-Logs"
+  "Major mode for composite buffers rendered with `json-log-viewer`."
+  :group 'json-log-viewer)
+
 (defun composite-json-log-viewer--source-candidates ()
   "Return live non-composite `json-log-viewer-mode' buffers."
   (let (buffers)
@@ -313,6 +317,7 @@ CALLBACK receives plist (:copied N :next-after-id ID) on success or
                  :timestamp-path "timestamp"
                  :level-path "level"
                  :message-path "message"
+                 :mode #'composite-json-log-viewer-mode
                  :streaming t
                  :direction 'oldest-first)))
     (with-current-buffer buffer

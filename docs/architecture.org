@@ -1,0 +1,379 @@
+#+title: Repository Architecture
+
+* Overview
+
+This repository is a small family of Emacs Lisp log tooling packages built around one shared core:
+
+- Source adapters collect logs from external systems and normalize them into JSON lines.
+- =json-log-viewer= stores those lines in SQLite, derives summary metadata asynchronously, and renders interactive log buffers.
+- Higher-level packages provide transient UIs, session state, source-specific command building, and source-specific header metadata.
+
+The current packages are:
+
+- =aws-logs=: CloudWatch tailing and Logs Insights querying.
+- =kube-logs=: Kubernetes log viewing through =kubectl logs=.
+- =kafka-logs=: Kafka message viewing through =kcat=.
+- =json-log-viewer=: generic viewer, storage, filtering, and rendering engine.
+- =composite-json-log-viewer=: merged stream built from other =json-log-viewer= buffers.
+
+* Architectural Style
+
+The system follows a layered structure:
+
+1. UI/session layer
+   - Transient menus and buffer-local/session variables capture user intent.
+   - Examples: =aws-logs.el=, =kube-logs.el=, =kafka-logs.el=.
+2. Source execution layer
+   - Builds CLI commands, runs subprocesses, and handles one-shot vs streaming flows.
+   - Converts source output into normalized JSON lines or row objects.
+3. Shared viewer layer
+   - Stores log data in per-buffer SQLite databases.
+   - Asynchronously derives display summaries and details.
+   - Renders foldable overlays, handles narrow/widen, refresh, and auto-follow.
+4. Async infrastructure layer
+   - Runs ordered jobs in subordinate Emacs processes.
+   - Keeps heavy SQLite and normalization work off the main UI thread.
+
+This keeps source-specific logic mostly separate from rendering/storage logic.
+
+* Main Components
+
+** Source Packages
+
+*** =aws-logs.el=
+
+- Owns user-facing session state: profile, region, log group, time range, follow mode, ECS mode, filters, Insights query, summary field overrides, and presets.
+- Defines the transient UI and saved-query workflow.
+- Delegates execution to:
+  - =aws-logs-tail.el= for =aws logs tail=
+  - =aws-logs-insights.el= for Logs Insights
+  - =aws-logs-query.el= for query editing mode
+
+*** =aws-logs-tail.el=
+
+- Builds =aws logs tail= commands from the session state.
+- Supports two rendering modes:
+  - Plain comint output for raw tailing.
+  - ECS/JSON mode through =json-log-viewer=.
+- In ECS streaming mode it implements a staged pipeline:
+  - process chunk queue
+  - raw line queue
+  - JSON normalization queue
+  - batched viewer pushes
+- Applies backpressure by pausing and resuming the subprocess when queues exceed watermarks.
+
+*** =aws-logs-insights.el=
+
+- Runs asynchronous Logs Insights queries using =start-query= and polling =get-query-results=.
+- Freezes source context into the viewer buffer so refreshes keep using the original query, log group, and AWS args.
+- Converts Insights rows into JSON lines with synthetic summary fields:
+  - =__summary_timestamp=
+  - =__summary_level=
+  - =__summary_message=
+  - synthetic extra fields
+- Uses =json-log-viewer= as the display surface for both initial loads and refreshes.
+
+*** =aws-logs-query.el=
+
+- Defines a small major mode for Logs Insights query editing.
+- Provides popup editing with recursive-edit and finish/cancel commands.
+- Supplies syntax highlighting used both in the editor and in transient summaries.
+
+*** =kube-logs.el=
+
+- Provides a transient UI for =kubectl logs=.
+- Manages context, namespace, target kind/name, follow, tail, since, filters, and presets.
+- Converts Kubernetes log lines into normalized JSON objects with fields such as:
+  - =timestamp=
+  - =raw=
+  - =namespace=
+  - =target=
+  - =kind=
+  - =payload=
+- Uses =json-log-viewer= for both one-shot and streaming modes.
+
+*** =kafka-logs.el=
+
+- Provides a transient UI for =kcat=.
+- Manages connection definitions, topic selection, stream vs time-span mode, filters, payload format, message path, JSON detail paths, and extra summary paths.
+- Resolves credentials from =auth-source= when configured.
+- Converts kcat JSON envelopes into normalized JSON objects with fields such as:
+  - =timestamp=
+  - =level=
+  - =topic=
+  - =partition=
+  - =offset=
+  - =key=
+  - =payload=
+- Uses =json-log-viewer= for both one-shot and streaming consumption.
+
+*** =composite-json-log-viewer.el=
+
+- Creates a derived aggregate stream by subscribing to other =json-log-viewer= buffers.
+- Has two ingestion paths:
+  - Initial backfill by copying SQLite rows from source buffers into the composite buffer's SQLite database.
+  - Live append by subscribing to source-buffer append events and ingesting the corresponding source entries.
+- Reuses =json-log-viewer= for storage, filtering, and display instead of inventing a separate renderer.
+
+** Shared Viewer and Storage
+
+*** =json-log-viewer.el=
+
+This is the core of the repository.
+
+Responsibilities:
+
+- Create viewer buffers with =json-log-viewer-make-buffer=.
+- Normalize summary/display configuration:
+  - timestamp path
+  - level path
+  - message path
+  - extra summary paths
+  - JSON detail block paths
+- Persist raw JSON in a per-buffer SQLite database.
+- Run async ingestion and truncation queues.
+- Render foldable summary rows with overlay-backed expansion.
+- Support:
+  - streaming append
+  - non-streaming replace
+  - narrow/widen replay from stored JSON
+  - refresh callbacks
+  - auto-follow
+  - subscriber notifications
+
+Important design choice:
+
+- The main buffer keeps summaries and overlays in memory.
+- Full detail data lives in SQLite and is loaded lazily when an entry is expanded.
+
+This is why large or streaming buffers remain usable without storing all rendered details directly on overlays.
+
+*** =json-log-viewer-shared.el=
+
+- Shared JSON/path helper library.
+- Handles:
+  - JSON parsing
+  - path resolution
+  - escaped-dot path handling
+  - flattening nested JSON
+  - conversion of nested values to one-line summary strings
+
+Both the main viewer and the async worker depend on the same path semantics, which keeps summaries and details consistent.
+
+*** =json-log-viewer-repository.el=
+
+- SQL-only storage layer around SQLite.
+- Defines schema and reusable repository operations for:
+  - inserts
+  - summary row selection
+  - raw JSON lookup
+  - filtering searches
+  - truncation
+  - copying rows from one SQLite database into another
+
+It is intentionally thin so the viewer and async workers share one data model.
+
+*** =json-log-viewer-async-worker.el=
+
+- Worker-side logic for async ingestion and truncation.
+- Runs inside subordinate Emacs processes started by =async-job-queue=.
+- Responsibilities:
+  - parse JSON lines
+  - derive summary metadata
+  - write rows into SQLite
+  - rebuild visible entries for narrow/widen
+  - delete old rows when streaming retention limits are exceeded
+
+*** =async-job-queue.el=
+
+- Small ordered async queue abstraction.
+- Starts a dedicated subordinate Emacs process.
+- Serializes a processing function into that worker.
+- Guarantees job callbacks are delivered in push order.
+
+This ordering guarantee matters because log ingest, replay, and truncation must not race in a way that breaks the viewer’s visible ordering.
+
+*** =json-log-viewer-evil.el=
+
+- Optional Evil bindings layered on top of =json-log-viewer-mode=.
+- Pure integration module; it does not affect data flow.
+
+* Data Model
+
+The shared data contract across source adapters is “normalized JSON line”.
+
+Each source package turns external output into a JSON object string with enough fields for the viewer to do three jobs:
+
+- render summary lines
+- keep the raw/full payload for expansion and searching
+- preserve source context in consistent fields
+
+The viewer then stores each entry in SQLite as:
+
+- raw JSON text
+- resolved summary metadata
+  - timestamp
+  - level
+  - message
+  - extra fields
+- sortable timestamp epoch when available
+
+The rendered buffer uses summary metadata for the visible line and retrieves full details lazily from SQLite on expansion.
+
+* Primary Flows
+
+** 1. AWS tail / kube logs / Kafka stream
+
+1. User configures options in a transient UI.
+2. Source package builds CLI args and starts a subprocess.
+3. Process output arrives in chunks.
+4. Source adapter normalizes output into JSON lines.
+5. Source adapter pushes JSON lines into =json-log-viewer=.
+6. =json-log-viewer= submits ingest jobs to the async worker queue.
+7. Worker writes raw JSON plus summary metadata into SQLite.
+8. Callback appends visible entries into the viewer buffer.
+9. Viewer publishes append events to subscribers.
+
+** 2. AWS Logs Insights
+
+1. User sets a query and launches Insights.
+2. =aws-logs-insights.el= starts =aws logs start-query= asynchronously.
+3. It polls =get-query-results= until completion.
+4. Rows are transformed into JSON lines with synthetic summary fields.
+5. =json-log-viewer= replaces the viewer contents.
+6. Later refreshes rerun the frozen query context from the viewer buffer.
+
+** 3. Composite viewer
+
+1. Composite buffer subscribes to one or more source viewer buffers.
+2. Historical rows are copied from source SQLite files into the composite SQLite file in async chunks.
+3. Composite viewer widens/rebuilds from its own SQLite store after backfill completes.
+4. New source append events trigger live ingestion of source rows into the composite buffer.
+
+* Data Flow Diagram
+
+#+begin_example
+                +-------------------+
+                |   Transient/UI    |
+                | aws/kube/kafka    |
+                +---------+---------+
+                          |
+                          v
+                +-------------------+
+                | Session variables |
+                | presets/query cfg |
+                +---------+---------+
+                          |
+                          v
+        +-------------------------------------------+
+        | Source adapters                           |
+        | aws-logs-tail / aws-logs-insights         |
+        | kube-logs / kafka-logs                    |
+        +---------+-------------------+-------------+
+                  |                   |
+                  | subprocess output |
+                  | / query results   |
+                  v                   |
+        +-------------------------+   |
+        | JSON-line normalization |<--+
+        | source-specific mapping |
+        +------------+------------+
+                     |
+                     v
+        +-----------------------------+
+        | json-log-viewer             |
+        | buffer API + render engine  |
+        +-------------+---------------+
+                      |
+                      | async jobs
+                      v
+        +-----------------------------+
+        | async-job-queue             |
+        | subordinate Emacs workers   |
+        +-------------+---------------+
+                      |
+                      v
+        +-----------------------------+
+        | json-log-viewer-async-worker|
+        | parse / summarize / filter  |
+        +-------------+---------------+
+                      |
+                      v
+        +-----------------------------+
+        | SQLite repository           |
+        | raw JSON + summary metadata |
+        +-------------+---------------+
+                      |
+        lazy details  | visible summary rows
+         on expand    |
+                      v
+        +-----------------------------+
+        | json-log-viewer buffer      |
+        | overlays, narrow, refresh   |
+        +-------------+---------------+
+                      |
+                      v
+        +-----------------------------+
+        | Subscribers                 |
+        | composite-json-log-viewer   |
+        +-----------------------------+
+#+end_example
+
+* Package Relationships
+
+- =aws-logs.el= depends on =aws-logs-tail.el=, =aws-logs-insights.el=, and =aws-logs-query.el=.
+- =aws-logs-tail.el= and =aws-logs-insights.el= both depend on =json-log-viewer=.
+- =kube-logs.el= and =kafka-logs.el= also depend on =json-log-viewer=.
+- =json-log-viewer= depends on:
+  - =json-log-viewer-shared=
+  - =json-log-viewer-repository=
+  - =json-log-viewer-async-worker=
+  - =async-job-queue=
+- =composite-json-log-viewer.el= depends on =json-log-viewer= and =json-log-viewer-repository= and consumes subscriber events emitted by viewer buffers.
+
+* Concurrency and State Boundaries
+
+** Main Emacs process
+
+- Owns transient UI state and viewer buffers.
+- Starts and manages external CLI subprocesses.
+- Renders overlays and handles user interaction.
+
+** Subordinate Emacs worker process
+
+- Performs ordered async jobs for ingestion, filtering rebuilds, and truncation.
+- Writes and reads SQLite outside the main UI path.
+
+** Buffer-local state
+
+Each viewer buffer has isolated state:
+
+- SQLite file/database handle
+- async queues
+- summary path configuration
+- current filter
+- current overlays
+- subscriber list
+
+This makes the architecture naturally multi-buffer and allows different sources to coexist without a global data registry.
+
+* Design Invariants
+
+The tests reinforce a few important invariants:
+
+- Path resolution works for both nested keys and dotted JSON keys.
+- Narrowing and widening operate from stored JSON, not only from visible summary text.
+- Streaming viewers ingest entries asynchronously but preserve callback order.
+- Composite buffers merge history first, then stay live through append subscriptions.
+- Source adapters normalize into viewer-friendly JSON instead of letting the viewer parse source-specific CLI formats directly.
+
+* Extension Points
+
+To add a new log source, the current architecture expects:
+
+1. A source package that owns user/session state and command building.
+2. A normalization step that converts source output into JSON lines.
+3. A =json-log-viewer= buffer configured with appropriate summary and detail paths.
+4. Optional transient UI, refresh behavior, or presets.
+
+Because the viewer contract is JSON-line based, new sources can plug in without changing the renderer or storage model.

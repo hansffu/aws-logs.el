@@ -1735,6 +1735,7 @@ In non-streaming mode the append position follows configured direction."
                                        extra-paths
                                        json-paths
                                        refresh-function
+                                       (mode #'json-log-viewer-mode)
                                        streaming
                                        (max-entries json-log-viewer-stream-max-entries)
                                        (direction 'newest-first)
@@ -1752,6 +1753,9 @@ blocks in entry details instead of flattened subfields.
 
 REFRESH-FUNCTION, when non-nil, is called with the current old list of raw log
 lines and must return the new full list of raw log lines.
+
+MODE is the major mode function to initialize the viewer buffer. It must
+derive from `json-log-viewer-mode`. Defaults to `json-log-viewer-mode`.
 
 STREAMING controls append semantics:
 - non-nil: new data is appended to the bottom (use `json-log-viewer-push`)
@@ -1772,13 +1776,24 @@ Returns the created buffer."
          (normalized-lines (json-log-viewer--ensure-log-lines
                             log-lines "json-log-viewer-make-buffer :log-lines"))
          (normalized-direction (json-log-viewer--normalize-direction direction))
+         (normalized-mode
+          (cond
+           ((and (symbolp mode) (fboundp mode))
+            mode)
+           ((functionp mode)
+            mode)
+           (t
+            (user-error "json-log-viewer-make-buffer :mode must be a function, got: %S" mode))))
          (target (get-buffer-create buffer-name)))
     (with-current-buffer target
       ;; Reinitializing an existing viewer buffer can lose old queue handles if
       ;; mode setup resets locals first. Stop/close previous resources upfront.
       (json-log-viewer--stop-async-queue)
       (json-log-viewer--storage-close)
-      (json-log-viewer-mode)
+      (funcall normalized-mode)
+      (unless (derived-mode-p 'json-log-viewer-mode)
+        (user-error "json-log-viewer-make-buffer :mode must derive from json-log-viewer-mode, got: %S"
+                    normalized-mode))
       (setq-local json-log-viewer--entry-fields-function #'json-log-viewer--json-entry-fields)
       (setq-local json-log-viewer--summary-function #'json-log-viewer--json-summary)
       (setq-local json-log-viewer--refresh-function
