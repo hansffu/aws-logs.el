@@ -29,6 +29,8 @@
                   (buffer-or-name log-lines))
 (declare-function json-log-viewer-replace-log-lines "json-log-viewer"
                   (buffer-or-name log-lines &optional preserve-filter))
+(declare-function org-read-date "org"
+                  (&optional with-time to-time from-string prompt default-time default-input))
 
 (define-derived-mode kafka-logs-viewer-mode json-log-viewer-mode "Kafka-Logs"
   "Major mode for Kafka log buffers rendered with `json-log-viewer`."

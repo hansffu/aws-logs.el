@@ -289,38 +289,5 @@ Returns an `async-job-queue' object."
     (async-job-queue--cleanup-buffer queue))
   queue)
 
-(defun async-job-queue--worker-send (message)
-  "Send protocol MESSAGE from worker to parent."
-  (princ (prin1-to-string message) 'external-debugging-output)
-  (princ "\n" 'external-debugging-output))
-
-(defun async-job-queue--worker-main (process-func)
-  "Worker entrypoint. PROCESS-FUNC is called for each queued element."
-  (unless (functionp process-func)
-    (error "PROCESS-FUNC is not callable in worker: %S" process-func))
-  (let ((debug-on-error nil))
-    (catch 'done
-      (while t
-        (condition-case err
-            (pcase (read)
-              (`(:process ,id ,element)
-               (condition-case process-err
-                   (async-job-queue--worker-send
-                    (list :ok id (funcall process-func element)))
-                 (error
-                  (async-job-queue--worker-send
-                   (list :error id (error-message-string process-err))))))
-              (`(:stop)
-               (throw 'done t))
-              (other
-               (async-job-queue--worker-send
-                (list :error nil (format "Unknown worker command: %S" other)))))
-          (end-of-file
-           (throw 'done t))
-          (error
-           (async-job-queue--worker-send
-            (list :error nil (error-message-string err)))))))
-    (kill-emacs 0)))
-
 (provide 'async-job-queue)
 ;;; async-job-queue.el ends here

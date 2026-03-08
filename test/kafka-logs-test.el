@@ -5,6 +5,7 @@
 (require 'json)
 
 (require 'kafka-logs)
+(require 'json-log-viewer-shared)
 
 (defvar kafka-logs-connection)
 (defvar kafka-logs-topic)
@@ -99,9 +100,26 @@
       (should (equal (alist-get 'offset parsed) 9))
       (should (equal (alist-get 'key parsed) "order-1"))
       (should (equal (alist-get 'level parsed) "warn"))
-      (should (equal (alist-get 'message parsed) "boom"))
+      (should-not (assoc 'message parsed))
+      (should (equal (alist-get 'payload parsed)
+                     "{\"level\":\"warn\",\"message\":\"boom\"}"))
       (should (equal (alist-get 'timestamp parsed)
                      (kafka-logs--epoch-ms->iso8601 1700000000123))))))
+
+(ert-deftest kafka-logs-line->json-line-json-payload-with-message-path-test ()
+  (with-temp-buffer
+    (let ((kafka-logs-message-path "payload.message")
+          (line
+           (concat
+            "{\"topic\":\"orders\",\"partition\":2,\"offset\":9,"
+            "\"ts\":1700000000123,\"key\":\"order-1\","
+            "\"payload\":\"{\\\"level\\\":\\\"warn\\\",\\\"message\\\":\\\"boom\\\"}\"}")))
+      (let* ((json-line (kafka-logs--line->json-line line))
+             (parsed (json-parse-string json-line :object-type 'alist))
+             (flattened (json-log-viewer-shared--flatten-path-values parsed)))
+        (should (equal (json-log-viewer-shared--resolve-path
+                        parsed kafka-logs-message-path flattened)
+                       "boom"))))))
 
 (ert-deftest kafka-logs-line->json-line-array-payload-test ()
   (with-temp-buffer

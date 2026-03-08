@@ -384,13 +384,5 @@
        (setq deleted (json-log-viewer-async-worker--sqlite-truncate-oldest db count))))
     (list :op 'truncate :count deleted)))
 
-(defun json-log-viewer-async-worker-process-entry-details-job (_job)
-  "Compatibility no-op retained for older callers."
-  (list :op 'noop :count 0))
-
-(defun json-log-viewer-async-worker-process-job (job)
-  "Compatibility wrapper that routes JOB to log-ingestor worker."
-  (json-log-viewer-async-worker-process-log-ingestor-job job))
-
 (provide 'json-log-viewer-async-worker)
 ;;; json-log-viewer-async-worker.el ends here

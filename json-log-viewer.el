@@ -336,12 +336,6 @@ CALLBACK is called as (ACTION SOURCE-BUFFER ENTRY-OVERLAYS)."
    (json-log-viewer--make-log-ingestor-async-job 'reset nil)
    t))
 
-(defun json-log-viewer--storage-put-entry-details (_signature _filter-text _fields)
-  "Compatibility no-op; entry details are loaded from sqlite on expand.")
-
-(defun json-log-viewer--storage-remove-entry-details-batch (_signatures)
-  "Compatibility no-op; truncation is handled by trunkator queue.")
-
 (defun json-log-viewer--storage-entry-filter-text (entry-overlay)
   "Return normalized filter text for ENTRY-OVERLAY."
   (when (and (overlay-buffer entry-overlay)
@@ -590,28 +584,6 @@ CALLBACK is called as (ACTION SOURCE-BUFFER ENTRY-OVERLAYS)."
   (list :count count
         :worker-file (json-log-viewer--async-worker-file)
         :sqlite-file json-log-viewer--sqlite-file))
-
-(defun json-log-viewer--make-async-job (op payload &optional _preserve-filter)
-  "Compatibility wrapper that builds log-ingestor async jobs."
-  (pcase op
-    ('reset
-     (json-log-viewer--make-log-ingestor-async-job 'reset nil))
-    ('ingest
-     (json-log-viewer--make-log-ingestor-async-job 'ingest payload))
-    ('append
-     (json-log-viewer--make-log-ingestor-async-job
-      'ingest
-      (if (listp payload) (car payload) payload)))
-    ('narrow
-     (json-log-viewer--make-log-ingestor-async-job 'narrow nil payload))
-    ('widen
-     (json-log-viewer--make-log-ingestor-async-job 'widen nil nil))
-    ('replace
-     (json-log-viewer--make-log-ingestor-async-job 'reset nil))
-    (_
-     (list :op op
-          :worker-file (json-log-viewer--async-worker-file)
-          :sqlite-file json-log-viewer--sqlite-file))))
 
 (defun json-log-viewer--async-submit (job &optional wait-for-callback)
   "Submit log-ingestor JOB to current buffer queue.
@@ -1510,9 +1482,6 @@ Return value is always sorted in ascending order and each row is a plist:
                        (funcall json-log-viewer--entry-fields-function entry)))
          (fields (and raw-fields (json-log-viewer--normalize-fields raw-fields)))
          (summary (funcall json-log-viewer--summary-function entry fields))
-         (filter-text (or (plist-get entry :filter-text)
-                          (and fields (json-log-viewer--entry-filter-text fields))
-                          ""))
          (signature (json-log-viewer--entry-signature entry))
          (summary-start (point))
          entry-ov)
@@ -1526,8 +1495,6 @@ Return value is always sorted in ascending order and each row is a plist:
     (overlay-put entry-ov 'json-log-viewer-log-entry-id entry-id)
     (overlay-put entry-ov 'json-log-viewer-storage-buffer (current-buffer))
     (overlay-put entry-ov 'json-log-viewer-storage-entry-id entry-id)
-    (unless storage-populated
-      (json-log-viewer--storage-put-entry-details signature filter-text fields))
     (overlay-put entry-ov 'json-log-viewer-signature signature)
     (overlay-put entry-ov 'json-log-viewer-storage-signature signature)
     (push entry-ov json-log-viewer--entry-overlays)
