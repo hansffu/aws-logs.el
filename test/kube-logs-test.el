@@ -63,32 +63,6 @@
                      "--prefix"
                      "--timestamps")))))
 
-(ert-deftest kube-logs-make-viewer-buffer-uses-fixed-summary-paths-test ()
-  (let ((kube-logs-context "dev-cluster")
-        (kube-logs-namespace "payments")
-        (kube-logs-namespace-enabled t)
-        (kube-logs-target-kind "deployment")
-        (kube-logs-target "payments-api")
-        (kube-logs-follow t)
-        (kube-logs-tail-lines 200)
-        (kube-logs-since "10m")
-        captured
-        created-buffer)
-    (unwind-protect
-        (cl-letf (((symbol-function 'json-log-viewer-make-buffer)
-                   (lambda (&rest args)
-                     (setq captured args)
-                     (setq created-buffer (get-buffer-create "*kube-logs-test-viewer*"))))
-                  ((symbol-function 'kube-logs--install-viewer-keymap)
-                   (lambda () nil)))
-          (let ((buf (kube-logs--make-viewer-buffer nil t)))
-            (should (bufferp buf))
-            (should (equal (plist-get (cdr captured) :level-path) "payload.log\\.level"))
-            (should (equal (plist-get (cdr captured) :message-path) "payload.message"))
-            (should (equal (plist-get (cdr captured) :extra-paths)
-                           '("payload.service\\.name" "payload.log\\.logger")))))
-      (when (buffer-live-p created-buffer)
-        (kill-buffer created-buffer)))))
 
 (ert-deftest kube-logs-line->json-line-json-message-test ()
   (with-temp-buffer

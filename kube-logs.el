@@ -82,17 +82,20 @@ When non-nil, output is piped through grep with this regex."
   :group 'kube-logs)
 
 (defcustom kube-logs-level-path nil
-  "Path to the level"
+  "Path to the level field in the log JSON.
+Set this to match your log format, e.g. \"payload.log.level\"."
   :type 'string
   :group 'kube-logs)
 
 (defcustom kube-logs-message-path nil
-  "Path to the message"
+  "Path to the message field in the log JSON.
+Set this to match your log format, e.g. \"payload.message\"."
   :type 'string
   :group 'kube-logs)
 
 (defcustom kube-logs-extra-paths '()
-  "Path to the extra tags"
+  "Additional paths to display in log summaries.
+Set this to match your log format, e.g. \\='(\"payload.service.name\")."
   :type '(repeat string)
   :group 'kube-logs)
 
