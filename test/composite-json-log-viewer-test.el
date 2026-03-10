@@ -26,12 +26,9 @@
           (setq source
                 (json-log-viewer-make-buffer
                  "*json-log-viewer-source-test*"
-                 :log-lines nil
                  :timestamp-path "timestamp"
                  :level-path "level"
-                 :message-path "message"
-                 :streaming t
-                 :direction 'oldest-first))
+                 :message-path "message"))
           (json-log-viewer-push
            source
            '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"level\":\"info\",\"message\":\"old\"}"))
@@ -89,21 +86,15 @@
           (setq source-a
                 (json-log-viewer-make-buffer
                  "*json-log-viewer-source-a-test*"
-                 :log-lines nil
                  :timestamp-path "timestamp"
                  :level-path "level"
-                 :message-path "message"
-                 :streaming t
-                 :direction 'oldest-first))
+                 :message-path "message"))
           (setq source-b
                 (json-log-viewer-make-buffer
                  "*json-log-viewer-source-b-test*"
-                 :log-lines nil
                  :timestamp-path "timestamp"
                  :level-path "level"
-                 :message-path "message"
-                 :streaming t
-                 :direction 'oldest-first))
+                 :message-path "message"))
           (json-log-viewer-push
            source-a
            '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"level\":\"info\",\"message\":\"a-0\"}"
@@ -145,12 +136,9 @@
           (setq source
                 (json-log-viewer-make-buffer
                  "*json-log-viewer-source-paths-test*"
-                 :log-lines nil
                  :timestamp-path "meta.ts"
                  :level-path "meta.level"
-                 :message-path "payload.msg"
-                 :streaming t
-                 :direction 'oldest-first))
+                 :message-path "payload.msg"))
           (json-log-viewer-push
            source
            '("{\"meta\":{\"ts\":\"2026-01-01T00:00:00Z\",\"level\":\"info\"},\"payload\":{\"msg\":\"old\"}}"))

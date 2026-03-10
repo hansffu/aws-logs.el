@@ -323,10 +323,8 @@ Returns (NORMALIZED-LINES . NEW-PENDING)."
           (kill-buffer aws-logs--tail-once-output-buffer))
         (setq aws-logs--tail-once-output-buffer nil)))))
 
-(defun aws-logs--tail-make-ecs-buffer (initial-lines streaming)
-  "Create ECS viewer buffer from INITIAL-LINES.
-
-When STREAMING is non-nil, buffer is configured for incremental pushes."
+(defun aws-logs--tail-make-ecs-buffer ()
+  "Create ECS viewer buffer."
   (let* ((buffer-name (aws-logs--tail-viewer-buffer-name))
          (existing (get-buffer buffer-name))
          (buffer nil))
@@ -335,13 +333,10 @@ When STREAMING is non-nil, buffer is configured for incremental pushes."
     (setq buffer
           (json-log-viewer-make-buffer
            buffer-name
-           :log-lines (or initial-lines nil)
            :timestamp-path "@timestamp"
            :level-path "log.level"
            :message-path "message"
            :mode #'aws-logs-tail-viewer-mode
-           :streaming streaming
-           :direction 'oldest-first
            :header-lines-function #'aws-logs--tail-header-lines))
     (with-current-buffer buffer
       (setq-local aws-logs--tail-process nil)
@@ -621,7 +616,7 @@ When FLUSH-NOW is non-nil, flush immediately."
 
 (defun aws-logs--tail-run-ecs-once ()
   "Run ECS tail once asynchronously and render in json-log-viewer."
-  (let* ((buffer (aws-logs--tail-make-ecs-buffer nil nil))
+  (let* ((buffer (aws-logs--tail-make-ecs-buffer))
          (args (append (aws-logs--tail-global-args) (aws-logs--tail-args)))
          (command (aws-logs--tail-command-with-filter args nil))
          (output-buffer (generate-new-buffer " *aws-logs-tail-once*"))
@@ -672,7 +667,7 @@ When FLUSH-NOW is non-nil, flush immediately."
 
 (defun aws-logs--tail-run-ecs-stream ()
   "Run ECS tail in follow mode and stream lines into json-log-viewer."
-  (let* ((buffer (aws-logs--tail-make-ecs-buffer nil t))
+  (let* ((buffer (aws-logs--tail-make-ecs-buffer))
          (args (append (aws-logs--tail-global-args) (aws-logs--tail-args)))
          (command (aws-logs--tail-command-with-filter args t))
          (process (make-process

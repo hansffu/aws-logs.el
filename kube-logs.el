@@ -368,10 +368,8 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
   (kube-logs--kill-buffer-process (current-buffer))
   (quit-window t))
 
-(defun kube-logs--make-viewer-buffer (initial-lines streaming)
-  "Create kube logs viewer buffer using INITIAL-LINES.
-
-When STREAMING is non-nil, configure buffer for incremental pushes."
+(defun kube-logs--make-viewer-buffer ()
+  "Create kube logs viewer buffer."
   (let* ((buffer-name (kube-logs--viewer-buffer-name))
          (existing (get-buffer buffer-name))
          buffer)
@@ -380,14 +378,11 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
     (setq buffer
           (json-log-viewer-make-buffer
            buffer-name
-           :log-lines (or initial-lines nil)
            :timestamp-path "timestamp"
            :level-path kube-logs-level-path
            :message-path kube-logs-message-path
            :extra-paths kube-logs-extra-paths
            :mode #'kube-logs-viewer-mode
-           :streaming streaming
-           :direction 'oldest-first
            :header-lines-function #'kube-logs--viewer-header-lines))
     (with-current-buffer buffer
       (setq-local kube-logs--process nil)
@@ -494,7 +489,7 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
 
 (defun kube-logs--run-once ()
   "Fetch logs once asynchronously and render in json-log-viewer."
-  (let* ((buffer (kube-logs--make-viewer-buffer nil nil))
+  (let* ((buffer (kube-logs--make-viewer-buffer))
          (args (kube-logs--logs-args))
          (command (kube-logs--command-with-filter args nil))
          (output-buffer (generate-new-buffer " *kube-logs-once*"))
@@ -541,7 +536,7 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
 
 (defun kube-logs--run-stream ()
   "Start streaming logs and render them in json-log-viewer."
-  (let* ((buffer (kube-logs--make-viewer-buffer nil t))
+  (let* ((buffer (kube-logs--make-viewer-buffer))
          (args (kube-logs--logs-args))
          (command (kube-logs--command-with-filter args t))
          (process (make-process

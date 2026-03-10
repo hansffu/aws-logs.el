@@ -329,16 +329,13 @@ ON-SUCCESS is called with (QUERY-ID PAYLOAD)."
          (query aws-logs-query)
          (buffer-name (format "*AWS insights - %s*" log-group))
          (buffer
-          (json-log-viewer-make-buffer
+         (json-log-viewer-make-buffer
            buffer-name
-           :log-lines nil
            :timestamp-path aws-logs-insights-timestamp-path
            :level-path aws-logs-insights-level-path
            :message-path aws-logs-insights-message-path
            :extra-paths aws-logs-insights-extra-paths
            :mode #'aws-logs-insights-viewer-mode
-           :streaming nil
-           :direction 'newest-first
            :header-lines-function #'aws-logs--insights-header-lines)))
     (with-current-buffer buffer
       (add-hook 'kill-buffer-hook #'aws-logs--insights-cancel-active-request nil t)

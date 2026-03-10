@@ -201,7 +201,7 @@
                    (special-mode))
                  viewer-buffer)))
       (unwind-protect
-          (let ((buffer (kafka-logs--make-viewer-buffer nil nil)))
+          (let ((buffer (kafka-logs--make-viewer-buffer)))
             (should (eq buffer viewer-buffer))
             (should (equal (plist-get captured-args :message-path)
                            "payload.data.name"))

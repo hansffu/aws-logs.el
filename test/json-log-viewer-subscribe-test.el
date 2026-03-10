@@ -11,12 +11,9 @@
           (setq buffer
                 (json-log-viewer-make-buffer
                  "*json-log-viewer-subscribe-test*"
-                 :log-lines nil
                  :timestamp-path "timestamp"
                  :level-path "level"
-                 :message-path "message"
-                 :streaming t
-                 :direction 'oldest-first))
+                 :message-path "message"))
           (with-current-buffer buffer
             (json-log-viewer-subscribe
              'test-subscriber

@@ -744,10 +744,8 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
   "Convert kcat output LINES to json-log-viewer JSON lines."
   (delq nil (mapcar #'kafka-logs--line->json-line lines)))
 
-(defun kafka-logs--make-viewer-buffer (initial-lines streaming)
-  "Create kafka logs viewer buffer using INITIAL-LINES.
-
-When STREAMING is non-nil, configure buffer for incremental pushes."
+(defun kafka-logs--make-viewer-buffer ()
+  "Create kafka logs viewer buffer."
   (let* ((buffer-name (kafka-logs--viewer-buffer-name))
          (existing (get-buffer buffer-name))
          (extra-paths
@@ -764,14 +762,11 @@ When STREAMING is non-nil, configure buffer for incremental pushes."
     (setq buffer
           (json-log-viewer-make-buffer
            buffer-name
-           :log-lines (or initial-lines nil)
            :timestamp-path "timestamp"
            :message-path message-path
            :extra-paths extra-paths
            :json-paths kafka-logs-json-paths
            :mode #'kafka-logs-viewer-mode
-           :streaming streaming
-           :direction 'oldest-first
            :header-lines-function #'kafka-logs--viewer-header-lines))
     (with-current-buffer buffer
       (setq-local kafka-logs--process nil)
@@ -922,7 +917,7 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
 
 (defun kafka-logs--run-once ()
   "Fetch Kafka messages once asynchronously and render in json-log-viewer."
-  (let* ((buffer (kafka-logs--make-viewer-buffer nil nil))
+  (let* ((buffer (kafka-logs--make-viewer-buffer))
          (args (kafka-logs--consume-args))
          (command (kafka-logs--command-with-filter args nil))
          (output-buffer (generate-new-buffer " *kafka-logs-once*"))
@@ -971,7 +966,7 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
 
 (defun kafka-logs--run-stream ()
   "Start Kafka stream and render in json-log-viewer."
-  (let* ((buffer (kafka-logs--make-viewer-buffer nil t))
+  (let* ((buffer (kafka-logs--make-viewer-buffer))
          (args (kafka-logs--consume-args))
          (command (kafka-logs--command-with-filter args t))
          (process (make-process

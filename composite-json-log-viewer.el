@@ -313,13 +313,10 @@ CALLBACK receives plist (:copied N :next-after-id ID) on success or
         (composite-json-log-viewer--cleanup))))
   (let ((buffer (json-log-viewer-make-buffer
                  buffer-name
-                 :log-lines nil
                  :timestamp-path "timestamp"
                  :level-path "level"
                  :message-path "message"
-                 :mode #'composite-json-log-viewer-mode
-                 :streaming t
-                 :direction 'oldest-first)))
+                 :mode #'composite-json-log-viewer-mode)))
     (with-current-buffer buffer
       (setq-local composite-json-log-viewer--is-composite t)
       (setq-local composite-json-log-viewer--source-buffers nil)

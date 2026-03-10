@@ -894,8 +894,8 @@ Returns cons cell (ENTRIES . NEXT-ID)."
 (defun json-log-viewer--json-header-lines (state)
   "Return header lines for current JSON-line buffer and STATE."
   (append
-   (list (cons "Mode" (if (plist-get state :streaming) "streaming" "non-streaming"))
-         (cons "Direction" (symbol-name (plist-get state :direction)))
+   (list (cons "Mode" "streaming")
+         (cons "Direction" "oldest-first")
          (cons "Auto follow" (if (plist-get state :auto-follow) "on" "off")))
    (when (functionp json-log-viewer--json-header-lines-function)
      (or (funcall json-log-viewer--json-header-lines-function state) nil))))
@@ -930,24 +930,20 @@ Returns cons cell (ENTRIES . NEXT-ID)."
    (t (string-lessp (format "%s" a) (format "%s" b)))))
 
 (defun json-log-viewer--sort-entries (entries)
-  "Return ENTRIES in display order for current buffer mode."
+  "Return ENTRIES in ascending sort-key order."
   (let ((ordered (append entries nil)))
     (if (not json-log-viewer--sort-key-function)
         ordered
-      (let ((ascending (if json-log-viewer--streaming
-                           t
-                         (eq json-log-viewer--direction 'oldest-first))))
-        (cl-stable-sort
-         ordered
-         (lambda (a b)
-           (let ((ka (funcall json-log-viewer--sort-key-function a))
-                 (kb (funcall json-log-viewer--sort-key-function b)))
-             (cond
-              ((and (null ka) (null kb)) nil)
-              ((null ka) nil)
-              ((null kb) t)
-              (ascending (json-log-viewer--sort-key< ka kb))
-              (t (json-log-viewer--sort-key< kb ka))))))))))
+      (cl-stable-sort
+       ordered
+       (lambda (a b)
+         (let ((ka (funcall json-log-viewer--sort-key-function a))
+               (kb (funcall json-log-viewer--sort-key-function b)))
+           (cond
+            ((and (null ka) (null kb)) nil)
+            ((null ka) nil)
+            ((null kb) t)
+            (t (json-log-viewer--sort-key< ka kb)))))))))
 
 (defun json-log-viewer--state ()
   "Return current viewer state plist for callbacks."
@@ -1425,15 +1421,11 @@ Return value is always sorted in ascending order and each row is a plist:
   "Return header-line text for current viewer buffer."
   (let ((messages (format "Messages: %d" json-log-viewer--entry-count))
         (follow (format "Follow: %s" (if json-log-viewer--auto-follow "on" "off")))
-        (direction (format "Direction: %s" (symbol-name json-log-viewer--direction)))
         (needle (and json-log-viewer--filter-string
                      (string-trim json-log-viewer--filter-string))))
     (concat
      " " messages
      "  |  " follow
-     (if json-log-viewer--streaming
-         ""
-       (concat "  |  " direction))
      (if (and needle (not (string-empty-p needle)))
          (format "  |  Narrow: \"%s\"" needle)
        ""))))
@@ -1598,8 +1590,7 @@ When STORAGE-PREPARED is non-nil, skip resetting sqlite entry-details."
 (defun json-log-viewer-append-entries (entries)
   "Append ENTRIES into current viewer buffer.
 
-In streaming mode new entries are always appended to the bottom.
-In non-streaming mode the append position follows configured direction."
+New entries are always appended to the bottom."
   (let* ((skip-sort (and json-log-viewer--streaming
                          json-log-viewer--stream-assume-ordered))
          (candidate-entries (if skip-sort
@@ -1608,16 +1599,12 @@ In non-streaming mode the append position follows configured direction."
          (ordered (if skip-sort
                       candidate-entries
                     (json-log-viewer--sort-entries candidate-entries)))
-         (append-at-bottom (or json-log-viewer--streaming
-                               (eq json-log-viewer--direction 'oldest-first)))
          (inhibit-read-only t)
          (inserted-overlays nil))
     (when ordered
       (save-excursion
         (json-log-viewer--delete-no-results-placeholder)
-        (if append-at-bottom
-            (goto-char (point-max))
-          (goto-char (json-log-viewer--header-end-position)))
+        (goto-char (point-max))
         (dolist (entry ordered)
           (push (json-log-viewer--insert-entry entry) inserted-overlays)))
       (setq inserted-overlays (nreverse inserted-overlays))
@@ -1627,7 +1614,7 @@ In non-streaming mode the append position follows configured direction."
       (json-log-viewer--evict-oldest-entries-if-needed)
       (json-log-viewer--apply-filter-to-overlays inserted-overlays)
       (json-log-viewer--refresh-header)
-      (when (and json-log-viewer--auto-follow append-at-bottom)
+      (when json-log-viewer--auto-follow
         (json-log-viewer--set-point-to-latest-entry))
       (json-log-viewer--highlight-current-line)
       (json-log-viewer--publish 'append inserted-overlays))
@@ -1695,7 +1682,6 @@ In non-streaming mode the append position follows configured direction."
 
 (cl-defun json-log-viewer-make-buffer (buffer-name
                                        &key
-                                       log-lines
                                        timestamp-path
                                        level-path
                                        message-path
@@ -1703,15 +1689,11 @@ In non-streaming mode the append position follows configured direction."
                                        json-paths
                                        refresh-function
                                        (mode #'json-log-viewer-mode)
-                                       streaming
                                        (max-entries json-log-viewer-stream-max-entries)
-                                       (direction 'newest-first)
                                        header-lines-function)
-  "Create BUFFER-NAME for JSON LOG-LINES.
+  "Create BUFFER-NAME for JSON log rendering.
 
 Summary rendering is configured with explicit JSON paths.
-
-LOG-LINES is a list of JSON strings.
 
 TIMESTAMP-PATH, LEVEL-PATH, MESSAGE-PATH are dot-separated JSON paths used for
 summary rendering. EXTRA-PATHS is a list of additional paths rendered as
@@ -1724,10 +1706,8 @@ lines and must return the new full list of raw log lines.
 MODE is the major mode function to initialize the viewer buffer. It must
 derive from `json-log-viewer-mode`. Defaults to `json-log-viewer-mode`.
 
-STREAMING controls append semantics:
-- non-nil: new data is appended to the bottom (use `json-log-viewer-push`)
-- nil: ordering follows DIRECTION
-  (`newest-first`/`oldest-first` or `desc`/`asc`)
+Buffers are always configured in streaming mode and append in oldest-first
+direction.
 
 MAX-ENTRIES caps retained rows in streaming mode. Nil disables capping.
 
@@ -1740,9 +1720,6 @@ Returns the created buffer."
          (normalized-json-paths (json-log-viewer--normalize-path-list
                                  json-paths
                                  "json-log-viewer-make-buffer :json-paths"))
-         (normalized-lines (json-log-viewer--ensure-log-lines
-                            log-lines "json-log-viewer-make-buffer :log-lines"))
-         (normalized-direction (json-log-viewer--normalize-direction direction))
          (normalized-mode
           (cond
            ((and (symbolp mode) (fboundp mode))
@@ -1769,13 +1746,13 @@ Returns the created buffer."
       (setq-local json-log-viewer--header-function #'json-log-viewer--json-header-lines)
       (setq-local json-log-viewer--signature-function #'json-log-viewer--json-entry-signature)
       (setq-local json-log-viewer--sort-key-function #'json-log-viewer--json-entry-sort-key)
-      (setq-local json-log-viewer--streaming streaming)
-      (setq-local json-log-viewer--direction normalized-direction)
+      (setq-local json-log-viewer--streaming t)
+      (setq-local json-log-viewer--direction 'oldest-first)
       (setq-local json-log-viewer--context nil)
       (setq-local json-log-viewer--metadata nil)
       (setq-local json-log-viewer--narrow-rebuild-in-progress nil)
       (setq-local json-log-viewer--entry-count 0)
-      (setq-local json-log-viewer--stream-assume-ordered streaming)
+      (setq-local json-log-viewer--stream-assume-ordered t)
       (setq-local json-log-viewer--stream-max-entries max-entries)
       (setq-local json-log-viewer--next-entry-id 0)
       (setq-local json-log-viewer--timestamp-path timestamp-path)
@@ -1793,19 +1770,15 @@ Returns the created buffer."
       (json-log-viewer--start-async-queue)
       (json-log-viewer--ensure-async-queue-running)
       (json-log-viewer-replace-entries nil nil t)
-      (when normalized-lines
-        (json-log-viewer-replace-log-lines target normalized-lines nil))
     target)))
 
 (defun json-log-viewer-push (buffer-or-name log-lines)
   "Push LOG-LINES into BUFFER-OR-NAME for streaming updates.
 
 BUFFER-OR-NAME must identify a live `json-log-viewer-mode` buffer created by
-`json-log-viewer-make-buffer` with `:streaming` non-nil."
+`json-log-viewer-make-buffer`."
   (let ((target (json-log-viewer-get-buffer buffer-or-name)))
     (with-current-buffer target
-      (unless json-log-viewer--streaming
-        (user-error "json-log-viewer-push requires a buffer with streaming mode enabled"))
       (let ((normalized-lines (json-log-viewer--ensure-log-lines
                                log-lines "json-log-viewer-push")))
         (json-log-viewer--ensure-async-queue-running)
