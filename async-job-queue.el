@@ -31,6 +31,7 @@
   pending-head
   pending-tail
   ready-results
+  stopping-p
   stopped-p)
 
 (defun async-job-queue--emacs-program ()
@@ -62,20 +63,51 @@ LABEL is used in error messages."
                    label
                    (error-message-string err))))))
 
-(defun async-job-queue--worker-eval-form (encoded-func)
+(defun async-job-queue--serialize-optional-function (func label)
+  "Serialize optional FUNC as readable Lisp source, or nil.
+LABEL is used in error messages."
+  (when func
+    (async-job-queue--serialize-function func label)))
+
+(defun async-job-queue--worker-eval-form (encoded-process-func
+                                          encoded-init-func
+                                          encoded-teardown-func)
   "Return worker bootstrap `--eval` form string.
-ENCODED-FUNC is base64-encoded PROCESS-FUNC text."
+ENCODED-PROCESS-FUNC is base64-encoded PROCESS-FUNC text.
+ENCODED-INIT-FUNC and ENCODED-TEARDOWN-FUNC are optional base64-encoded
+function texts."
   (prin1-to-string
-   `(let* ((process-func-text (base64-decode-string ,encoded-func))
-           (process-func (car (read-from-string process-func-text))))
+   `(let* ((process-func-text (base64-decode-string ,encoded-process-func))
+           (init-func-text ,encoded-init-func)
+           (teardown-func-text ,encoded-teardown-func)
+           (process-func (car (read-from-string process-func-text)))
+           (init-func (when init-func-text
+                        (car (read-from-string
+                              (base64-decode-string init-func-text)))))
+           (teardown-func (when teardown-func-text
+                            (car (read-from-string
+                                  (base64-decode-string teardown-func-text))))))
       (unless (functionp process-func)
         (error "PROCESS-FUNC is not callable in worker: %S" process-func))
+      (when (and init-func (not (functionp init-func)))
+        (error "INIT-FUNC is not callable in worker: %S" init-func))
+      (when (and teardown-func (not (functionp teardown-func)))
+        (error "TEARDOWN-FUNC is not callable in worker: %S" teardown-func))
       (let ((debug-on-error nil)
             (send (lambda (message)
                     (let ((print-escape-newlines t)
                           (print-escape-control-characters t))
                       (princ (prin1-to-string message) 'external-debugging-output))
-                    (princ "\n" 'external-debugging-output))))
+                    (princ "\n" 'external-debugging-output)))
+            (run-teardown-p nil))
+        (condition-case init-err
+            (when init-func
+              (funcall init-func))
+          (error
+           (funcall send (list :lifecycle-error
+                               (format "INIT-FUNC failed: %s"
+                                       (error-message-string init-err))))
+           (kill-emacs 0)))
         (catch 'done
           (while t
             (condition-case err
@@ -87,33 +119,57 @@ ENCODED-FUNC is base64-encoded PROCESS-FUNC text."
                       (funcall send (list :error id (error-message-string process-err)))))
                    nil)
                   (`(:stop)
+                   (setq run-teardown-p t)
                    (throw 'done t))
                   (other
-                   (funcall send (list :error nil (format "Unknown worker command: %S" other)))))
+                   (funcall send (list :lifecycle-error
+                                       (format "Unknown worker command: %S" other)))))
               (end-of-file
                (throw 'done t))
               (error
-               (funcall send (list :error nil (error-message-string err)))))))
+               (funcall send (list :lifecycle-error (error-message-string err)))))))
+        (when (and run-teardown-p teardown-func)
+          (condition-case teardown-err
+              (funcall teardown-func)
+            (error
+             (funcall send (list :lifecycle-error
+                                 (format "TEARDOWN-FUNC failed: %s"
+                                         (error-message-string teardown-err)))))))
         (kill-emacs 0)))))
 
 ;;;###autoload
-(defun async-job-queue-create (process-func callback-func)
+(cl-defun async-job-queue-create (process-func callback-func
+                                               &key init-func teardown-func)
   "Create an async job queue with PROCESS-FUNC and CALLBACK-FUNC.
 
 PROCESS-FUNC runs in a subordinate Emacs for each pushed element.
 CALLBACK-FUNC runs in the current Emacs with the processed result.
+INIT-FUNC runs once in worker Emacs before processing jobs when non-nil.
+TEARDOWN-FUNC runs once in worker Emacs during stop when non-nil.
 
 Returns an `async-job-queue' object."
   (unless (functionp callback-func)
     (user-error "CALLBACK-FUNC must be a function, got: %S" callback-func))
-  (let* ((serialized-func (async-job-queue--serialize-function
-                           process-func
-                           "PROCESS-FUNC"))
-         (encoded-func (base64-encode-string serialized-func t))
+  (let* ((serialized-process-func (async-job-queue--serialize-function
+                                   process-func
+                                   "PROCESS-FUNC"))
+         (serialized-init-func (async-job-queue--serialize-optional-function
+                                init-func
+                                "INIT-FUNC"))
+         (serialized-teardown-func (async-job-queue--serialize-optional-function
+                                    teardown-func
+                                    "TEARDOWN-FUNC"))
+         (encoded-process-func (base64-encode-string serialized-process-func t))
+         (encoded-init-func (when serialized-init-func
+                              (base64-encode-string serialized-init-func t)))
+         (encoded-teardown-func (when serialized-teardown-func
+                                  (base64-encode-string serialized-teardown-func t)))
          (queue-id (cl-incf async-job-queue--next-id))
          (buffer (generate-new-buffer
                   (format " *async-job-queue-%d*" queue-id)))
-         (eval-form (async-job-queue--worker-eval-form encoded-func))
+         (eval-form (async-job-queue--worker-eval-form encoded-process-func
+                                                       encoded-init-func
+                                                       encoded-teardown-func))
          (command (list (async-job-queue--emacs-program)
                         "-Q" "--batch"
                         "--eval" eval-form))
@@ -135,6 +191,7 @@ Returns an `async-job-queue' object."
                  :pending-head nil
                  :pending-tail nil
                  :ready-results (make-hash-table :test 'eql)
+                 :stopping-p nil
                  :stopped-p nil))
     (set-process-filter
      process
@@ -209,6 +266,13 @@ Returns an `async-job-queue' object."
             (`(:error ,id ,message-text)
              (when id
                (puthash id (cons 'error message-text) (async-job-queue-ready-results queue))))
+            (`(:lifecycle-error ,message-text)
+             (condition-case callback-err
+                 (funcall (async-job-queue-callback-func queue)
+                          (list :error message-text))
+               (error
+                (message "async-job-queue callback error: %s"
+                         (error-message-string callback-err)))))
             (_
              (message "async-job-queue: unknown worker message: %S" msg))))
       (error
@@ -242,6 +306,7 @@ Returns an `async-job-queue' object."
   "Handle worker process EVENT for QUEUE."
   (unless (async-job-queue-stopped-p queue)
     (setf (async-job-queue-stopped-p queue) t)
+    (setf (async-job-queue-stopping-p queue) nil)
     (message "async-job-queue worker exited: %s" (string-trim event)))
   (async-job-queue--cleanup-buffer queue))
 
@@ -249,6 +314,7 @@ Returns an `async-job-queue' object."
   "Return non-nil when QUEUE worker process is alive."
   (and (async-job-queue-p queue)
        (not (async-job-queue-stopped-p queue))
+       (not (async-job-queue-stopping-p queue))
        (process-live-p (async-job-queue-process queue))))
 
 ;;;###autoload
@@ -270,11 +336,12 @@ Returns an `async-job-queue' object."
 
 ;;;###autoload
 (defun async-job-queue-stop (queue)
-  "Stop QUEUE immediately and kill the subordinate Emacs process."
+  "Stop QUEUE and terminate its subordinate Emacs process."
   (unless (async-job-queue-p queue)
     (user-error "QUEUE must be an async-job-queue object, got: %S" queue))
-  (unless (async-job-queue-stopped-p queue)
-    (setf (async-job-queue-stopped-p queue) t)
+  (unless (or (async-job-queue-stopped-p queue)
+              (async-job-queue-stopping-p queue))
+    (setf (async-job-queue-stopping-p queue) t)
     (setf (async-job-queue-partial-output queue) "")
     (setf (async-job-queue-pending-head queue) nil)
     (setf (async-job-queue-pending-tail queue) nil)
@@ -283,10 +350,7 @@ Returns an `async-job-queue' object."
       (ignore-errors
         (process-send-string
          (async-job-queue-process queue)
-         (async-job-queue--serialize-command '(:stop))))
-      (ignore-errors
-        (delete-process (async-job-queue-process queue))))
-    (async-job-queue--cleanup-buffer queue))
+         (async-job-queue--serialize-command '(:stop))))))
   queue)
 
 (provide 'async-job-queue)
