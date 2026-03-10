@@ -11,7 +11,15 @@
 (defvar aws-logs-custom-time-range)
 (defvar aws-logs-time-range)
 (defvar aws-logs-query)
-(defvar aws-logs-insights-refresh-overlap-seconds)
+
+(defun aws-logs-core-test--make-viewer (buffer-name initial-lines &rest args)
+  "Create json-log-viewer BUFFER-NAME, optionally seeded with INITIAL-LINES."
+  (let ((buf (apply #'json-log-viewer-make-buffer buffer-name args)))
+    (when initial-lines
+      (json-log-viewer-push buf initial-lines)
+      (with-current-buffer buf
+        (json-log-viewer--async-await-pending-count 0)))
+    buf))
 
 (ert-deftest aws-logs-insights-parse-time-range-to-seconds-test ()
   (should (= 30 (aws-logs--insights-parse-time-range-to-seconds "30s")))
@@ -23,59 +31,19 @@
   (should-not (aws-logs--insights-parse-time-range-to-seconds "10"))
   (should-not (aws-logs--insights-parse-time-range-to-seconds "foo")))
 
-(ert-deftest aws-logs-insights-window-context-since-test ()
+(ert-deftest aws-logs-insights-time-window-since-test ()
   (let ((aws-logs-custom-time-range nil)
         (aws-logs-time-range "10m"))
     (cl-letf (((symbol-function 'float-time) (lambda (&optional _time) 1000.0)))
-      (let ((ctx (aws-logs--insights-window-context)))
-        (should (eq (plist-get ctx :mode) 'since))
-        (should (= (plist-get ctx :start) 400))
-        (should (= (plist-get ctx :end) 1000))
-        (should (= (plist-get ctx :last-end) 1000))))))
+      (let ((window (aws-logs--insights-time-window)))
+        (should (= (nth 0 window) 400))
+        (should (= (nth 1 window) 1000))))))
 
-(ert-deftest aws-logs-insights-window-context-custom-range-test ()
+(ert-deftest aws-logs-insights-time-window-custom-range-test ()
   (let ((aws-logs-custom-time-range '("2026-01-01T00:00:00+0000" . "2026-01-01T00:10:00+0000"))
         (aws-logs-time-range "10m"))
-    (let ((ctx (aws-logs--insights-window-context)))
-      (should (eq (plist-get ctx :mode) 'custom-range))
-      (should (< (plist-get ctx :start) (plist-get ctx :end))))))
-
-(ert-deftest aws-logs-insights-extra-summary-paths-test ()
-  (should (equal (aws-logs--insights-extra-summary-paths '("service" "class"))
-                 '("__summary_extra_0" "__summary_extra_1"))))
-
-(ert-deftest aws-logs-insights-since-refresh-uses-base-start-test ()
-  (with-temp-buffer
-    (setq-local aws-logs--insights-refresh-context '(:mode since :start 100 :last-end 200))
-    (setq-local aws-logs--insights-request-in-flight nil)
-    (setq-local aws-logs--insights-log-group "group-a")
-    (let ((aws-logs-insights-refresh-overlap-seconds 20)
-          captured)
-      (cl-letf (((symbol-function 'float-time) (lambda (&optional _time) 300.0))
-                ((symbol-function 'aws-logs--insights-run-window-async)
-                 (lambda (_buffer start end _on-success)
-                   (setq captured (list start end)))))
-        (aws-logs--insights-start-refresh-async (current-buffer)))
-      (should (equal captured '(100 300))))))
-
-(ert-deftest aws-logs-insights-run-window-uses-frozen-context-test ()
-  (with-temp-buffer
-    (setq-local aws-logs--insights-source-log-group "frozen-group")
-    (setq-local aws-logs--insights-source-query "fields @timestamp | limit 5")
-    (setq-local aws-logs--insights-source-global-args '("--region=us-east-1" "--profile=frozen"))
-    (setq aws-logs-query "fields @timestamp | limit 1")
-    (let (captured)
-      (cl-letf (((symbol-function 'aws-logs--insights-run-query-window-async)
-                 (lambda (_buffer _request-id _start _end global-args log-group query on-success _on-error)
-                   (setq captured (list global-args log-group query))
-                   (funcall on-success "qid" '((results . nil)))))
-                ((symbol-function 'message) (lambda (&rest _args) nil)))
-        (aws-logs--insights-run-window-async (current-buffer) 10 20
-                                             (lambda (_query-id _payload) nil)))
-      (should (equal captured
-                     '(("--region=us-east-1" "--profile=frozen")
-                       "frozen-group"
-                       "fields @timestamp | limit 5"))))))
+    (let ((window (aws-logs--insights-time-window)))
+      (should (< (nth 0 window) (nth 1 window))))))
 
 (ert-deftest aws-logs-tail-ecs-normalize-lines-with-pending-test ()
   (let* ((first (aws-logs--tail-ecs-normalize-lines-with-pending
@@ -215,15 +183,13 @@
       (should (get-text-property 0 'json-log-viewer-json-block value)))))
 
 (ert-deftest json-log-viewer-sqlite-storage-offloads-hidden-data-test ()
-  (let* ((buf (json-log-viewer-make-buffer
+  (let* ((buf (aws-logs-core-test--make-viewer
                "*json-log-viewer-sqlite-storage-test*"
-               :log-lines
                '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"hello\",\"payload\":{\"service\":\"orders\",\"log\":{\"level\":\"ERROR\"}}}")
                :timestamp-path "timestamp"
                :level-path "payload.log.level"
                :message-path "msg"
-               :json-paths '("payload")
-               :streaming t))
+               :json-paths '("payload")))
          sqlite-file)
     (unwind-protect
         (with-current-buffer buf
@@ -245,16 +211,14 @@
         (should-not (file-exists-p sqlite-file))))))
 
 (ert-deftest json-log-viewer-get-logs-since-returns-sorted-tail-test ()
-  (let* ((buf (json-log-viewer-make-buffer
+  (let* ((buf (aws-logs-core-test--make-viewer
                "*json-log-viewer-get-logs-since-test*"
-               :log-lines
                '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"m0\"}"
                  "{\"timestamp\":\"2026-01-01T00:00:01Z\",\"msg\":\"m1\"}"
                  "{\"timestamp\":\"2026-01-01T00:00:02Z\",\"msg\":\"m2\"}")
                :timestamp-path "timestamp"
                :level-path "level"
-               :message-path "msg"
-               :streaming t))
+               :message-path "msg"))
          rows)
     (unwind-protect
         (with-current-buffer buf
@@ -272,14 +236,13 @@
         (kill-buffer buf)))))
 
 (ert-deftest json-log-viewer-json-refresh-async-sentinel-test ()
-  (let* ((buf (json-log-viewer-make-buffer
+  (let* ((buf (aws-logs-core-test--make-viewer
                "*json-log-viewer-test*"
-               :log-lines '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"a\"}")
+               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"a\"}")
                :timestamp-path "timestamp"
                :level-path "level"
                :message-path "msg"
-               :refresh-function (lambda (_old-lines) :async)
-               :streaming nil))
+               :refresh-function (lambda (_old-lines) :async)))
          result)
     (unwind-protect
         (with-current-buffer buf
@@ -291,13 +254,12 @@
         (kill-buffer buf)))))
 
 (ert-deftest json-log-viewer-stream-push-respects-auto-follow-test ()
-  (let* ((buf (json-log-viewer-make-buffer
+  (let* ((buf (aws-logs-core-test--make-viewer
                "*json-log-viewer-follow-test*"
-               :log-lines '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"a\"}")
+               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"a\"}")
                :timestamp-path "timestamp"
                :level-path "level"
-               :message-path "msg"
-               :streaming t)))
+               :message-path "msg")))
     (unwind-protect
         (with-current-buffer buf
           (goto-char (point-min))
@@ -316,13 +278,12 @@
         (kill-buffer buf)))))
 
 (ert-deftest json-log-viewer-stream-message-path-object-renders-json-test ()
-  (let* ((buf (json-log-viewer-make-buffer
+  (let* ((buf (aws-logs-core-test--make-viewer
                "*json-log-viewer-stream-message-path-test*"
-               :log-lines nil
+               nil
                :timestamp-path "timestamp"
                :level-path "level"
-               :message-path "payload.data"
-               :streaming t)))
+               :message-path "payload.data")))
     (unwind-protect
         (with-current-buffer buf
           (json-log-viewer-push
@@ -339,13 +300,12 @@
         (kill-buffer buf)))))
 
 (ert-deftest json-log-viewer-log-ingestor-job-carries-line-test ()
-  (let ((buf (json-log-viewer-make-buffer
+  (let ((buf (aws-logs-core-test--make-viewer
               "*json-log-viewer-reserve-ids-test*"
-              :log-lines nil
+              nil
               :timestamp-path "timestamp"
               :level-path "level"
-              :message-path "msg"
-              :streaming t)))
+              :message-path "msg")))
     (unwind-protect
         (with-current-buffer buf
           (let* ((line-a "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"a\"}")
@@ -360,14 +320,12 @@
         (kill-buffer buf)))))
 
 (ert-deftest json-log-viewer-lazy-details-render-on-toggle-test ()
-  (let* ((buf (json-log-viewer-make-buffer
+  (let* ((buf (aws-logs-core-test--make-viewer
                "*json-log-viewer-lazy-details-test*"
-               :log-lines
                '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"level\":\"info\",\"msg\":\"hello\",\"meta\":{\"service\":\"orders\"}}")
                :timestamp-path "timestamp"
                :level-path "level"
-               :message-path "msg"
-               :streaming nil)))
+               :message-path "msg")))
     (unwind-protect
         (with-current-buffer buf
           (goto-char (point-min))
@@ -388,16 +346,14 @@
         (kill-buffer buf)))))
 
 (ert-deftest json-log-viewer-narrow-replays-matches-from-stored-json-test ()
-  (let* ((buf (json-log-viewer-make-buffer
+  (let* ((buf (aws-logs-core-test--make-viewer
                "*json-log-viewer-narrow-replay-test*"
-               :log-lines
                '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"level\":\"info\",\"msg\":\"alpha\",\"payload\":{\"db\":\"orders\"}}"
                  "{\"timestamp\":\"2026-01-01T00:00:01Z\",\"level\":\"info\",\"msg\":\"hidden-db-hit\",\"payload\":{\"db\":\"needle\"}}"
                  "{\"timestamp\":\"2026-01-01T00:00:02Z\",\"level\":\"info\",\"msg\":\"needle-visible\",\"payload\":{\"db\":\"payments\"}}")
                :timestamp-path "timestamp"
                :level-path "level"
-               :message-path "msg"
-               :streaming t)))
+               :message-path "msg")))
     (unwind-protect
         (with-current-buffer buf
           (setq json-log-viewer--filter-string "needle")
@@ -420,16 +376,14 @@
         (kill-buffer buf)))))
 
 (ert-deftest json-log-viewer-widen-replays-all-stored-json-rows-test ()
-  (let* ((buf (json-log-viewer-make-buffer
+  (let* ((buf (aws-logs-core-test--make-viewer
                "*json-log-viewer-widen-replay-test*"
-               :log-lines
                '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"level\":\"info\",\"msg\":\"alpha\"}"
                  "{\"timestamp\":\"2026-01-01T00:00:01Z\",\"level\":\"info\",\"msg\":\"hidden-db-hit\",\"payload\":{\"db\":\"needle\"}}"
                  "{\"timestamp\":\"2026-01-01T00:00:02Z\",\"level\":\"info\",\"msg\":\"gamma\"}")
                :timestamp-path "timestamp"
                :level-path "level"
-               :message-path "msg"
-               :streaming t)))
+               :message-path "msg")))
     (unwind-protect
         (with-current-buffer buf
           (setq json-log-viewer--filter-string "needle")
@@ -445,16 +399,14 @@
         (kill-buffer buf)))))
 
 (ert-deftest json-log-viewer-json-path-renders-payload-block-test ()
-  (let* ((buf (json-log-viewer-make-buffer
+  (let* ((buf (aws-logs-core-test--make-viewer
                "*json-log-viewer-json-path-payload-test*"
-               :log-lines
                '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"hello\",\"payload\":\"{\\\"service\\\":\\\"orders\\\",\\\"log\\\":{\\\"level\\\":\\\"ERROR\\\"}}\"}")
                :timestamp-path "timestamp"
                :level-path "payload.log.level"
                :message-path "msg"
                :extra-paths '("payload.service")
-               :json-paths '("payload")
-               :streaming nil)))
+               :json-paths '("payload"))))
     (unwind-protect
         (with-current-buffer buf
           (goto-char (point-min))
@@ -473,15 +425,13 @@
         (kill-buffer buf)))))
 
 (ert-deftest json-log-viewer-json-path-renders-nested-block-test ()
-  (let* ((buf (json-log-viewer-make-buffer
+  (let* ((buf (aws-logs-core-test--make-viewer
                "*json-log-viewer-json-path-nested-test*"
-               :log-lines
                '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"hello\",\"payload\":{\"service\":\"orders\",\"log\":{\"level\":\"ERROR\"}}}")
                :timestamp-path "timestamp"
                :level-path "payload.log.level"
                :message-path "msg"
-               :json-paths '("payload.log")
-               :streaming nil)))
+               :json-paths '("payload.log"))))
     (unwind-protect
         (with-current-buffer buf
           (goto-char (point-min))
@@ -499,14 +449,12 @@
         (kill-buffer buf)))))
 
 (ert-deftest json-log-viewer-json-path-renders-array-block-test ()
-  (let* ((buf (json-log-viewer-make-buffer
+  (let* ((buf (aws-logs-core-test--make-viewer
                "*json-log-viewer-json-path-array-test*"
-               :log-lines
                '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"hello\",\"payload\":[{\"externalTransactionId\":\"c12345d6789\",\"loyaltyAccountId\":1}]}")
                :timestamp-path "timestamp"
                :message-path "msg"
-               :json-paths '("payload")
-               :streaming nil)))
+               :json-paths '("payload"))))
     (unwind-protect
         (with-current-buffer buf
           (goto-char (point-min))
@@ -531,11 +479,9 @@
                   (nreverse acc)))
          (buf (json-log-viewer-make-buffer
                "*json-log-viewer-chunk-evict-test*"
-               :log-lines nil
                :timestamp-path "timestamp"
                :level-path "level"
                :message-path "msg"
-               :streaming t
                :max-entries 300)))
     (unwind-protect
         (with-current-buffer buf
@@ -549,13 +495,12 @@
         (kill-buffer buf)))))
 
 (ert-deftest json-log-viewer-cursor-move-disables-auto-follow-test ()
-  (let* ((buf (json-log-viewer-make-buffer
+  (let* ((buf (aws-logs-core-test--make-viewer
                "*json-log-viewer-follow-disable-test*"
-               :log-lines '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"a\"}")
+               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"a\"}")
                :timestamp-path "timestamp"
                :level-path "level"
-               :message-path "msg"
-               :streaming t)))
+               :message-path "msg")))
     (unwind-protect
         (with-current-buffer buf
           (setq-local json-log-viewer--auto-follow t)
@@ -569,13 +514,12 @@
         (kill-buffer buf)))))
 
 (ert-deftest json-log-viewer-shows-info-in-popup-instead-of-header-test ()
-  (let* ((buf (json-log-viewer-make-buffer
+  (let* ((buf (aws-logs-core-test--make-viewer
                "*json-log-viewer-info-test*"
-               :log-lines '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"hello\"}")
+               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"hello\"}")
                :timestamp-path "timestamp"
                :level-path "level"
                :message-path "msg"
-               :streaming nil
                :header-lines-function (lambda (_state)
                                         (list (cons "Log group" "/aws/demo")))))
          (help-buffer-name (help-buffer))
@@ -590,7 +534,7 @@
           (with-current-buffer help-buffer-name
             (setq help-text (buffer-substring-no-properties (point-min) (point-max))))
           (should (string-match-p "Bindings[[:space:]]+|[[:space:]]+Info" help-text))
-          (should (string-match-p "Mode:[[:space:]]+non-streaming" help-text))
+          (should (string-match-p "Mode:[[:space:]]+streaming" help-text))
           (should (string-match-p "Log group:[[:space:]]+/aws/demo" help-text))
           (should (string-match-p "Messages:[[:space:]]+1" help-text))
           (should (string-match-p "show info" help-text)))
@@ -600,13 +544,12 @@
         (kill-buffer help-buffer-name)))))
 
 (ert-deftest json-log-viewer-popup-keybindings-can-replace-defaults-test ()
-  (let* ((buf (json-log-viewer-make-buffer
+  (let* ((buf (aws-logs-core-test--make-viewer
                "*json-log-viewer-keys-test*"
-               :log-lines '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"hello\"}")
+               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"hello\"}")
                :timestamp-path "timestamp"
                :level-path "level"
-               :message-path "msg"
-               :streaming nil))
+               :message-path "msg"))
          (help-buffer-name (help-buffer))
          help-text)
     (unwind-protect
