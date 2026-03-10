@@ -66,35 +66,24 @@ If you want to change the default for new Emacs sessions, customize this option.
   :type '(choice (const :tag "None" nil) string)
   :group 'aws-logs)
 
-(defcustom aws-logs-default-summary-timestamp-field nil
-  "Optional default field/path used for Insights summary timestamp."
-  :type '(choice (const :tag "Auto (guess)" nil) string)
+(defcustom aws-logs-default-insights-timestamp-path "@timestamp"
+  "Default timestamp JSON path for Insights rendering."
+  :type '(choice (const :tag "Unset" nil) string)
   :group 'aws-logs)
 
-(defcustom aws-logs-default-summary-level-field nil
-  "Optional default field/path used for Insights summary level."
-  :type '(choice (const :tag "Auto (guess)" nil) string)
+(defcustom aws-logs-default-insights-level-path "level"
+  "Default level JSON path for Insights rendering."
+  :type '(choice (const :tag "Unset" nil) string)
   :group 'aws-logs)
 
-(defcustom aws-logs-default-summary-message-field nil
-  "Optional default field/path used for Insights summary message."
-  :type '(choice (const :tag "Auto (guess)" nil) string)
+(defcustom aws-logs-default-insights-message-path "@message"
+  "Default message JSON path for Insights rendering."
+  :type '(choice (const :tag "Unset" nil) string)
   :group 'aws-logs)
 
-(defcustom aws-logs-default-summary-extra-fields nil
-  "Optional list of extra field/paths to include in Insights summaries.
-
-Each configured field is rendered as a bracketed segment between level and
-message, for example: [service] [class]."
-  :type '(choice (const :tag "None" nil) (repeat string))
-  :group 'aws-logs)
-
-(defcustom aws-logs-insights-refresh-overlap-seconds 2
-  "Seconds of overlap used for incremental Insights refresh windows.
-
-Using a small overlap helps catch late-ingested events. Duplicate rows are
-filtered by signature before rendering."
-  :type 'integer
+(defcustom aws-logs-default-insights-extra-paths nil
+  "Default extra JSON paths shown in Insights summaries."
+  :type '(repeat string)
   :group 'aws-logs)
 
 (defcustom aws-logs-default-follow nil
@@ -198,17 +187,17 @@ Prefer `aws-logs-default-log-group`."
   "Selected CloudWatch Logs Insights query string for this Emacs session,
 or nil when disabled.")
 
-(defvar aws-logs-summary-timestamp-field aws-logs-default-summary-timestamp-field
-  "Optional field/path used for Insights summary timestamp in this session.")
+(defvar aws-logs-insights-timestamp-path aws-logs-default-insights-timestamp-path
+  "Timestamp JSON path used for Insights rendering in this session.")
 
-(defvar aws-logs-summary-level-field aws-logs-default-summary-level-field
-  "Optional field/path used for Insights summary level in this session.")
+(defvar aws-logs-insights-level-path aws-logs-default-insights-level-path
+  "Level JSON path used for Insights rendering in this session.")
 
-(defvar aws-logs-summary-message-field aws-logs-default-summary-message-field
-  "Optional field/path used for Insights summary message in this session.")
+(defvar aws-logs-insights-message-path aws-logs-default-insights-message-path
+  "Message JSON path used for Insights rendering in this session.")
 
-(defvar aws-logs-summary-extra-fields aws-logs-default-summary-extra-fields
-  "Optional list of extra field/paths for Insights summary in this session.")
+(defvar aws-logs-insights-extra-paths aws-logs-default-insights-extra-paths
+  "Extra JSON paths shown in Insights summaries in this session.")
 
 (defvar aws-logs-follow aws-logs-default-follow
   "Non-nil means follow (tail) logs for this Emacs session.")
@@ -458,8 +447,11 @@ different layout (for example with `no-littering`)."
   '(:log-group :since :follow :ecs :profile :query
                :filter
                :custom-time-range
+               ;; Backward-compatible aliases:
                :summary-timestamp-field :summary-level-field :summary-message-field
-               :summary-extra-fields)
+               :summary-extra-fields
+               :insights-timestamp-path :insights-level-path :insights-message-path
+               :insights-extra-paths)
   "Allowed keys for aws-logs presets.")
 
 (defun aws-logs--preset-plist-valid-p (plist)
@@ -491,9 +483,17 @@ with any subset of these keys:
 - `:query` string or nil
 - `:filter` string or nil
 - `:summary-timestamp-field` string or nil
+  (alias for `:insights-timestamp-path`)
 - `:summary-level-field` string or nil
+  (alias for `:insights-level-path`)
 - `:summary-message-field` string or nil
+  (alias for `:insights-message-path`)
 - `:summary-extra-fields` list of strings or nil
+  (alias for `:insights-extra-paths`)
+- `:insights-timestamp-path` string or nil
+- `:insights-level-path` string or nil
+- `:insights-message-path` string or nil
+- `:insights-extra-paths` list of strings or nil
 
 Preset apply semantics:
 - Missing key: leave current session value unchanged
@@ -521,14 +521,27 @@ If a preset with NAME already exists, it is replaced."
                    (:filter . aws-logs-filter)
                    (:profile . aws-logs-profile)
                    (:query . aws-logs-query)
-                   (:summary-timestamp-field . aws-logs-summary-timestamp-field)
-                   (:summary-level-field . aws-logs-summary-level-field)
-                   (:summary-message-field . aws-logs-summary-message-field)
-                   (:summary-extra-fields . aws-logs-summary-extra-fields)))
+                   (:insights-timestamp-path . aws-logs-insights-timestamp-path)
+                   (:insights-level-path . aws-logs-insights-level-path)
+                   (:insights-message-path . aws-logs-insights-message-path)
+                   (:insights-extra-paths . aws-logs-insights-extra-paths)))
     (let ((key (car entry))
           (var (cdr entry)))
       (when (plist-member plist key)
         (set var (plist-get plist key)))))
+  ;; Backward-compatible aliases for older preset keys.
+  (when (plist-member plist :summary-timestamp-field)
+    (setq aws-logs-insights-timestamp-path
+          (plist-get plist :summary-timestamp-field)))
+  (when (plist-member plist :summary-level-field)
+    (setq aws-logs-insights-level-path
+          (plist-get plist :summary-level-field)))
+  (when (plist-member plist :summary-message-field)
+    (setq aws-logs-insights-message-path
+          (plist-get plist :summary-message-field)))
+  (when (plist-member plist :summary-extra-fields)
+    (setq aws-logs-insights-extra-paths
+          (plist-get plist :summary-extra-fields)))
   ;; Keep relative and explicit ranges mutually exclusive.
   (when (and (plist-member plist :since)
              (plist-get plist :since))
@@ -649,44 +662,44 @@ Returns a cons cell (FROM . TO), where both values are ISO-like strings."
             (aws-logs--custom-time-range-to-string))
   :argument "--time-range=")
 
-(transient-define-infix aws-logs-infix-summary-timestamp-field ()
-  :description "Timestamp field"
+(transient-define-infix aws-logs-infix-insights-timestamp-path ()
+  :description "Timestamp path"
   :class 'transient-option
   :allow-empty t
-  :init-value (lambda (obj) (transient-infix-set obj aws-logs-summary-timestamp-field))
+  :init-value (lambda (obj) (transient-infix-set obj aws-logs-insights-timestamp-path))
   :reader (lambda (_prompt initial _hist)
-            (let ((input (string-trim (read-string "Timestamp field (empty=auto): "
+            (let ((input (string-trim (read-string "Timestamp path (empty=unset): "
                                                    (or initial "")))))
-              (setq aws-logs-summary-timestamp-field
+              (setq aws-logs-insights-timestamp-path
                     (unless (string-empty-p input) input))
               input))
-  :argument "--summary-timestamp=")
+  :argument "--insights-timestamp-path=")
 
-(transient-define-infix aws-logs-infix-summary-level-field ()
-  :description "Level field"
+(transient-define-infix aws-logs-infix-insights-level-path ()
+  :description "Level path"
   :class 'transient-option
   :allow-empty t
-  :init-value (lambda (obj) (transient-infix-set obj aws-logs-summary-level-field))
+  :init-value (lambda (obj) (transient-infix-set obj aws-logs-insights-level-path))
   :reader (lambda (_prompt initial _hist)
-            (let ((input (string-trim (read-string "Level field (empty=auto): "
+            (let ((input (string-trim (read-string "Level path (empty=unset): "
                                                    (or initial "")))))
-              (setq aws-logs-summary-level-field
+              (setq aws-logs-insights-level-path
                     (unless (string-empty-p input) input))
               input))
-  :argument "--summary-level=")
+  :argument "--insights-level-path=")
 
-(transient-define-infix aws-logs-infix-summary-message-field ()
-  :description "Message field"
+(transient-define-infix aws-logs-infix-insights-message-path ()
+  :description "Message path"
   :class 'transient-option
   :allow-empty t
-  :init-value (lambda (obj) (transient-infix-set obj aws-logs-summary-message-field))
+  :init-value (lambda (obj) (transient-infix-set obj aws-logs-insights-message-path))
   :reader (lambda (_prompt initial _hist)
-            (let ((input (string-trim (read-string "Message field (empty=auto): "
+            (let ((input (string-trim (read-string "Message path (empty=unset): "
                                                    (or initial "")))))
-              (setq aws-logs-summary-message-field
+              (setq aws-logs-insights-message-path
                     (unless (string-empty-p input) input))
               input))
-  :argument "--summary-message=")
+  :argument "--insights-message-path=")
 
 (defun aws-logs--formatting-reprompt ()
   "Refresh the formatting transient."
@@ -694,33 +707,33 @@ Returns a cons cell (FROM . TO), where both values are ISO-like strings."
   (transient-setup 'aws-logs-formatting-transient))
 
 (defun aws-logs--formatting-extra-summary ()
-  "Return one-line summary of currently configured extra fields."
-  (if aws-logs-summary-extra-fields
-      (string-join aws-logs-summary-extra-fields ", ")
+  "Return one-line summary of currently configured extra paths."
+  (if aws-logs-insights-extra-paths
+      (string-join aws-logs-insights-extra-paths ", ")
     "none"))
 
 (transient-define-suffix aws-logs-formatting-extra-add ()
-  "Add one extra summary field/path."
+  "Add one extra Insights summary path."
   :transient t
   (interactive)
-  (let ((input (string-trim (read-string "Add extra field: "))))
+  (let ((input (string-trim (read-string "Add extra path: "))))
     (when (string-empty-p input)
-      (user-error "Field cannot be empty"))
-    (unless (member input aws-logs-summary-extra-fields)
-      (setq aws-logs-summary-extra-fields
-            (append aws-logs-summary-extra-fields (list input))))
+      (user-error "Path cannot be empty"))
+    (unless (member input aws-logs-insights-extra-paths)
+      (setq aws-logs-insights-extra-paths
+            (append aws-logs-insights-extra-paths (list input))))
     (aws-logs--formatting-reprompt)))
 
 (transient-define-suffix aws-logs-formatting-extra-delete ()
-  "Delete one extra summary field/path."
+  "Delete one extra Insights summary path."
   :transient t
   (interactive)
-  (unless aws-logs-summary-extra-fields
-    (user-error "No extra fields to delete"))
-  (let ((selection (completing-read "Delete extra field: "
-                                    aws-logs-summary-extra-fields nil t)))
-    (setq aws-logs-summary-extra-fields
-          (delete selection (copy-sequence aws-logs-summary-extra-fields)))
+  (unless aws-logs-insights-extra-paths
+    (user-error "No extra paths to delete"))
+  (let ((selection (completing-read "Delete extra path: "
+                                    aws-logs-insights-extra-paths nil t)))
+    (setq aws-logs-insights-extra-paths
+          (delete selection (copy-sequence aws-logs-insights-extra-paths)))
     (aws-logs--formatting-reprompt)))
 
 (transient-define-suffix aws-logs-formatting-done ()
@@ -731,16 +744,16 @@ Returns a cons cell (FROM . TO), where both values are ISO-like strings."
   (transient-setup 'aws-logs-transient))
 
 (transient-define-prefix aws-logs-formatting-transient ()
-  "Formatting options for Insights summary rendering."
+  "Formatting options for Insights JSON-path rendering."
   :remember-value 'exit
   [["Fields"
-    ("t" "Timestamp field" aws-logs-infix-summary-timestamp-field)
-    ("l" "Level field" aws-logs-infix-summary-level-field)
-    ("m" "Message field" aws-logs-infix-summary-message-field)]
+    ("t" "Timestamp path" aws-logs-infix-insights-timestamp-path)
+    ("l" "Level path" aws-logs-infix-insights-level-path)
+    ("m" "Message path" aws-logs-infix-insights-message-path)]
 
    [4 :description (lambda () (format "Extras: %s" (aws-logs--formatting-extra-summary)))
-      ("a" "Add extra field" aws-logs-formatting-extra-add)
-      ("d" "Delete extra field" aws-logs-formatting-extra-delete)]]
+      ("a" "Add extra path" aws-logs-formatting-extra-add)
+      ("d" "Delete extra path" aws-logs-formatting-extra-delete)]]
 
   [["Done"
     ("RET" "Back to main" aws-logs-formatting-done)]]
