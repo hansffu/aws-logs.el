@@ -131,9 +131,6 @@ to `js-mode`."
 (defvar-local json-log-viewer--summary-function nil
   "Callback: (ENTRY FIELDS) -> summary string.")
 
-(defvar-local json-log-viewer--refresh-function nil
-  "Callback: (STATE) -> plist refresh payload.")
-
 (defvar-local json-log-viewer--header-function nil
   "Callback: (STATE) -> alist of (KEY . VALUE) header lines.")
 
@@ -204,9 +201,6 @@ to `js-mode`."
                          (buffer-file-name))))
     (and source-file (file-name-directory source-file)))
   "Directory that contains json-log-viewer source files.")
-
-(defvar-local json-log-viewer--json-refresh-log-lines-function nil
-  "Callback: (OLD-LOG-LINES) -> NEW-LOG-LINES for JSON-line buffers.")
 
 (defvar-local json-log-viewer--json-header-lines-function nil
   "Optional callback: (STATE) -> additional header lines for JSON-line buffers.")
@@ -441,8 +435,6 @@ CALLBACK is called as (ACTION SOURCE-BUFFER ENTRY-OVERLAYS)."
             (or (plist-get result :next-after-id) 0)))))
       ('entry-fields
        (json-log-viewer--apply-entry-fields-result result))
-      ('all-json-lines nil)
-      ('logs-before nil)
       (op
        (message "json-log-viewer async worker returned unknown op: %S" op)))))
 
@@ -874,21 +866,6 @@ Returns cons cell (ENTRIES . NEXT-ID)."
    (when (functionp json-log-viewer--json-header-lines-function)
      (or (funcall json-log-viewer--json-header-lines-function state) nil))))
 
-(defun json-log-viewer--json-refresh (_state)
-  "Refresh callback used for JSON-line buffers."
-  (unless (functionp json-log-viewer--json-refresh-log-lines-function)
-    (user-error "No JSON-line refresh function configured"))
-  (let* ((old-lines (json-log-viewer--raw-lines-list))
-         (refresh-value (funcall json-log-viewer--json-refresh-log-lines-function old-lines)))
-    (if (eq refresh-value :async)
-        ;; Async refresh function will mutate the buffer later.
-        (list :entries nil :replace nil)
-      (let ((new-lines (json-log-viewer--ensure-log-lines
-                        refresh-value
-                        "json-log-viewer refresh-function return value")))
-        (json-log-viewer-replace-log-lines (current-buffer) new-lines t)
-        (list :entries nil :replace nil)))))
-
 (defun json-log-viewer--entry-signature (entry)
   "Return stable signature for ENTRY."
   (if json-log-viewer--signature-function
@@ -1296,38 +1273,6 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback is applied."
       (format "\"%s\"" json-log-viewer--filter-string)
     "(none)"))
 
-(defun json-log-viewer--raw-lines-list ()
-  "Return flattened copy of raw lines from worker storage."
-  (json-log-viewer--ensure-async-queue-running)
-  (plist-get
-   (json-log-viewer--async-submit-and-await-result
-    (json-log-viewer--make-async-job 'all-json-lines))
-   :lines))
-
-(defun json-log-viewer--get-logs-since (timestamp limit)
-  "Return stored log rows before TIMESTAMP from current buffer sqlite storage.
-
-TIMESTAMP is an epoch float upper bound and rows are returned strictly
-before it.
-When TIMESTAMP is nil, all stored rows are eligible.
-
-LIMIT controls how many of the newest matching rows are returned.  When LIMIT
-is nil, all matching rows are returned.
-
-Return value is sorted in ascending order and each row is a plist:
-  (:id INTEGER :timestamp NUMBER-OR-NIL :json STRING)."
-  (json-log-viewer--ensure-async-queue-running)
-  (unless (or (null timestamp) (numberp timestamp))
-    (user-error "TIMESTAMP must be a number or nil, got: %S" timestamp))
-  (unless (or (null limit)
-              (and (integerp limit) (> limit 0)))
-    (user-error "LIMIT must be a positive integer or nil, got: %S" limit))
-  (plist-get
-   (json-log-viewer--async-submit-and-await-result
-    (append (json-log-viewer--make-async-job 'logs-before)
-            (list :timestamp timestamp :limit limit)))
-   :rows))
-
 (defun json-log-viewer--info-line (key value)
   "Return formatted popup info line from KEY and VALUE."
   (concat
@@ -1350,16 +1295,13 @@ Return value is sorted in ascending order and each row is a plist:
 
 (defun json-log-viewer--default-keybindings ()
   "Return default keybindings shown in the viewer info popup."
-  (append
-   '(("TAB" . "toggle entry")
-     ("S-TAB" . "toggle all")
-     ("C-c C-n" . "narrow")
-     ("C-c C-w" . "widen")
-     ("C-c C-f" . "toggle follow")
-     ("?" . "show info")
-     ("q" . "quit"))
-   (when json-log-viewer--refresh-function
-     '(("C-c C-r" . "refresh")))))
+  '(("TAB" . "toggle entry")
+    ("S-TAB" . "toggle all")
+    ("C-c C-n" . "narrow")
+    ("C-c C-w" . "widen")
+    ("C-c C-f" . "toggle follow")
+    ("?" . "show info")
+    ("q" . "quit")))
 
 (defun json-log-viewer--keybindings ()
   "Return keybindings shown in the viewer info popup."
@@ -1625,35 +1567,12 @@ New entries are always appended to the bottom."
       (json-log-viewer--publish 'append inserted-overlays))
     ordered))
 
-(defun json-log-viewer-refresh ()
-  "Refresh current viewer buffer via configured refresh callback."
-  (interactive)
-  (unless json-log-viewer--refresh-function
-    (user-error "No refresh callback configured for this buffer"))
-  (let* ((result (funcall json-log-viewer--refresh-function (json-log-viewer--state)))
-         (entries (or (plist-get result :entries) nil))
-         (replace (if (plist-member result :replace)
-                      (plist-get result :replace)
-                    (not json-log-viewer--streaming)))
-         (message-text (plist-get result :message)))
-    (when (plist-member result :context)
-      (setq json-log-viewer--context (plist-get result :context)))
-    (when (plist-member result :metadata)
-      (setq json-log-viewer--metadata (plist-get result :metadata)))
-    (if replace
-        (json-log-viewer-replace-entries entries t)
-      (json-log-viewer-append-entries entries))
-    (json-log-viewer--refresh-header)
-    (when message-text
-      (message "%s" message-text))))
-
 (defvar-keymap json-log-viewer-mode-map
   :doc "Keymap for `json-log-viewer-mode'."
   "TAB" #'json-log-viewer-toggle-entry
   "<tab>" #'json-log-viewer-toggle-entry
   "<backtab>" #'json-log-viewer-toggle-all
   "?" #'json-log-viewer-show-info
-  "C-c C-r" #'json-log-viewer-refresh
   "C-c C-n" #'json-log-viewer-narrow
   "C-c C-f" #'json-log-viewer-toggle-auto-follow
   "C-c C-w" #'json-log-viewer-widen)
@@ -1692,7 +1611,6 @@ New entries are always appended to the bottom."
                                        message-path
                                        extra-paths
                                        json-paths
-                                       refresh-function
                                        (mode #'json-log-viewer-mode)
                                        (max-entries json-log-viewer-stream-max-entries)
                                        header-lines-function)
@@ -1704,9 +1622,6 @@ TIMESTAMP-PATH, LEVEL-PATH, MESSAGE-PATH are dot-separated JSON paths used for
 summary rendering. EXTRA-PATHS is a list of additional paths rendered as
 bracketed segments. JSON-PATHS is a list of paths rendered as pretty JSON
 blocks in entry details instead of flattened subfields.
-
-REFRESH-FUNCTION, when non-nil, is called with the current old list of raw log
-lines and must return the new full list of raw log lines.
 
 MODE is the major mode function to initialize the viewer buffer. It must
 derive from `json-log-viewer-mode`. Defaults to `json-log-viewer-mode`.
@@ -1743,9 +1658,6 @@ Returns the created buffer."
         (user-error "json-log-viewer-make-buffer :mode must derive from json-log-viewer-mode, got: %S"
                     normalized-mode))
       (setq-local json-log-viewer--summary-function #'json-log-viewer--json-summary)
-      (setq-local json-log-viewer--refresh-function
-                  (when (functionp refresh-function)
-                    #'json-log-viewer--json-refresh))
       (setq-local json-log-viewer--header-function #'json-log-viewer--json-header-lines)
       (setq-local json-log-viewer--signature-function #'json-log-viewer--json-entry-signature)
       (setq-local json-log-viewer--sort-key-function #'json-log-viewer--json-entry-sort-key)
@@ -1763,7 +1675,6 @@ Returns the created buffer."
       (setq-local json-log-viewer--message-path message-path)
       (setq-local json-log-viewer--extra-paths normalized-extra-paths)
       (setq-local json-log-viewer--json-paths normalized-json-paths)
-      (setq-local json-log-viewer--json-refresh-log-lines-function refresh-function)
       (setq-local json-log-viewer--json-header-lines-function header-lines-function)
       (setq-local json-log-viewer--seen-signatures (make-hash-table :test 'equal))
       (setq-local json-log-viewer--subscribers nil)
@@ -1787,12 +1698,6 @@ BUFFER-OR-NAME must identify a live `json-log-viewer-mode` buffer created by
         (dolist (line normalized-lines)
           (json-log-viewer--async-submit
            (json-log-viewer--make-async-job 'ingest line)))))))
-
-(defun json-log-viewer-current-log-lines (buffer-or-name)
-  "Return a copy of current raw log lines from BUFFER-OR-NAME."
-  (let ((target (json-log-viewer-get-buffer buffer-or-name)))
-    (with-current-buffer target
-      (json-log-viewer--raw-lines-list))))
 
 (defun json-log-viewer-replace-log-lines (buffer-or-name log-lines &optional preserve-filter)
   "Replace raw LOG-LINES in BUFFER-OR-NAME.

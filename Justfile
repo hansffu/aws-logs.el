@@ -3,7 +3,6 @@ dir := justfile_directory()
 test:
     emacs -Q --batch -L . -L test \
         -l test/aws-logs-core-test.el \
-        -l test/composite-json-log-viewer-test.el \
         -l test/json-log-viewer-subscribe-test.el \
         -l test/kafka-logs-test.el \
         -l test/kube-logs-test.el \

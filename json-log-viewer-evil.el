@@ -8,18 +8,17 @@
 ;;
 ;;; Code:
 
+(defvar json-log-viewer--keybindings-function)
+
 
 (defun json-log-viewer--evil-popup-keybindings ()
   "Return Evil keybindings for `json-log-viewer-show-info` popup."
-  (append
-   '(("TAB" . "toggle entry")
-     ("S-TAB" . "toggle all")
-     ("zn" . "narrow")
-     ("zw" . "widen")
-     ("?" . "show info")
-     ("zf" . "toggle follow"))
-   (when json-log-viewer--refresh-function
-     '(("gr" . "refresh")))))
+  '(("TAB" . "toggle entry")
+    ("S-TAB" . "toggle all")
+    ("zn" . "narrow")
+    ("zw" . "widen")
+    ("?" . "show info")
+    ("zf" . "toggle follow")))
 
 (defun json-log-viewer-setup-evil ()
   "Set up Evil keybindings for `json-log-viewer-mode`.
@@ -35,7 +34,6 @@ Safe to call multiple times."
       (kbd "?") #'json-log-viewer-show-info
       (kbd "zn") #'json-log-viewer-narrow
       (kbd "zw") #'json-log-viewer-widen
-      (kbd "gr") #'json-log-viewer-refresh
       (kbd "zf") #'json-log-viewer-toggle-auto-follow))
   (setq json-log-viewer--keybindings-function #'json-log-viewer--evil-popup-keybindings)
   )

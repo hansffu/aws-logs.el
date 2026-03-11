@@ -454,23 +454,6 @@ AFTER-ID is exclusive. CHUNK-SIZE is max row count."
                       :entry-id entry-id
                       :fields (json-log-viewer-async-worker--entry-fields
                                json-log-viewer-async-worker--db entry-id config))))
-             ('all-json-lines
-              (list :op 'all-json-lines
-                    :lines (json-log-viewer-repository-select-all-json-lines
-                            json-log-viewer-async-worker--db)))
-             ('logs-before
-              (let ((timestamp (plist-get job :timestamp))
-                    (limit (plist-get job :limit)))
-                (unless (or (null timestamp) (numberp timestamp))
-                  (error "logs-before op requires numeric or nil :timestamp"))
-                (unless (or (null limit)
-                            (and (integerp limit) (> limit 0)))
-                  (error "logs-before op requires positive integer or nil :limit"))
-                (list :op 'logs-before
-                      :rows (json-log-viewer-repository-select-logs-before
-                             json-log-viewer-async-worker--db
-                             timestamp
-                             limit))))
              (_
               (error "Unknown log-ingestor op: %S" op)))))
       (if request-id

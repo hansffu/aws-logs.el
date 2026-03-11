@@ -203,55 +203,11 @@
             (json-log-viewer-toggle-entry)
             (let ((text (buffer-substring-no-properties (point-min) (point-max))))
               (should (string-match-p "payload:\n{" text))
-              (should (string-match-p "\"service\": \"orders\"" text))))
-          (should (= (length (json-log-viewer-current-log-lines buf)) 1)))
+              (should (string-match-p "\"service\": \"orders\"" text)))))
       (when (buffer-live-p buf)
         (kill-buffer buf))
       (when sqlite-file
         (should-not (file-exists-p sqlite-file))))))
-
-(ert-deftest json-log-viewer-get-logs-since-returns-sorted-tail-test ()
-  (let* ((buf (aws-logs-core-test--make-viewer
-               "*json-log-viewer-get-logs-since-test*"
-               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"m0\"}"
-                 "{\"timestamp\":\"2026-01-01T00:00:01Z\",\"msg\":\"m1\"}"
-                 "{\"timestamp\":\"2026-01-01T00:00:02Z\",\"msg\":\"m2\"}")
-               :timestamp-path "timestamp"
-               :level-path "level"
-               :message-path "msg"))
-         rows)
-    (unwind-protect
-        (with-current-buffer buf
-          (json-log-viewer--async-await-pending-count 0)
-          (setq rows (json-log-viewer--get-logs-since
-                      (json-log-viewer--parse-time "2026-01-01T00:00:03Z")
-                      2))
-          (should (= (length rows) 2))
-          (should (equal (mapcar (lambda (row) (plist-get row :timestamp)) rows)
-                         (list (json-log-viewer--parse-time "2026-01-01T00:00:01Z")
-                               (json-log-viewer--parse-time "2026-01-01T00:00:02Z"))))
-          (should (string-match-p "\"m1\"" (plist-get (car rows) :json)))
-          (should (string-match-p "\"m2\"" (plist-get (cadr rows) :json))))
-      (when (buffer-live-p buf)
-        (kill-buffer buf)))))
-
-(ert-deftest json-log-viewer-json-refresh-async-sentinel-test ()
-  (let* ((buf (aws-logs-core-test--make-viewer
-               "*json-log-viewer-test*"
-               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"a\"}")
-               :timestamp-path "timestamp"
-               :level-path "level"
-               :message-path "msg"
-               :refresh-function (lambda (_old-lines) :async)))
-         result)
-    (unwind-protect
-        (with-current-buffer buf
-          (setq result (json-log-viewer--json-refresh nil))
-          (should (equal (plist-get result :entries) nil))
-          (should (eq (plist-get result :replace) nil))
-          (should (= (length (json-log-viewer-current-log-lines buf)) 1)))
-      (when (buffer-live-p buf)
-        (kill-buffer buf)))))
 
 (ert-deftest json-log-viewer-stream-push-respects-auto-follow-test ()
   (let* ((buf (aws-logs-core-test--make-viewer
@@ -487,10 +443,10 @@
         (with-current-buffer buf
           (json-log-viewer-push buf lines)
           (should (= json-log-viewer--entry-count 251))
-          (let ((stored (json-log-viewer-current-log-lines buf)))
-            (should (= (length stored) 251))
-            (should (string-match-p "\"m-50\"" (car stored)))
-            (should (string-match-p "\"m-300\"" (car (last stored))))))
+          (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+            (should (string-match-p "m-50" text))
+            (should (string-match-p "m-300" text))
+            (should-not (string-match-p "m-49" text))))
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
