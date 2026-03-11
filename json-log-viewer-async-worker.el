@@ -18,6 +18,7 @@
 (declare-function json-pretty-print-buffer "json" ())
 (declare-function json-log-viewer-repository-select-summary-entry-by-id
                   "json-log-viewer-repository" (db entry-id))
+(declare-function async-job-queue-worker-publish "async-job-queue" (payload))
 
 (defun json-log-viewer-async-worker--normalize-narrow-string (needle)
   "Normalize NEEDLE into downcased substring matching text, or nil."
@@ -324,6 +325,36 @@ AFTER-ID is exclusive. CHUNK-SIZE is max row count."
 (defvar json-log-viewer-async-worker--chunk-size 1
   "Worker-local chunk size used for retention truncation.")
 
+(defvar json-log-viewer-async-worker--render-mode 'all
+  "Worker-local render mode: `all' or `narrow'.")
+
+(defvar json-log-viewer-async-worker--render-narrow-string nil
+  "Worker-local active narrow string, or nil when rendering all entries.")
+
+(defun json-log-viewer-async-worker--publish-cmd (cmd &rest props)
+  "Publish render CMD with PROPS to the main Emacs instance."
+  (async-job-queue-worker-publish (append (list :cmd cmd) props)))
+
+(defun json-log-viewer-async-worker--publish-rerender-chunks ()
+  "Publish clear/render commands for current worker render mode."
+  (let ((narrow-string (and (eq json-log-viewer-async-worker--render-mode 'narrow)
+                            json-log-viewer-async-worker--render-narrow-string))
+        (after-id 0)
+        (chunk-size (max 1 (or json-log-viewer-async-worker--chunk-size 1)))
+        done)
+    (json-log-viewer-async-worker--publish-cmd 'clear)
+    (while (not done)
+      (let* ((entries (json-log-viewer-async-worker--sqlite-select-entries-chunk
+                       json-log-viewer-async-worker--db
+                       after-id
+                       chunk-size
+                       narrow-string))
+             (count (length entries)))
+        (when entries
+          (json-log-viewer-async-worker--publish-cmd 'render-entries :entries entries)
+          (setq after-id (or (plist-get (car (last entries)) :id) after-id)))
+        (setq done (< count chunk-size))))))
+
 (defun json-log-viewer-async-worker-init (&optional config)
   "Initialize worker-local sqlite storage from CONFIG plist."
   (json-log-viewer-async-worker-teardown)
@@ -331,6 +362,8 @@ AFTER-ID is exclusive. CHUNK-SIZE is max row count."
         (plist-get config :max-entries))
   (setq json-log-viewer-async-worker--chunk-size
         (max 1 (or (plist-get config :chunk-size) 1)))
+  (setq json-log-viewer-async-worker--render-mode 'all)
+  (setq json-log-viewer-async-worker--render-narrow-string nil)
   (let* ((file (make-temp-file "json-log-viewer-worker-" nil ".sqlite"))
          (db (sqlite-open file)))
     (setq json-log-viewer-async-worker--sqlite-file file)
@@ -346,7 +379,9 @@ AFTER-ID is exclusive. CHUNK-SIZE is max row count."
   (when (and json-log-viewer-async-worker--sqlite-file
              (file-exists-p json-log-viewer-async-worker--sqlite-file))
     (ignore-errors (delete-file json-log-viewer-async-worker--sqlite-file)))
-  (setq json-log-viewer-async-worker--sqlite-file nil))
+  (setq json-log-viewer-async-worker--sqlite-file nil)
+  (setq json-log-viewer-async-worker--render-mode 'all)
+  (setq json-log-viewer-async-worker--render-narrow-string nil))
 
 (defun json-log-viewer-async-worker--ensure-storage ()
   "Ensure worker-local sqlite storage has been initialized."
@@ -403,62 +438,62 @@ AFTER-ID is exclusive. CHUNK-SIZE is max row count."
          (narrow-string (json-log-viewer-async-worker--normalize-narrow-string
                          (plist-get job :narrow-string))))
     (json-log-viewer-async-worker--ensure-storage)
-    (let ((result
-           (pcase op
-             ('reset
-              (json-log-viewer-repository-reset-log-entries
-               json-log-viewer-async-worker--db)
-              (list :op 'reset))
-             ('ingest
-              (let ((line (plist-get job :line)))
-                (unless (stringp line)
-                  (error "Log-ingestor job :line must be a string"))
-                (list :op 'ingest
-                      :entry (json-log-viewer-async-worker--sqlite-insert-log-entry
-                              json-log-viewer-async-worker--db line config narrow-string)
-                      :evicted-count (json-log-viewer-async-worker--enforce-retention
-                                      json-log-viewer-async-worker--db))))
-             ('narrow
-              (unless narrow-string
-                (error "Log-ingestor narrow op requires :narrow-string"))
-              (let* ((after-id (max 0 (or (plist-get job :after-id) 0)))
-                     (chunk-size (max 1 (or (plist-get job :chunk-size) 500)))
-                     (entries (json-log-viewer-async-worker--sqlite-select-entries-chunk
-                               json-log-viewer-async-worker--db
-                               after-id
-                               chunk-size
-                               narrow-string))
-                     (next-after-id (or (plist-get (car (last entries)) :id) after-id)))
-              (list :op 'narrow
-                    :entries entries
-                    :next-after-id next-after-id
-                    :done (< (length entries) chunk-size))))
-             ('widen
-              (let* ((after-id (max 0 (or (plist-get job :after-id) 0)))
-                     (chunk-size (max 1 (or (plist-get job :chunk-size) 500)))
-                     (entries (json-log-viewer-async-worker--sqlite-select-entries-chunk
-                               json-log-viewer-async-worker--db
-                               after-id
-                               chunk-size
-                               nil))
-                     (next-after-id (or (plist-get (car (last entries)) :id) after-id)))
-              (list :op 'widen
-                    :entries entries
-                    :next-after-id next-after-id
-                    :done (< (length entries) chunk-size))))
-             ('entry-fields
-              (let ((entry-id (plist-get job :entry-id)))
-                (unless (integerp entry-id)
-                  (error "entry-fields op requires integer :entry-id"))
-                (list :op 'entry-fields
-                      :entry-id entry-id
-                      :fields (json-log-viewer-async-worker--entry-fields
-                               json-log-viewer-async-worker--db entry-id config))))
-             (_
-              (error "Unknown log-ingestor op: %S" op)))))
-      (if request-id
-          (plist-put result :request-id request-id)
-        result))))
+    (pcase op
+      ('reset
+       (json-log-viewer-repository-reset-log-entries
+        json-log-viewer-async-worker--db)
+       (json-log-viewer-async-worker--publish-cmd 'clear)
+       (when request-id
+         (list :request-id request-id)))
+      ('ingest
+       (let ((line (plist-get job :line))
+             entry)
+         (unless (stringp line)
+           (error "Log-ingestor job :line must be a string"))
+         (setq entry (json-log-viewer-async-worker--sqlite-insert-log-entry
+                      json-log-viewer-async-worker--db
+                      line
+                      config
+                      (and (eq json-log-viewer-async-worker--render-mode 'narrow)
+                           json-log-viewer-async-worker--render-narrow-string)))
+         (json-log-viewer-async-worker--enforce-retention
+          json-log-viewer-async-worker--db)
+         (when entry
+           (json-log-viewer-async-worker--publish-cmd 'render-entries :entries (list entry)))
+         (when request-id
+           (list :request-id request-id))))
+      ('narrow
+       (unless narrow-string
+         (error "Log-ingestor narrow op requires :narrow-string"))
+       (setq json-log-viewer-async-worker--render-mode 'narrow)
+       (setq json-log-viewer-async-worker--render-narrow-string narrow-string)
+       (json-log-viewer-async-worker--publish-rerender-chunks)
+       (when request-id
+         (list :request-id request-id)))
+      ('rerender
+       (if narrow-string
+           (progn
+             (setq json-log-viewer-async-worker--render-mode 'narrow)
+             (setq json-log-viewer-async-worker--render-narrow-string narrow-string))
+         (setq json-log-viewer-async-worker--render-mode 'all)
+         (setq json-log-viewer-async-worker--render-narrow-string nil))
+       (json-log-viewer-async-worker--publish-rerender-chunks)
+       (when request-id
+         (list :request-id request-id)))
+      ((or 'entry-details 'entry-fields)
+       (let ((entry-id (plist-get job :entry-id)))
+         (unless (integerp entry-id)
+           (error "entry-details op requires integer :entry-id"))
+         (json-log-viewer-async-worker--publish-cmd
+          'expand-details
+          :entry-id entry-id
+          :fields (json-log-viewer-async-worker--entry-fields
+                   json-log-viewer-async-worker--db entry-id config)
+          :request-id request-id)
+         (when request-id
+           (list :request-id request-id))))
+      (_
+       (error "Unknown log-ingestor op: %S" op)))))
 
 (provide 'json-log-viewer-async-worker)
 ;;; json-log-viewer-async-worker.el ends here

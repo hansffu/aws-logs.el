@@ -422,7 +422,7 @@
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
-(ert-deftest json-log-viewer-stream-evicts-in-chunks-test ()
+(ert-deftest json-log-viewer-stream-evicts-locally-at-cap-test ()
   (let* ((json-log-viewer-stream-chunk-size 50)
          (lines (let (acc)
                   (dotimes (i 301)
@@ -442,11 +442,11 @@
     (unwind-protect
         (with-current-buffer buf
           (json-log-viewer-push buf lines)
-          (should (= json-log-viewer--entry-count 251))
+          (should (= json-log-viewer--entry-count 300))
           (let ((text (buffer-substring-no-properties (point-min) (point-max))))
-            (should (string-match-p "m-50" text))
+            (should (string-match-p "m-1" text))
             (should (string-match-p "m-300" text))
-            (should-not (string-match-p "m-49" text))))
+            (should-not (string-match-p "m-0" text))))
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 

@@ -93,6 +93,16 @@ function texts."
         (error "INIT-FUNC is not callable in worker: %S" init-func))
       (when (and teardown-func (not (functionp teardown-func)))
         (error "TEARDOWN-FUNC is not callable in worker: %S" teardown-func))
+      (defvar async-job-queue--worker-send-func nil)
+      (defvar async-job-queue--worker-current-id nil)
+      (defun async-job-queue-worker-publish (payload)
+        "Publish PAYLOAD as an intermediate event for current job."
+        (unless async-job-queue--worker-send-func
+          (error "Worker publish called without active send function"))
+        (unless async-job-queue--worker-current-id
+          (error "Worker publish called outside active job"))
+        (funcall async-job-queue--worker-send-func
+                 (list :event async-job-queue--worker-current-id payload)))
       (let ((debug-on-error nil)
             (send (lambda (message)
                     (let ((print-escape-newlines t)
@@ -100,6 +110,7 @@ function texts."
                       (princ (prin1-to-string message) 'external-debugging-output))
                     (princ "\n" 'external-debugging-output)))
             (run-teardown-p nil))
+        (setq async-job-queue--worker-send-func send)
         (condition-case init-err
             (when init-func
               (funcall init-func))
@@ -113,10 +124,11 @@ function texts."
             (condition-case err
                 (pcase (read)
                   (`(:process ,id ,element)
-                   (condition-case process-err
-                       (funcall send (list :ok id (funcall process-func element)))
-                     (error
-                      (funcall send (list :error id (error-message-string process-err)))))
+                   (let ((async-job-queue--worker-current-id id))
+                     (condition-case process-err
+                         (funcall send (list :ok id (funcall process-func element)))
+                       (error
+                        (funcall send (list :error id (error-message-string process-err))))))
                    nil)
                   (`(:stop)
                    (setq run-teardown-p t)
@@ -135,6 +147,7 @@ function texts."
              (funcall send (list :lifecycle-error
                                  (format "TEARDOWN-FUNC failed: %s"
                                          (error-message-string teardown-err)))))))
+        (setq async-job-queue--worker-send-func nil)
         (kill-emacs 0)))))
 
 ;;;###autoload
@@ -266,6 +279,12 @@ Returns an `async-job-queue' object."
             (`(:error ,id ,message-text)
              (when id
                (puthash id (cons 'error message-text) (async-job-queue-ready-results queue))))
+            (`(:event ,_id ,payload)
+             (condition-case callback-err
+                 (funcall (async-job-queue-callback-func queue) payload)
+               (error
+                (message "async-job-queue callback error: %s"
+                         (error-message-string callback-err)))))
             (`(:lifecycle-error ,message-text)
              (condition-case callback-err
                  (funcall (async-job-queue-callback-func queue)
