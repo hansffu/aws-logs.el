@@ -296,24 +296,87 @@
       (push (json-log-viewer-async-worker--stored-row->entry row) entries))
     (nreverse entries)))
 
+(defun json-log-viewer-async-worker--sqlite-select-entries-chunk
+    (db after-id chunk-size &optional narrow-string)
+  "Return chunked ordered summary entries from DB.
+
+AFTER-ID is exclusive. CHUNK-SIZE is max row count."
+  (let ((rows (json-log-viewer-repository-select-summary-entries-chunk
+               db after-id chunk-size narrow-string))
+        entries)
+    (dolist (row rows)
+      (push (json-log-viewer-async-worker--stored-row->entry row) entries))
+    (nreverse entries)))
+
 (defun json-log-viewer-async-worker--sqlite-truncate-oldest (db count)
   "Delete COUNT oldest rows from DB ordered by timestamp then id."
   (json-log-viewer-repository-truncate-oldest db count))
 
-(defconst json-log-viewer-async-worker--sqlite-lock-retries 12
-  "Maximum retries when sqlite reports lock contention.")
+(defvar json-log-viewer-async-worker--db nil
+  "Worker-local sqlite handle used by queue jobs.")
 
-(defun json-log-viewer-async-worker--sqlite-setup (db)
-  "Apply sqlite settings for DB used by async workers."
-  (json-log-viewer-repository-setup-db db))
+(defvar json-log-viewer-async-worker--sqlite-file nil
+  "Worker-local sqlite file path for current queue session.")
 
-(defun json-log-viewer-async-worker--sqlite-lock-error-p (err)
-  "Return non-nil when ERR indicates sqlite lock contention."
-  (json-log-viewer-repository-lock-error-p err))
+(defvar json-log-viewer-async-worker--max-entries nil
+  "Worker-local streaming retention cap, or nil for unbounded.")
 
-(defun json-log-viewer-async-worker--sqlite-run-transaction (sqlite-file body-fn)
-  "Run BODY-FN inside a sqlite transaction for SQLITE-FILE with lock retries."
-  (json-log-viewer-repository-run-transaction sqlite-file body-fn))
+(defvar json-log-viewer-async-worker--chunk-size 1
+  "Worker-local chunk size used for retention truncation.")
+
+(defun json-log-viewer-async-worker-init (&optional config)
+  "Initialize worker-local sqlite storage from CONFIG plist."
+  (json-log-viewer-async-worker-teardown)
+  (setq json-log-viewer-async-worker--max-entries
+        (plist-get config :max-entries))
+  (setq json-log-viewer-async-worker--chunk-size
+        (max 1 (or (plist-get config :chunk-size) 1)))
+  (let* ((file (make-temp-file "json-log-viewer-worker-" nil ".sqlite"))
+         (db (sqlite-open file)))
+    (setq json-log-viewer-async-worker--sqlite-file file)
+    (setq json-log-viewer-async-worker--db db)
+    (json-log-viewer-repository-setup-db db)
+    (json-log-viewer-repository-create-schema db)))
+
+(defun json-log-viewer-async-worker-teardown ()
+  "Close and remove worker-local sqlite storage."
+  (when json-log-viewer-async-worker--db
+    (ignore-errors (sqlite-close json-log-viewer-async-worker--db))
+    (setq json-log-viewer-async-worker--db nil))
+  (when (and json-log-viewer-async-worker--sqlite-file
+             (file-exists-p json-log-viewer-async-worker--sqlite-file))
+    (ignore-errors (delete-file json-log-viewer-async-worker--sqlite-file)))
+  (setq json-log-viewer-async-worker--sqlite-file nil))
+
+(defun json-log-viewer-async-worker--ensure-storage ()
+  "Ensure worker-local sqlite storage has been initialized."
+  (unless json-log-viewer-async-worker--db
+    (error "Worker sqlite storage is not initialized")))
+
+(defun json-log-viewer-async-worker--sqlite-count-entries (db)
+  "Return row count in DB."
+  (or (car (car (sqlite-select db "SELECT COUNT(*) FROM log_entry")))
+      0))
+
+(defun json-log-viewer-async-worker--stream-eviction-drop-count (over-limit)
+  "Return chunk-rounded drop count for OVER-LIMIT rows."
+  (let* ((chunk-size (max 1 (or json-log-viewer-async-worker--chunk-size 1)))
+         (chunks (/ (+ over-limit chunk-size -1) chunk-size)))
+    (* chunks chunk-size)))
+
+(defun json-log-viewer-async-worker--enforce-retention (db)
+  "Apply worker retention policy in DB and return deleted row count."
+  (if (and (integerp json-log-viewer-async-worker--max-entries)
+           (> json-log-viewer-async-worker--max-entries 0))
+      (let* ((count (json-log-viewer-async-worker--sqlite-count-entries db))
+             (over-limit (- count json-log-viewer-async-worker--max-entries)))
+        (if (> over-limit 0)
+            (let ((drop (json-log-viewer-async-worker--stream-eviction-drop-count
+                         over-limit)))
+              (json-log-viewer-async-worker--sqlite-truncate-oldest db drop)
+              drop)
+          0))
+    0))
 
 (defun json-log-viewer-async-worker--config-from-job (job)
   "Extract reusable config plist from JOB."
@@ -321,68 +384,98 @@
         :level-path (plist-get job :level-path)
         :message-path (plist-get job :message-path)
         :extra-paths (or (plist-get job :extra-paths) nil)
-        :sqlite-file (plist-get job :sqlite-file)))
+        :json-paths (or (plist-get job :json-paths) nil)))
+
+(defun json-log-viewer-async-worker--entry-fields (db entry-id config)
+  "Return normalized detail rows for ENTRY-ID using CONFIG."
+  (when-let ((json-text (json-log-viewer-repository-select-entry-json-by-id db entry-id)))
+    (let ((parsed (json-log-viewer-shared--parse-json-line json-text)))
+      (json-log-viewer-async-worker--json-object-rows
+       parsed
+       json-text
+       (plist-get config :json-paths)))))
 
 (defun json-log-viewer-async-worker-process-log-ingestor-job (job)
   "Process one LOG-INGESTOR JOB payload."
   (let* ((op (or (plist-get job :op) 'ingest))
-         (sqlite-file (plist-get job :sqlite-file))
+         (request-id (plist-get job :request-id))
          (config (json-log-viewer-async-worker--config-from-job job))
          (narrow-string (json-log-viewer-async-worker--normalize-narrow-string
                          (plist-get job :narrow-string))))
-    (unless sqlite-file
-      (error "Log-ingestor worker missing sqlite support"))
-    (pcase op
-      ('reset
-       (json-log-viewer-async-worker--sqlite-run-transaction
-        sqlite-file
-        (lambda (db)
-          (json-log-viewer-repository-reset-log-entries db)))
-       (list :op 'reset))
-      ('ingest
-       (let ((line (plist-get job :line)))
-         (unless (stringp line)
-           (error "Log-ingestor job :line must be a string"))
-         (list :op 'ingest
-               :entry
-               (json-log-viewer-async-worker--sqlite-run-transaction
-                sqlite-file
-                (lambda (db)
-                  (json-log-viewer-async-worker--sqlite-insert-log-entry
-                   db line config narrow-string))))))
-      ('narrow
-       (unless narrow-string
-         (error "Log-ingestor narrow op requires :narrow-string"))
-       (list :op 'narrow
-             :entries
-             (json-log-viewer-async-worker--sqlite-run-transaction
-              sqlite-file
-              (lambda (db)
-                (json-log-viewer-async-worker--sqlite-select-entries
-                 db config narrow-string)))))
-      ('widen
-       (list :op 'widen
-             :entries
-             (json-log-viewer-async-worker--sqlite-run-transaction
-              sqlite-file
-              (lambda (db)
-                (json-log-viewer-async-worker--sqlite-select-entries
-                 db config nil)))))
-      (_
-       (error "Unknown log-ingestor op: %S" op)))))
-
-(defun json-log-viewer-async-worker-process-trunkator-job (job)
-  "Process one TRUNKATOR JOB payload."
-  (let* ((sqlite-file (plist-get job :sqlite-file))
-         (count (max 0 (or (plist-get job :count) 0)))
-         (deleted 0))
-    (unless sqlite-file
-      (error "Trunkator worker missing sqlite support"))
-    (json-log-viewer-async-worker--sqlite-run-transaction
-     sqlite-file
-     (lambda (db)
-       (setq deleted (json-log-viewer-async-worker--sqlite-truncate-oldest db count))))
-    (list :op 'truncate :count deleted)))
+    (json-log-viewer-async-worker--ensure-storage)
+    (let ((result
+           (pcase op
+             ('reset
+              (json-log-viewer-repository-reset-log-entries
+               json-log-viewer-async-worker--db)
+              (list :op 'reset))
+             ('ingest
+              (let ((line (plist-get job :line)))
+                (unless (stringp line)
+                  (error "Log-ingestor job :line must be a string"))
+                (list :op 'ingest
+                      :entry (json-log-viewer-async-worker--sqlite-insert-log-entry
+                              json-log-viewer-async-worker--db line config narrow-string)
+                      :evicted-count (json-log-viewer-async-worker--enforce-retention
+                                      json-log-viewer-async-worker--db))))
+             ('narrow
+              (unless narrow-string
+                (error "Log-ingestor narrow op requires :narrow-string"))
+              (let* ((after-id (max 0 (or (plist-get job :after-id) 0)))
+                     (chunk-size (max 1 (or (plist-get job :chunk-size) 500)))
+                     (entries (json-log-viewer-async-worker--sqlite-select-entries-chunk
+                               json-log-viewer-async-worker--db
+                               after-id
+                               chunk-size
+                               narrow-string))
+                     (next-after-id (or (plist-get (car (last entries)) :id) after-id)))
+              (list :op 'narrow
+                    :entries entries
+                    :next-after-id next-after-id
+                    :done (< (length entries) chunk-size))))
+             ('widen
+              (let* ((after-id (max 0 (or (plist-get job :after-id) 0)))
+                     (chunk-size (max 1 (or (plist-get job :chunk-size) 500)))
+                     (entries (json-log-viewer-async-worker--sqlite-select-entries-chunk
+                               json-log-viewer-async-worker--db
+                               after-id
+                               chunk-size
+                               nil))
+                     (next-after-id (or (plist-get (car (last entries)) :id) after-id)))
+              (list :op 'widen
+                    :entries entries
+                    :next-after-id next-after-id
+                    :done (< (length entries) chunk-size))))
+             ('entry-fields
+              (let ((entry-id (plist-get job :entry-id)))
+                (unless (integerp entry-id)
+                  (error "entry-fields op requires integer :entry-id"))
+                (list :op 'entry-fields
+                      :entry-id entry-id
+                      :fields (json-log-viewer-async-worker--entry-fields
+                               json-log-viewer-async-worker--db entry-id config))))
+             ('all-json-lines
+              (list :op 'all-json-lines
+                    :lines (json-log-viewer-repository-select-all-json-lines
+                            json-log-viewer-async-worker--db)))
+             ('logs-before
+              (let ((timestamp (plist-get job :timestamp))
+                    (limit (plist-get job :limit)))
+                (unless (or (null timestamp) (numberp timestamp))
+                  (error "logs-before op requires numeric or nil :timestamp"))
+                (unless (or (null limit)
+                            (and (integerp limit) (> limit 0)))
+                  (error "logs-before op requires positive integer or nil :limit"))
+                (list :op 'logs-before
+                      :rows (json-log-viewer-repository-select-logs-before
+                             json-log-viewer-async-worker--db
+                             timestamp
+                             limit))))
+             (_
+              (error "Unknown log-ingestor op: %S" op)))))
+      (if request-id
+          (plist-put result :request-id request-id)
+        result))))
 
 (provide 'json-log-viewer-async-worker)
 ;;; json-log-viewer-async-worker.el ends here

@@ -213,6 +213,38 @@ Returned rows are ascending plists of shape
           :message-path (nth 4 row)
           :extra-paths (nth 5 row))))
 
+(defun json-log-viewer-repository-select-summary-entries-chunk (db after-id limit &optional narrow-string)
+  "Return summary row plists chunk from DB after AFTER-ID with LIMIT.
+
+When NARROW-STRING is non-nil, only matching rows are returned."
+  (let ((rows
+         (if narrow-string
+             (sqlite-select
+              db
+              (concat
+               "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths "
+               "FROM log_entry "
+               "WHERE id > ? AND instr(lower(json), ?) > 0 "
+               "ORDER BY id LIMIT ?")
+              (vector after-id narrow-string limit))
+           (sqlite-select
+            db
+            (concat
+             "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths "
+             "FROM log_entry "
+             "WHERE id > ? "
+             "ORDER BY id LIMIT ?")
+            (vector after-id limit)))))
+    (mapcar
+     (lambda (row)
+       (list :id (nth 0 row)
+             :sort-key (nth 1 row)
+             :timestamp (nth 2 row)
+             :level-path (nth 3 row)
+             :message-path (nth 4 row)
+             :extra-paths (nth 5 row)))
+     rows)))
+
 (defun json-log-viewer-repository-reset-log-entries (db)
   "Delete all log rows in DB."
   (sqlite-execute db "DELETE FROM log_entry"))
