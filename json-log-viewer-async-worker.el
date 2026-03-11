@@ -297,18 +297,6 @@
       (push (json-log-viewer-async-worker--stored-row->entry row) entries))
     (nreverse entries)))
 
-(defun json-log-viewer-async-worker--sqlite-select-entries-chunk
-    (db after-id chunk-size &optional narrow-string)
-  "Return chunked ordered summary entries from DB.
-
-AFTER-ID is exclusive. CHUNK-SIZE is max row count."
-  (let ((rows (json-log-viewer-repository-select-summary-entries-chunk
-               db after-id chunk-size narrow-string))
-        entries)
-    (dolist (row rows)
-      (push (json-log-viewer-async-worker--stored-row->entry row) entries))
-    (nreverse entries)))
-
 (defun json-log-viewer-async-worker--sqlite-select-entries-tail
     (db limit &optional narrow-string)
   "Return at most LIMIT newest summary entries from DB, ordered by id."
@@ -345,39 +333,30 @@ AFTER-ID is exclusive. CHUNK-SIZE is max row count."
   "Publish clear/render commands for current worker render mode."
   (let ((narrow-string (and (eq json-log-viewer-async-worker--render-mode 'narrow)
                             json-log-viewer-async-worker--render-narrow-string))
-        (after-id 0)
         (chunk-size (max 1 (or json-log-viewer-async-worker--chunk-size 1)))
         (entry-limit (and (integerp json-log-viewer-async-worker--max-entries)
                           (> json-log-viewer-async-worker--max-entries 0)
-                          json-log-viewer-async-worker--max-entries))
-        done)
+                          json-log-viewer-async-worker--max-entries)))
     (json-log-viewer-async-worker--publish-cmd 'clear)
-    (if entry-limit
-        (let ((remaining (json-log-viewer-async-worker--sqlite-select-entries-tail
+    (let ((remaining (if entry-limit
+                         (json-log-viewer-async-worker--sqlite-select-entries-tail
                           json-log-viewer-async-worker--db
                           entry-limit
-                          narrow-string)))
-          (while remaining
-            (let ((batch nil)
-                  (count 0))
-              (while (and remaining (< count chunk-size))
-                (push (pop remaining) batch)
-                (setq count (1+ count)))
-              (when batch
-                (json-log-viewer-async-worker--publish-cmd
-                 'render-entries
-                 :entries (nreverse batch))))))
-      (while (not done)
-        (let* ((entries (json-log-viewer-async-worker--sqlite-select-entries-chunk
-                         json-log-viewer-async-worker--db
-                         after-id
-                         chunk-size
-                         narrow-string))
-               (count (length entries)))
-          (when entries
-            (json-log-viewer-async-worker--publish-cmd 'render-entries :entries entries)
-            (setq after-id (or (plist-get (car (last entries)) :id) after-id)))
-          (setq done (< count chunk-size)))))))
+                          narrow-string)
+                       (json-log-viewer-async-worker--sqlite-select-entries
+                        json-log-viewer-async-worker--db
+                        nil
+                        narrow-string))))
+      (while remaining
+        (let ((batch nil)
+              (count 0))
+          (while (and remaining (< count chunk-size))
+            (push (pop remaining) batch)
+            (setq count (1+ count)))
+          (when batch
+            (json-log-viewer-async-worker--publish-cmd
+             'render-entries
+             :entries (nreverse batch))))))))
 
 (defun json-log-viewer-async-worker-init (&optional config)
   "Initialize worker-local sqlite storage from CONFIG plist."
@@ -442,8 +421,7 @@ AFTER-ID is exclusive. CHUNK-SIZE is max row count."
        (json-log-viewer-repository-reset-log-entries
         json-log-viewer-async-worker--db)
        (json-log-viewer-async-worker--publish-cmd 'clear)
-       (when request-id
-         (list :request-id request-id)))
+       nil)
       ('ingest
        (let ((line (plist-get job :line))
              entry)
@@ -457,16 +435,14 @@ AFTER-ID is exclusive. CHUNK-SIZE is max row count."
                            json-log-viewer-async-worker--render-narrow-string)))
          (when entry
            (json-log-viewer-async-worker--publish-cmd 'render-entries :entries (list entry)))
-         (when request-id
-           (list :request-id request-id))))
+         nil))
       ('narrow
        (unless narrow-string
          (error "Log-ingestor narrow op requires :narrow-string"))
        (setq json-log-viewer-async-worker--render-mode 'narrow)
        (setq json-log-viewer-async-worker--render-narrow-string narrow-string)
        (json-log-viewer-async-worker--publish-rerender-chunks)
-       (when request-id
-         (list :request-id request-id)))
+       nil)
       ('rerender
        (if narrow-string
            (progn
@@ -475,8 +451,7 @@ AFTER-ID is exclusive. CHUNK-SIZE is max row count."
          (setq json-log-viewer-async-worker--render-mode 'all)
          (setq json-log-viewer-async-worker--render-narrow-string nil))
        (json-log-viewer-async-worker--publish-rerender-chunks)
-       (when request-id
-         (list :request-id request-id)))
+       nil)
       ((or 'entry-details 'entry-fields)
        (let ((entry-id (plist-get job :entry-id)))
          (unless (integerp entry-id)
@@ -487,8 +462,7 @@ AFTER-ID is exclusive. CHUNK-SIZE is max row count."
           :fields (json-log-viewer-async-worker--entry-fields
                    json-log-viewer-async-worker--db entry-id config)
           :request-id request-id)
-         (when request-id
-           (list :request-id request-id))))
+         nil))
       (_
        (error "Unknown log-ingestor op: %S" op)))))
 

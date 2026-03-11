@@ -155,12 +155,6 @@ to `js-mode`."
 (defvar-local json-log-viewer--async-next-request-id 0
   "Monotonic request id used to correlate async worker responses.")
 
-(defvar-local json-log-viewer--sqlite-db nil
-  "Deprecated compatibility slot. Main process no longer owns sqlite handles.")
-
-(defvar-local json-log-viewer--sqlite-file nil
-  "Deprecated compatibility slot. Main process no longer owns sqlite files.")
-
 (defvar-local json-log-viewer--entry-count 0
   "Cached count of rendered entry overlays.")
 
@@ -471,11 +465,6 @@ CALLBACK is called as (ACTION SOURCE-BUFFER ENTRY-OVERLAYS)."
   (when json-log-viewer--async-queue
     (ignore-errors (async-job-queue-stop json-log-viewer--async-queue))
     (setq json-log-viewer--async-queue nil))
-  (when (and (stringp json-log-viewer--sqlite-file)
-             (file-exists-p json-log-viewer--sqlite-file))
-    (ignore-errors (delete-file json-log-viewer--sqlite-file)))
-  (setq json-log-viewer--sqlite-file nil)
-  (setq json-log-viewer--sqlite-db nil)
   (setq json-log-viewer--async-pending-count 0)
   (setq json-log-viewer--async-next-request-id 0)
   nil)
@@ -488,10 +477,6 @@ CALLBACK is called as (ACTION SOURCE-BUFFER ENTRY-OVERLAYS)."
         (max-entries json-log-viewer--stream-max-entries)
         (chunk-size json-log-viewer-stream-chunk-size))
     (setq-local json-log-viewer--async-next-request-id 0)
-    ;; Compatibility marker path for callers/tests that only verify lifecycle.
-    (setq-local json-log-viewer--sqlite-file
-                (make-temp-file "json-log-viewer-worker-session-"))
-    (setq-local json-log-viewer--sqlite-db nil)
     (setq-local json-log-viewer--async-queue
                 (async-job-queue-create
                  (json-log-viewer--make-async-queue-process-func)
@@ -1380,9 +1365,7 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback is applied."
   (message "Re-rendering..."))
 
 (defun json-log-viewer-widen ()
-  "Clear active narrowing and replay all stored entries.
-
-Compatibility alias for callers expecting widen semantics."
+  "Clear active narrowing and replay all stored entries."
   (interactive)
   (setq json-log-viewer--filter-string nil)
   (json-log-viewer--refresh-header)

@@ -251,19 +251,17 @@
       (should (get-text-property 0 'json-log-viewer-json-block value)))))
 
 (ert-deftest json-log-viewer-sqlite-storage-offloads-hidden-data-test ()
-  (let* ((buf (aws-logs-core-test--make-viewer
-               "*json-log-viewer-sqlite-storage-test*"
-               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"hello\",\"payload\":{\"service\":\"orders\",\"log\":{\"level\":\"ERROR\"}}}")
-               :timestamp-path "timestamp"
-               :level-path "payload.log.level"
-               :message-path "msg"
-               :json-paths '("payload")))
-         sqlite-file)
+  ;; SQLite now lives entirely in the worker process; this test verifies that
+  ;; entry expansion fetches hidden fields from worker storage correctly.
+  (let ((buf (aws-logs-core-test--make-viewer
+              "*json-log-viewer-sqlite-storage-test*"
+              '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"hello\",\"payload\":{\"service\":\"orders\",\"log\":{\"level\":\"ERROR\"}}}")
+              :timestamp-path "timestamp"
+              :level-path "payload.log.level"
+              :message-path "msg"
+              :json-paths '("payload"))))
     (unwind-protect
         (with-current-buffer buf
-          (setq sqlite-file json-log-viewer--sqlite-file)
-          (should (stringp sqlite-file))
-          (should (file-exists-p sqlite-file))
           (let ((entry-ov (car json-log-viewer--entry-overlays)))
             (should entry-ov)
             (should-not (overlay-get entry-ov 'json-log-viewer-entry-fields))
@@ -273,9 +271,7 @@
               (should (string-match-p "payload:\n{" text))
               (should (string-match-p "\"service\": \"orders\"" text)))))
       (when (buffer-live-p buf)
-        (kill-buffer buf))
-      (when sqlite-file
-        (should-not (file-exists-p sqlite-file))))))
+        (kill-buffer buf)))))
 
 (ert-deftest json-log-viewer-stream-push-respects-auto-follow-test ()
   (let* ((buf (aws-logs-core-test--make-viewer
