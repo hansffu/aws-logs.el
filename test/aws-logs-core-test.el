@@ -157,6 +157,74 @@
     (should (equal (plist-get entry-dotted :level) "INFO"))
     (should (equal (plist-get entry-nested :level) "INFO"))))
 
+(ert-deftest json-log-viewer-async-worker-rerender-caps-published-entries-test ()
+  (let (published)
+    (cl-letf (((symbol-function 'async-job-queue-worker-publish)
+               (lambda (payload) (push payload published))))
+      (unwind-protect
+          (progn
+            (json-log-viewer-async-worker-init '(:max-entries 3 :chunk-size 2))
+            (dotimes (i 5)
+              (json-log-viewer-async-worker-process-log-ingestor-job
+               (list :op 'ingest
+                     :line (format "{\"timestamp\":\"2026-01-01T00:00:0%dZ\",\"msg\":\"m-%d\"}"
+                                   i i)
+                     :timestamp-path "timestamp"
+                     :message-path "msg")))
+            (setq published nil)
+            (json-log-viewer-async-worker-process-log-ingestor-job
+             (list :op 'rerender
+                   :timestamp-path "timestamp"
+                   :message-path "msg"))
+            (setq published (nreverse published))
+            (should (equal (plist-get (car published) :cmd) 'clear))
+            (let* ((commands (cdr published))
+                   (entries (apply #'append
+                                   (mapcar (lambda (cmd) (plist-get cmd :entries))
+                                           commands)))
+                   (messages (mapcar (lambda (entry) (plist-get entry :message))
+                                     entries)))
+              (should (= (length entries) 3))
+              (should (equal messages '("m-2" "m-3" "m-4")))))
+        (ignore-errors (json-log-viewer-async-worker-teardown))))))
+
+(ert-deftest json-log-viewer-async-worker-rerender-orders-by-timestamp-test ()
+  (let (published)
+    (cl-letf (((symbol-function 'async-job-queue-worker-publish)
+               (lambda (payload) (push payload published))))
+      (unwind-protect
+          (progn
+            (json-log-viewer-async-worker-init '(:max-entries 10 :chunk-size 10))
+            ;; Ingest out of timestamp order; replay should order by timestamp.
+            (json-log-viewer-async-worker-process-log-ingestor-job
+             (list :op 'ingest
+                   :line "{\"timestamp\":\"2026-01-01T00:00:10Z\",\"msg\":\"late\"}"
+                   :timestamp-path "timestamp"
+                   :message-path "msg"))
+            (json-log-viewer-async-worker-process-log-ingestor-job
+             (list :op 'ingest
+                   :line "{\"timestamp\":\"2026-01-01T00:00:05Z\",\"msg\":\"early\"}"
+                   :timestamp-path "timestamp"
+                   :message-path "msg"))
+            (json-log-viewer-async-worker-process-log-ingestor-job
+             (list :op 'ingest
+                   :line "{\"timestamp\":\"2026-01-01T00:00:08Z\",\"msg\":\"middle\"}"
+                   :timestamp-path "timestamp"
+                   :message-path "msg"))
+            (setq published nil)
+            (json-log-viewer-async-worker-process-log-ingestor-job
+             (list :op 'rerender
+                   :timestamp-path "timestamp"
+                   :message-path "msg"))
+            (setq published (nreverse published))
+            (let* ((entries (apply #'append
+                                   (mapcar (lambda (cmd) (plist-get cmd :entries))
+                                           (cdr published))))
+                   (messages (mapcar (lambda (entry) (plist-get entry :message))
+                                     entries)))
+              (should (equal messages '("early" "middle" "late")))))
+        (ignore-errors (json-log-viewer-async-worker-teardown))))))
+
 (ert-deftest json-log-viewer-parse-time-preserves-subsecond-order-test ()
   (let ((t1 (json-log-viewer--parse-time "2026-01-01T00:00:00.123Z"))
         (t2 (json-log-viewer--parse-time "2026-01-01T00:00:00.124Z")))
@@ -442,11 +510,11 @@
     (unwind-protect
         (with-current-buffer buf
           (json-log-viewer-push buf lines)
-          (should (= json-log-viewer--entry-count 300))
+          (should (= json-log-viewer--entry-count 251))
           (let ((text (buffer-substring-no-properties (point-min) (point-max))))
-            (should (string-match-p "m-1" text))
+            (should (string-match-p "m-50" text))
             (should (string-match-p "m-300" text))
-            (should-not (string-match-p "m-0" text))))
+            (should-not (string-match-p "m-49" text))))
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 

@@ -184,17 +184,18 @@ Returned rows are ascending plists of shape
    (if narrow-string
        (sqlite-select
         db
-        (concat
-         "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths "
-         "FROM log_entry "
-         "WHERE instr(lower(json), ?) > 0 "
-         "ORDER BY id")
+       (concat
+        "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths "
+        "FROM log_entry "
+        "WHERE instr(lower(json), ?) > 0 "
+         "ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, timestamp_epoch, id")
         (vector narrow-string))
      (sqlite-select
       db
       (concat
        "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths "
-       "FROM log_entry ORDER BY id")))))
+       "FROM log_entry "
+       "ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, timestamp_epoch, id")))))
 
 (defun json-log-viewer-repository-select-summary-entry-by-id (db entry-id)
   "Return summary row plist for ENTRY-ID from DB."
@@ -235,6 +236,47 @@ When NARROW-STRING is non-nil, only matching rows are returned."
              "WHERE id > ? "
              "ORDER BY id LIMIT ?")
             (vector after-id limit)))))
+    (mapcar
+     (lambda (row)
+       (list :id (nth 0 row)
+             :sort-key (nth 1 row)
+             :timestamp (nth 2 row)
+             :level-path (nth 3 row)
+             :message-path (nth 4 row)
+             :extra-paths (nth 5 row)))
+     rows)))
+
+(defun json-log-viewer-repository-select-summary-tail-entries (db limit &optional narrow-string)
+  "Return at most LIMIT newest summary row plists from DB, ordered by timestamp/id.
+
+When NARROW-STRING is non-nil, only matching rows are returned."
+  (let ((rows
+         (if narrow-string
+             (sqlite-select
+              db
+              (concat
+               "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths "
+               "FROM ("
+               "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths "
+               "FROM log_entry "
+               "WHERE instr(lower(json), ?) > 0 "
+               "ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 0 ELSE 1 END, "
+               "timestamp_epoch DESC, id DESC LIMIT ?"
+               ") ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, "
+               "timestamp_epoch, id")
+              (vector narrow-string limit))
+           (sqlite-select
+            db
+            (concat
+             "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths "
+             "FROM ("
+             "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths "
+             "FROM log_entry "
+             "ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 0 ELSE 1 END, "
+             "timestamp_epoch DESC, id DESC LIMIT ?"
+             ") ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, "
+             "timestamp_epoch, id")
+            (vector limit)))))
     (mapcar
      (lambda (row)
        (list :id (nth 0 row)

@@ -82,12 +82,12 @@
 (defcustom json-log-viewer-stream-max-entries 15000
   "Maximum entries retained in streaming buffers.
 
-When nil, streaming buffers are unbounded."
+When non-nil, async narrow/rerender replays are also capped to this size."
   :type '(choice (const :tag "Unbounded" nil) integer)
   :group 'json-log-viewer)
 
 (defcustom json-log-viewer-stream-chunk-size 100
-  "Chunk size used for streaming storage and batch eviction."
+  "Chunk size used for async render-entry command batches."
   :type 'integer
   :group 'json-log-viewer)
 
@@ -389,8 +389,14 @@ CALLBACK is called as (ACTION SOURCE-BUFFER ENTRY-OVERLAYS)."
        (when (and (integerp json-log-viewer--stream-max-entries)
                   (> json-log-viewer--stream-max-entries 0)
                   (> json-log-viewer--entry-count json-log-viewer--stream-max-entries))
-         (json-log-viewer--drop-oldest-rendered-entries
-          (- json-log-viewer--entry-count json-log-viewer--stream-max-entries)))))
+         (let* ((over (- json-log-viewer--entry-count
+                         json-log-viewer--stream-max-entries))
+                (chunk-size (max 1 (or json-log-viewer-stream-chunk-size 1)))
+                ;; Drop at least one full chunk once over limit to avoid
+                ;; constant +1/-1 churn around the cap.
+                (drop (* chunk-size
+                         (/ (+ over chunk-size -1) chunk-size))))
+           (json-log-viewer--drop-oldest-rendered-entries drop)))))
     ('expand-details
      (json-log-viewer--apply-entry-fields-result command))
     ('error
@@ -1441,41 +1447,45 @@ Compatibility alias for callers expecting widen semantics."
   "Drop DROP oldest rendered entries from the buffer."
   (when (> drop 0)
     (let ((inhibit-read-only t))
-      (let* ((drop (min json-log-viewer--entry-count drop))
-           (keep (- json-log-viewer--entry-count drop))
-           kept
-           victims
-           (victim-folds nil))
-        ;; Avoid `cl-subseq` on long lists to prevent deep recursive list copying.
-        (let ((idx 0))
-          (dolist (entry-overlay json-log-viewer--entry-overlays)
-            (if (< idx keep)
-                (push entry-overlay kept)
-              (push entry-overlay victims))
-            (setq idx (1+ idx))))
-        (setq kept (nreverse kept))
-        (setq victims (nreverse victims))
-        (setq json-log-viewer--entry-overlays kept)
-        (setq json-log-viewer--entry-count keep)
-        (dolist (entry-overlay victims)
-          (let ((fold-ov (overlay-get entry-overlay 'json-log-viewer-fold-overlay))
-                (sig (overlay-get entry-overlay 'json-log-viewer-signature)))
-            (when (overlayp fold-ov)
-              (push fold-ov victim-folds))
-            (when sig
-              (remhash sig json-log-viewer--seen-signatures))
-            (when (and (overlay-buffer entry-overlay)
-                       (overlay-start entry-overlay)
-                       (overlay-end entry-overlay))
-              (delete-region (overlay-start entry-overlay)
-                             (overlay-end entry-overlay)))
-            (when (overlay-buffer entry-overlay)
-              (delete-overlay entry-overlay))
-            (when (overlayp fold-ov)
-              (delete-overlay fold-ov))))
-        (setq json-log-viewer--fold-overlays
-              (cl-remove-if (lambda (ov) (memq ov victim-folds))
-                            json-log-viewer--fold-overlays))))))
+      (let ((remaining (min json-log-viewer--entry-count drop))
+            (chunk-size (max 1 (or json-log-viewer-stream-chunk-size 1))))
+        (while (> remaining 0)
+          (let* ((chunk-drop (min remaining chunk-size))
+                 (keep (- json-log-viewer--entry-count chunk-drop))
+                 kept
+                 victims
+                 (victim-folds nil))
+            ;; Avoid `cl-subseq` on long lists to prevent deep recursive list copying.
+            (let ((idx 0))
+              (dolist (entry-overlay json-log-viewer--entry-overlays)
+                (if (< idx keep)
+                    (push entry-overlay kept)
+                  (push entry-overlay victims))
+                (setq idx (1+ idx))))
+            (setq kept (nreverse kept))
+            (setq victims (nreverse victims))
+            (setq json-log-viewer--entry-overlays kept)
+            (setq json-log-viewer--entry-count keep)
+            (dolist (entry-overlay victims)
+              (let ((fold-ov (overlay-get entry-overlay 'json-log-viewer-fold-overlay))
+                    (sig (overlay-get entry-overlay 'json-log-viewer-signature)))
+                (when (overlayp fold-ov)
+                  (push fold-ov victim-folds))
+                (when sig
+                  (remhash sig json-log-viewer--seen-signatures))
+                (when (and (overlay-buffer entry-overlay)
+                           (overlay-start entry-overlay)
+                           (overlay-end entry-overlay))
+                  (delete-region (overlay-start entry-overlay)
+                                 (overlay-end entry-overlay)))
+                (when (overlay-buffer entry-overlay)
+                  (delete-overlay entry-overlay))
+                (when (overlayp fold-ov)
+                  (delete-overlay fold-ov))))
+            (setq json-log-viewer--fold-overlays
+                  (cl-remove-if (lambda (ov) (memq ov victim-folds))
+                                json-log-viewer--fold-overlays))
+            (setq remaining (- remaining chunk-drop))))))))
 
 (defun json-log-viewer-replace-entries (entries &optional preserve-filter storage-prepared)
   "Replace rendered entries with ENTRIES.
