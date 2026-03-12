@@ -91,6 +91,11 @@ When non-nil, async narrow/rerender replays are also capped to this size."
   :type 'integer
   :group 'json-log-viewer)
 
+(defcustom json-log-viewer-sliding-window-load-size 100
+  "Default entry count loaded by interactive sliding-window commands."
+  :type 'integer
+  :group 'json-log-viewer)
+
 (defcustom json-log-viewer-rebuild-chunk-size 500
   "Chunk size used for async replay commands."
   :type 'integer
@@ -154,6 +159,12 @@ to `js-mode`."
 
 (defvar-local json-log-viewer--async-next-request-id 0
   "Monotonic request id used to correlate async worker responses.")
+
+(defvar-local json-log-viewer--load-more-in-flight nil
+  "Non-nil when a load-more request is currently in flight.")
+
+(defvar-local json-log-viewer--load-more-request-id nil
+  "Request id of the active load-more operation, or nil.")
 
 (defvar-local json-log-viewer--entry-count 0
   "Cached count of rendered entry overlays.")
@@ -376,10 +387,13 @@ CALLBACK is called as (ACTION SOURCE-BUFFER ENTRY-OVERLAYS)."
     ('clear
      (json-log-viewer--clear-rendered-buffer))
     ('render-entries
-     (let ((entries (json-log-viewer--worker-entries->entries
-                     (plist-get command :entries))))
+     (let* ((entries (json-log-viewer--worker-entries->entries
+                      (plist-get command :entries)))
+            (prepend (plist-get command :prepend)))
        (when entries
-         (json-log-viewer-append-entries entries))
+         (if prepend
+             (json-log-viewer-prepend-entries entries)
+           (json-log-viewer-append-entries entries)))
        (when (and (integerp json-log-viewer--stream-max-entries)
                   (> json-log-viewer--stream-max-entries 0)
                   (> json-log-viewer--entry-count json-log-viewer--stream-max-entries))
@@ -390,9 +404,18 @@ CALLBACK is called as (ACTION SOURCE-BUFFER ENTRY-OVERLAYS)."
                 ;; constant +1/-1 churn around the cap.
                 (drop (* chunk-size
                          (/ (+ over chunk-size -1) chunk-size))))
-           (json-log-viewer--drop-oldest-rendered-entries drop)))))
+           (if prepend
+               (json-log-viewer--drop-newest-rendered-entries drop)
+             (json-log-viewer--drop-oldest-rendered-entries drop))))))
     ('expand-details
      (json-log-viewer--apply-entry-fields-result command))
+    ('load-more-complete
+     (let ((request-id (plist-get command :request-id)))
+       (when (and json-log-viewer--load-more-in-flight
+                  (or (null request-id)
+                      (eq request-id json-log-viewer--load-more-request-id)))
+         (setq json-log-viewer--load-more-in-flight nil)
+         (setq json-log-viewer--load-more-request-id nil))))
     ('error
      (message "json-log-viewer async worker error: %s"
               (or (plist-get command :message) "unknown error")))
@@ -467,6 +490,8 @@ CALLBACK is called as (ACTION SOURCE-BUFFER ENTRY-OVERLAYS)."
     (setq json-log-viewer--async-queue nil))
   (setq json-log-viewer--async-pending-count 0)
   (setq json-log-viewer--async-next-request-id 0)
+  (setq json-log-viewer--load-more-in-flight nil)
+  (setq json-log-viewer--load-more-request-id nil)
   nil)
 
 (defun json-log-viewer--start-async-queue ()
@@ -703,6 +728,15 @@ JSON-PATHS is a list of paths to render as JSON blocks instead of flattening."
     ((or 'oldest-first 'asc 'ascending) 'oldest-first)
     (_
      (user-error "Invalid direction: %S (expected newest-first/oldest-first or asc/desc)"
+                 direction))))
+
+(defun json-log-viewer--normalize-load-direction (direction)
+  "Normalize load-more DIRECTION to `before' or `after'."
+  (pcase direction
+    ((or 'before "before") 'before)
+    ((or 'after "after") 'after)
+    (_
+     (user-error "Invalid load-more direction: %S (expected before/after)"
                  direction))))
 
 (defun json-log-viewer--ensure-log-lines (log-lines source)
@@ -1372,6 +1406,134 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback is applied."
   (json-log-viewer--request-rerender 'rerender nil)
   (message "Rendering all entries..."))
 
+(defun json-log-viewer--make-load-more-async-job
+    (limit direction timestamp entry-id prepend)
+  "Build worker queue payload for load-more."
+  (let ((job (json-log-viewer--make-async-job 'load-more nil)))
+    (setq job (plist-put job :limit limit))
+    (setq job (plist-put job :direction direction))
+    (setq job (plist-put job :timestamp timestamp))
+    (when (integerp entry-id)
+      (setq job (plist-put job :entry-id entry-id)))
+    (when prepend
+      (setq job (plist-put job :prepend t)))
+    job))
+
+(defun json-log-viewer-load-more (buffer-or-name limit direction timestamp &optional prepend entry-id)
+  "Request additional entries from worker storage.
+
+BUFFER-OR-NAME must identify a live `json-log-viewer-mode` buffer.
+LIMIT is the number of entries to load. DIRECTION must be `before` or `after`.
+TIMESTAMP should be an epoch seconds value or timestamp string.
+When PREPEND is non-nil, entries are inserted at the top of the buffer.
+ENTRY-ID is an optional boundary id used as a fallback when timestamps are missing."
+  (let ((target (json-log-viewer-get-buffer buffer-or-name)))
+    (with-current-buffer target
+      (json-log-viewer--ensure-async-queue-running)
+      (if json-log-viewer--load-more-in-flight
+          (progn
+            (message "Load-more already in progress")
+            nil)
+        (let* ((normalized-direction (json-log-viewer--normalize-load-direction direction))
+               (normalized-limit
+                (if (and (integerp limit) (> limit 0))
+                    limit
+                  (user-error "Load-more limit must be a positive integer, got: %S" limit)))
+               (normalized-timestamp
+                (cond
+                 ((numberp timestamp) timestamp)
+                 ((stringp timestamp)
+                  (or (json-log-viewer--parse-time timestamp)
+                      (user-error "Invalid load-more timestamp: %S" timestamp)))
+                 (t
+                  (user-error "Load-more timestamp must be number or string, got: %S"
+                              timestamp))))
+               (normalized-entry-id
+                (when entry-id
+                  (unless (integerp entry-id)
+                    (user-error "Load-more entry-id must be integer, got: %S" entry-id))
+                  entry-id))
+               (job (json-log-viewer--make-load-more-async-job
+                     normalized-limit
+                     normalized-direction
+                     normalized-timestamp
+                     normalized-entry-id
+                     prepend)))
+          (setq json-log-viewer--load-more-in-flight t)
+          (setq json-log-viewer--load-more-request-id
+                (json-log-viewer--async-submit job nil))
+          json-log-viewer--load-more-request-id)))))
+
+(defun json-log-viewer--interactive-load-more-limit (arg)
+  "Resolve interactive load-more ARG into a positive integer."
+  (let ((limit (if arg
+                   (prefix-numeric-value arg)
+                 json-log-viewer-sliding-window-load-size)))
+    (unless (and (integerp limit) (> limit 0))
+      (user-error "Load size must be a positive integer, got: %S" limit))
+    limit))
+
+(defun json-log-viewer--boundary-overlay (direction)
+  "Return overlay at boundary for load DIRECTION.
+
+DIRECTION must be `before' or `after'."
+  (let ((ordered (json-log-viewer--entry-overlays-in-buffer-order nil)))
+    (unless ordered
+      (user-error "No rendered entries available for load-more"))
+    (pcase direction
+      ('before (car ordered))
+      ('after (car (last ordered)))
+      (_ (user-error "Unsupported boundary direction: %S" direction)))))
+
+(defun json-log-viewer--overlay-load-more-boundary (entry-overlay)
+  "Return (TIMESTAMP ENTRY-ID) boundary tuple from ENTRY-OVERLAY."
+  (let* ((raw-timestamp (overlay-get entry-overlay 'json-log-viewer-storage-timestamp))
+         (timestamp (cond
+                     ((numberp raw-timestamp) raw-timestamp)
+                     ((and (stringp raw-timestamp)
+                           (not (string-empty-p raw-timestamp))
+                           (not (string= raw-timestamp "-")))
+                      raw-timestamp)
+                     (t nil)))
+         (entry-id (json-log-viewer--entry-storage-id entry-overlay)))
+    (unless timestamp
+      (user-error "Boundary entry is missing a usable timestamp"))
+    (list timestamp entry-id)))
+
+(defun json-log-viewer-slide-window-older (&optional arg)
+  "Load older entries before the oldest currently rendered entry.
+
+With prefix ARG, use that many entries; otherwise use
+`json-log-viewer-sliding-window-load-size'."
+  (interactive "P")
+  (let* ((limit (json-log-viewer--interactive-load-more-limit arg))
+         (entry-overlay (json-log-viewer--boundary-overlay 'before))
+         (boundary (json-log-viewer--overlay-load-more-boundary entry-overlay)))
+    (json-log-viewer-load-more (current-buffer)
+                               limit
+                               'before
+                               (nth 0 boundary)
+                               t
+                               (nth 1 boundary))
+    (message "Loading %d older entries..." limit)))
+
+(defun json-log-viewer-slide-window-newer (&optional arg)
+  "Load newer entries after the newest currently rendered entry.
+
+With prefix ARG, use that many entries; otherwise use
+`json-log-viewer-sliding-window-load-size'."
+  (interactive "P")
+  (let* ((limit (json-log-viewer--interactive-load-more-limit arg))
+         (entry-overlay (json-log-viewer--boundary-overlay 'after))
+         (boundary (json-log-viewer--overlay-load-more-boundary entry-overlay)))
+    (json-log-viewer-load-more (current-buffer)
+                               limit
+                               'after
+                               (nth 0 boundary)
+                               nil
+                               (nth 1 boundary))
+    (message "Loading %d newer entries..." limit)))
+
 (defun json-log-viewer-toggle-auto-follow ()
   "Toggle automatic scrolling to newest entries."
   (interactive)
@@ -1402,6 +1564,8 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback is applied."
     (overlay-put entry-ov 'json-log-viewer-fold-overlay nil)
     (overlay-put entry-ov 'json-log-viewer-log-entry-id entry-id)
     (overlay-put entry-ov 'json-log-viewer-storage-entry-id entry-id)
+    (overlay-put entry-ov 'json-log-viewer-storage-timestamp
+                 (plist-get entry :timestamp))
     (overlay-put entry-ov 'json-log-viewer-signature signature)
     (overlay-put entry-ov 'json-log-viewer-storage-signature signature)
     (push entry-ov json-log-viewer--entry-overlays)
@@ -1470,6 +1634,43 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback is applied."
                                 json-log-viewer--fold-overlays))
             (setq remaining (- remaining chunk-drop))))))))
 
+(defun json-log-viewer--drop-newest-rendered-entries (drop)
+  "Drop DROP newest rendered entries from the buffer."
+  (when (> drop 0)
+    (let ((inhibit-read-only t))
+      (let ((remaining (min json-log-viewer--entry-count drop))
+            (chunk-size (max 1 (or json-log-viewer-stream-chunk-size 1))))
+        (while (> remaining 0)
+          (let* ((chunk-drop (min remaining chunk-size))
+                 (ordered (json-log-viewer--entry-overlays-in-buffer-order nil))
+                 (victims (last ordered chunk-drop))
+                 (victim-folds nil))
+            (dolist (entry-overlay victims)
+              (let ((fold-ov (overlay-get entry-overlay 'json-log-viewer-fold-overlay))
+                    (sig (overlay-get entry-overlay 'json-log-viewer-signature)))
+                (when (overlayp fold-ov)
+                  (push fold-ov victim-folds))
+                (when sig
+                  (remhash sig json-log-viewer--seen-signatures))
+                (when (and (overlay-buffer entry-overlay)
+                           (overlay-start entry-overlay)
+                           (overlay-end entry-overlay))
+                  (delete-region (overlay-start entry-overlay)
+                                 (overlay-end entry-overlay)))
+                (when (overlay-buffer entry-overlay)
+                  (delete-overlay entry-overlay))
+                (when (overlayp fold-ov)
+                  (delete-overlay fold-ov))))
+            (setq json-log-viewer--entry-overlays
+                  (cl-remove-if (lambda (ov) (memq ov victims))
+                                json-log-viewer--entry-overlays))
+            (setq json-log-viewer--fold-overlays
+                  (cl-remove-if (lambda (ov) (memq ov victim-folds))
+                                json-log-viewer--fold-overlays))
+            (setq json-log-viewer--entry-count
+                  (- json-log-viewer--entry-count (length victims)))
+            (setq remaining (- remaining chunk-drop))))))))
+
 (defun json-log-viewer-replace-entries (entries &optional preserve-filter storage-prepared)
   "Replace rendered entries with ENTRIES.
 
@@ -1498,6 +1699,52 @@ STORAGE-PREPARED is kept for API compatibility and ignored."
       (goto-char (point-min)))
     (json-log-viewer--highlight-current-line)
     (json-log-viewer--publish 'replace inserted-overlays)))
+
+(defun json-log-viewer-prepend-entries (entries)
+  "Prepend ENTRIES into current viewer buffer.
+
+New entries are inserted at the top."
+  (let* ((skip-sort (and json-log-viewer--streaming
+                         json-log-viewer--stream-assume-ordered))
+         (candidate-entries (if skip-sort
+                                entries
+                              (json-log-viewer--unseen-entries entries)))
+         (ordered (if skip-sort
+                      candidate-entries
+                    (json-log-viewer--sort-entries candidate-entries)))
+         (inhibit-read-only t)
+         (inserted-overlays nil)
+         (inserted-count 0))
+    (when ordered
+      (save-excursion
+        (json-log-viewer--delete-no-results-placeholder)
+        (goto-char (json-log-viewer--header-end-position))
+        (dolist (entry ordered)
+          (push (json-log-viewer--insert-entry entry) inserted-overlays)))
+      (setq inserted-count (length ordered))
+      ;; `json-log-viewer--insert-entry' always pushes onto
+      ;; `json-log-viewer--entry-overlays'. When prepending older entries at the
+      ;; buffer start, this leaves the just-inserted (oldest) overlays at the
+      ;; list front. Rotate that prefix to the tail to keep newest->oldest order.
+      (when (> inserted-count 0)
+        (let ((prefix nil)
+              (rest json-log-viewer--entry-overlays)
+              (idx 0))
+          (while (and rest (< idx inserted-count))
+            (push (car rest) prefix)
+            (setq rest (cdr rest))
+            (setq idx (1+ idx)))
+          (setq prefix (nreverse prefix))
+          (setq json-log-viewer--entry-overlays (nconc rest prefix))))
+      (setq inserted-overlays (nreverse inserted-overlays))
+      (setq json-log-viewer--entry-count
+            (+ json-log-viewer--entry-count (length ordered)))
+      (json-log-viewer--mark-seen-entries ordered)
+      (json-log-viewer--apply-filter-to-overlays inserted-overlays)
+      (json-log-viewer--refresh-header)
+      (json-log-viewer--highlight-current-line)
+      (json-log-viewer--publish 'prepend inserted-overlays))
+    ordered))
 
 (defun json-log-viewer-append-entries (entries)
   "Append ENTRIES into current viewer buffer.

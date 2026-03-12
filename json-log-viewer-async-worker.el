@@ -18,6 +18,12 @@
 (declare-function json-pretty-print-buffer "json" ())
 (declare-function json-log-viewer-repository-select-summary-entry-by-id
                   "json-log-viewer-repository" (db entry-id))
+(declare-function json-log-viewer-repository-select-summary-before
+                  "json-log-viewer-repository"
+                  (db timestamp limit &optional narrow-string boundary-id))
+(declare-function json-log-viewer-repository-select-summary-after
+                  "json-log-viewer-repository"
+                  (db timestamp limit &optional narrow-string boundary-id))
 (declare-function async-job-queue-worker-publish "async-job-queue" (payload))
 
 (defun json-log-viewer-async-worker--normalize-narrow-string (needle)
@@ -307,6 +313,26 @@
       (push (json-log-viewer-async-worker--stored-row->entry row) entries))
     (nreverse entries)))
 
+(defun json-log-viewer-async-worker--sqlite-select-entries-before
+    (db timestamp limit &optional narrow-string boundary-id)
+  "Return up to LIMIT summary entries before TIMESTAMP."
+  (let ((rows (json-log-viewer-repository-select-summary-before
+               db timestamp limit narrow-string boundary-id))
+        entries)
+    (dolist (row rows)
+      (push (json-log-viewer-async-worker--stored-row->entry row) entries))
+    (nreverse entries)))
+
+(defun json-log-viewer-async-worker--sqlite-select-entries-after
+    (db timestamp limit &optional narrow-string boundary-id)
+  "Return up to LIMIT summary entries after TIMESTAMP."
+  (let ((rows (json-log-viewer-repository-select-summary-after
+               db timestamp limit narrow-string boundary-id))
+        entries)
+    (dolist (row rows)
+      (push (json-log-viewer-async-worker--stored-row->entry row) entries))
+    (nreverse entries)))
+
 (defvar json-log-viewer-async-worker--db nil
   "Worker-local sqlite handle used by queue jobs.")
 
@@ -324,6 +350,9 @@
 
 (defvar json-log-viewer-async-worker--render-narrow-string nil
   "Worker-local active narrow string, or nil when rendering all entries.")
+
+(defvar json-log-viewer-async-worker--publish-mode 'live
+  "Worker-local publish mode: `live' or `on-demand'.")
 
 (defun json-log-viewer-async-worker--publish-cmd (cmd &rest props)
   "Publish render CMD with PROPS to the main Emacs instance."
@@ -367,6 +396,7 @@
         (max 1 (or (plist-get config :chunk-size) 1)))
   (setq json-log-viewer-async-worker--render-mode 'all)
   (setq json-log-viewer-async-worker--render-narrow-string nil)
+  (setq json-log-viewer-async-worker--publish-mode 'live)
   (let* ((file (make-temp-file "json-log-viewer-worker-" nil ".sqlite"))
          (db (sqlite-open file)))
     (setq json-log-viewer-async-worker--sqlite-file file)
@@ -384,7 +414,8 @@
     (ignore-errors (delete-file json-log-viewer-async-worker--sqlite-file)))
   (setq json-log-viewer-async-worker--sqlite-file nil)
   (setq json-log-viewer-async-worker--render-mode 'all)
-  (setq json-log-viewer-async-worker--render-narrow-string nil))
+  (setq json-log-viewer-async-worker--render-narrow-string nil)
+  (setq json-log-viewer-async-worker--publish-mode 'live))
 
 (defun json-log-viewer-async-worker--ensure-storage ()
   "Ensure worker-local sqlite storage has been initialized."
@@ -398,6 +429,13 @@
         :message-path (plist-get job :message-path)
         :extra-paths (or (plist-get job :extra-paths) nil)
         :json-paths (or (plist-get job :json-paths) nil)))
+
+(defun json-log-viewer-async-worker--normalize-boundary (timestamp)
+  "Normalize TIMESTAMP into epoch seconds when possible."
+  (cond
+   ((numberp timestamp) timestamp)
+   ((stringp timestamp) (json-log-viewer-async-worker--parse-time timestamp))
+   (t nil)))
 
 (defun json-log-viewer-async-worker--entry-fields (db entry-id config)
   "Return normalized detail rows for ENTRY-ID using CONFIG."
@@ -418,6 +456,9 @@
     (json-log-viewer-async-worker--ensure-storage)
     (pcase op
       ('reset
+       (setq json-log-viewer-async-worker--publish-mode 'live)
+       (setq json-log-viewer-async-worker--render-mode 'all)
+       (setq json-log-viewer-async-worker--render-narrow-string nil)
        (json-log-viewer-repository-reset-log-entries
         json-log-viewer-async-worker--db)
        (json-log-viewer-async-worker--publish-cmd 'clear)
@@ -433,7 +474,8 @@
                       config
                       (and (eq json-log-viewer-async-worker--render-mode 'narrow)
                            json-log-viewer-async-worker--render-narrow-string)))
-         (when entry
+         (when (and entry
+                    (eq json-log-viewer-async-worker--publish-mode 'live))
            (json-log-viewer-async-worker--publish-cmd 'render-entries :entries (list entry)))
          nil))
       ('narrow
@@ -444,6 +486,7 @@
        (json-log-viewer-async-worker--publish-rerender-chunks)
        nil)
       ('rerender
+       (setq json-log-viewer-async-worker--publish-mode 'live)
        (if narrow-string
            (progn
              (setq json-log-viewer-async-worker--render-mode 'narrow)
@@ -452,6 +495,60 @@
          (setq json-log-viewer-async-worker--render-narrow-string nil))
        (json-log-viewer-async-worker--publish-rerender-chunks)
        nil)
+      ('load-more
+       (let* ((limit (plist-get job :limit))
+              (direction (plist-get job :direction))
+              (timestamp (json-log-viewer-async-worker--normalize-boundary
+                          (plist-get job :timestamp)))
+              (boundary-id (plist-get job :entry-id))
+              (prepend (plist-get job :prepend))
+              (active-narrow (and (eq json-log-viewer-async-worker--render-mode 'narrow)
+                                  json-log-viewer-async-worker--render-narrow-string))
+              (chunk-size (max 1 (or json-log-viewer-async-worker--chunk-size 1))))
+         (unless (and (integerp limit) (> limit 0))
+           (error "load-more op requires positive integer :limit, got: %S" limit))
+         (unless (memq direction '(before after))
+           (error "load-more op requires :direction to be before/after, got: %S" direction))
+         (unless timestamp
+           (error "load-more op requires :timestamp, got: %S" (plist-get job :timestamp)))
+         (setq json-log-viewer-async-worker--publish-mode 'on-demand)
+         (let* ((entries
+                 (pcase direction
+                   ('before
+                    (json-log-viewer-async-worker--sqlite-select-entries-before
+                     json-log-viewer-async-worker--db
+                     timestamp
+                     limit
+                     active-narrow
+                     boundary-id))
+                   ('after
+                    (json-log-viewer-async-worker--sqlite-select-entries-after
+                     json-log-viewer-async-worker--db
+                     timestamp
+                     limit
+                     active-narrow
+                     boundary-id))))
+                (batches nil))
+           (while entries
+             (let ((batch nil)
+                   (count 0))
+               (while (and entries (< count chunk-size))
+                 (push (pop entries) batch)
+                 (setq count (1+ count)))
+               (when batch
+                 (push (nreverse batch) batches))))
+           (setq batches (nreverse batches))
+           (when prepend
+             (setq batches (nreverse batches)))
+           (dolist (batch batches)
+             (json-log-viewer-async-worker--publish-cmd
+              'render-entries
+              :entries batch
+              :prepend prepend)))
+         (json-log-viewer-async-worker--publish-cmd
+          'load-more-complete
+          :request-id request-id)
+         nil))
       ((or 'entry-details 'entry-fields)
        (let ((entry-id (plist-get job :entry-id)))
          (unless (integerp entry-id)

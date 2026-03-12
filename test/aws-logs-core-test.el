@@ -225,6 +225,118 @@
               (should (equal messages '("early" "middle" "late")))))
         (ignore-errors (json-log-viewer-async-worker-teardown))))))
 
+(ert-deftest json-log-viewer-async-worker-load-more-prepend-order-test ()
+  (let (published)
+    (cl-letf (((symbol-function 'async-job-queue-worker-publish)
+               (lambda (payload) (push payload published))))
+      (unwind-protect
+          (progn
+            (json-log-viewer-async-worker-init '(:max-entries 20 :chunk-size 2))
+            (dotimes (i 6)
+              (let ((idx (1+ i)))
+                (json-log-viewer-async-worker-process-log-ingestor-job
+                 (list :op 'ingest
+                       :line (format "{\"timestamp\":\"2026-01-01T00:00:%02dZ\",\"msg\":\"m-%d\"}"
+                                     idx idx)
+                       :timestamp-path "timestamp"
+                       :message-path "msg"))))
+            (setq published nil)
+            (json-log-viewer-async-worker-process-log-ingestor-job
+             (list :op 'load-more
+                   :direction 'before
+                   :limit 6
+                   :timestamp "2026-01-01T00:00:07Z"
+                   :prepend t
+                   :timestamp-path "timestamp"
+                   :message-path "msg"))
+            (setq published (nreverse published))
+            (let* ((commands (cl-remove-if-not
+                              (lambda (cmd) (eq (plist-get cmd :cmd) 'render-entries))
+                              published))
+                   (chunks (mapcar (lambda (cmd)
+                                     (mapcar (lambda (entry) (plist-get entry :message))
+                                             (plist-get cmd :entries)))
+                                   commands)))
+              (should (equal chunks
+                             '(("m-5" "m-6") ("m-3" "m-4") ("m-1" "m-2"))))))
+        (ignore-errors (json-log-viewer-async-worker-teardown))))))
+
+(ert-deftest json-log-viewer-async-worker-load-more-disables-live-publish-test ()
+  (let (published)
+    (cl-letf (((symbol-function 'async-job-queue-worker-publish)
+               (lambda (payload) (push payload published))))
+      (unwind-protect
+          (progn
+            (json-log-viewer-async-worker-init '(:max-entries 20 :chunk-size 10))
+            (json-log-viewer-async-worker-process-log-ingestor-job
+             (list :op 'ingest
+                   :line "{\"timestamp\":\"2026-01-01T00:00:01Z\",\"msg\":\"m-1\"}"
+                   :timestamp-path "timestamp"
+                   :message-path "msg"))
+            (should (cl-some (lambda (cmd) (eq (plist-get cmd :cmd) 'render-entries))
+                             published))
+            (setq published nil)
+            (json-log-viewer-async-worker-process-log-ingestor-job
+             (list :op 'load-more
+                   :direction 'before
+                   :limit 1
+                   :timestamp "2026-01-01T00:00:02Z"
+                   :timestamp-path "timestamp"
+                   :message-path "msg"))
+            (setq published nil)
+            (json-log-viewer-async-worker-process-log-ingestor-job
+             (list :op 'ingest
+                   :line "{\"timestamp\":\"2026-01-01T00:00:03Z\",\"msg\":\"m-2\"}"
+                   :timestamp-path "timestamp"
+                   :message-path "msg"))
+            (should (null published))
+            (json-log-viewer-async-worker-process-log-ingestor-job
+             (list :op 'rerender
+                   :timestamp-path "timestamp"
+                   :message-path "msg"))
+            (setq published nil)
+            (json-log-viewer-async-worker-process-log-ingestor-job
+             (list :op 'ingest
+                   :line "{\"timestamp\":\"2026-01-01T00:00:04Z\",\"msg\":\"m-3\"}"
+                   :timestamp-path "timestamp"
+                   :message-path "msg"))
+            (should (cl-some (lambda (cmd) (eq (plist-get cmd :cmd) 'render-entries))
+                             published)))
+        (ignore-errors (json-log-viewer-async-worker-teardown))))))
+
+(ert-deftest json-log-viewer-prepend-preserves-overlay-order-for-oldest-drop-test ()
+  (let ((buf (aws-logs-core-test--make-viewer
+              "*json-log-viewer-prepend-overlay-order-test*"
+              nil
+              :timestamp-path "timestamp"
+              :level-path "level"
+              :message-path "msg")))
+    (unwind-protect
+        (with-current-buffer buf
+          (json-log-viewer-append-entries
+           '((:id 3 :timestamp "2026-01-01T00:00:03Z" :level "info" :message "m-3" :storage-populated t)
+             (:id 4 :timestamp "2026-01-01T00:00:04Z" :level "info" :message "m-4" :storage-populated t)))
+          (json-log-viewer-prepend-entries
+           '((:id 1 :timestamp "2026-01-01T00:00:01Z" :level "info" :message "m-1" :storage-populated t)
+             (:id 2 :timestamp "2026-01-01T00:00:02Z" :level "info" :message "m-2" :storage-populated t)))
+          (json-log-viewer-append-entries
+           '((:id 5 :timestamp "2026-01-01T00:00:05Z" :level "info" :message "m-5" :storage-populated t)))
+          (should (equal (mapcar (lambda (ov)
+                                   (overlay-get ov 'json-log-viewer-storage-entry-id))
+                                 json-log-viewer--entry-overlays)
+                         '(5 4 3 2 1)))
+          (json-log-viewer--drop-oldest-rendered-entries 1)
+          (should (equal (mapcar (lambda (ov)
+                                   (overlay-get ov 'json-log-viewer-storage-entry-id))
+                                 json-log-viewer--entry-overlays)
+                         '(5 4 3 2)))
+          (should (equal (mapcar (lambda (ov)
+                                   (overlay-get ov 'json-log-viewer-storage-entry-id))
+                                 (json-log-viewer--entry-overlays-in-buffer-order))
+                         '(2 3 4 5))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
 (ert-deftest json-log-viewer-parse-time-preserves-subsecond-order-test ()
   (let ((t1 (json-log-viewer--parse-time "2026-01-01T00:00:00.123Z"))
         (t2 (json-log-viewer--parse-time "2026-01-01T00:00:00.124Z")))

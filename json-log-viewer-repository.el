@@ -257,6 +257,98 @@ When NARROW-STRING is non-nil, only matching rows are returned."
              :extra-paths (nth 5 row)))
      rows)))
 
+(defun json-log-viewer-repository-select-summary-before
+    (db timestamp limit &optional narrow-string boundary-id)
+  "Return up to LIMIT summary rows before TIMESTAMP.
+
+Rows are ordered ascending by timestamp/id. When BOUNDARY-ID is non-nil,
+it is used as a fallback for rows with NULL timestamps."
+  (let* ((boundary-id (or boundary-id 0))
+         (where-clause
+          (concat
+           "WHERE (timestamp_epoch < ? "
+           "OR (timestamp_epoch = ? AND id < ?) "
+           "OR (timestamp_epoch IS NULL AND id < ?)) "
+           (if narrow-string "AND instr(lower(json), ?) > 0 " "")))
+         (select
+          (concat
+           "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths "
+           "FROM log_entry ")))
+    (mapcar
+     (lambda (row)
+       (list :id (nth 0 row)
+             :sort-key (nth 1 row)
+             :timestamp (nth 2 row)
+             :level-path (nth 3 row)
+             :message-path (nth 4 row)
+             :extra-paths (nth 5 row)))
+     (if (and (integerp limit) (> limit 0))
+         (sqlite-select
+          db
+          (concat
+           "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths "
+           "FROM ("
+           select
+           where-clause
+           "ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 0 ELSE 1 END, "
+           "timestamp_epoch DESC, id DESC LIMIT ?"
+           ") ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, "
+           "timestamp_epoch, id")
+          (if narrow-string
+              (vector timestamp timestamp boundary-id boundary-id narrow-string limit)
+            (vector timestamp timestamp boundary-id boundary-id limit)))
+       (sqlite-select
+        db
+        (concat
+         select
+         where-clause
+         "ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, "
+         "timestamp_epoch, id")
+        (if narrow-string
+            (vector timestamp timestamp boundary-id boundary-id narrow-string)
+          (vector timestamp timestamp boundary-id boundary-id)))))))
+
+(defun json-log-viewer-repository-select-summary-after
+    (db timestamp limit &optional narrow-string boundary-id)
+  "Return up to LIMIT summary rows after TIMESTAMP.
+
+Rows are ordered ascending by timestamp/id. When BOUNDARY-ID is non-nil,
+it is used as a fallback for rows with NULL timestamps."
+  (let* ((boundary-id (or boundary-id 0))
+         (where-clause
+          (concat
+           "WHERE (timestamp_epoch > ? "
+           "OR (timestamp_epoch = ? AND id > ?) "
+           "OR (timestamp_epoch IS NULL AND id > ?)) "
+           (if narrow-string "AND instr(lower(json), ?) > 0 " "")))
+         (select
+          (concat
+           "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths "
+           "FROM log_entry ")))
+    (mapcar
+     (lambda (row)
+       (list :id (nth 0 row)
+             :sort-key (nth 1 row)
+             :timestamp (nth 2 row)
+             :level-path (nth 3 row)
+             :message-path (nth 4 row)
+             :extra-paths (nth 5 row)))
+     (sqlite-select
+      db
+      (concat
+       select
+       where-clause
+       "ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, "
+       "timestamp_epoch, id"
+       (if (and (integerp limit) (> limit 0)) " LIMIT ?" ""))
+      (if narrow-string
+          (if (and (integerp limit) (> limit 0))
+              (vector timestamp timestamp boundary-id boundary-id narrow-string limit)
+            (vector timestamp timestamp boundary-id boundary-id narrow-string))
+        (if (and (integerp limit) (> limit 0))
+            (vector timestamp timestamp boundary-id boundary-id limit)
+          (vector timestamp timestamp boundary-id boundary-id)))))))
+
 (defun json-log-viewer-repository-reset-log-entries (db)
   "Delete all log rows in DB."
   (sqlite-execute db "DELETE FROM log_entry"))
