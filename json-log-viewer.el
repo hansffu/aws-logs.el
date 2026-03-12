@@ -1286,8 +1286,11 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback is applied."
   "Return default keybindings shown in the viewer info popup."
   '(("TAB" . "toggle entry")
     ("S-TAB" . "toggle all")
-    ("C-c C-n" . "narrow")
-    ("C-c C-w" . "rerender")
+    ("C-c /" . "narrow")
+    ("C-c C-p" . "load older")
+    ("C-c C-n" . "load newer")
+    ("C-c C-t" . "window at time")
+    ("C-c C-w" . "render all")
     ("C-c C-f" . "toggle follow")
     ("?" . "show info")
     ("q" . "quit")))
@@ -1907,7 +1910,10 @@ New entries are always appended to the bottom."
   "<tab>" #'json-log-viewer-toggle-entry
   "<backtab>" #'json-log-viewer-toggle-all
   "?" #'json-log-viewer-show-info
-  "C-c C-n" #'json-log-viewer-narrow
+  "C-c /" #'json-log-viewer-narrow
+  "C-c C-p" #'json-log-viewer-slide-window-older
+  "C-c C-n" #'json-log-viewer-slide-window-newer
+  "C-c C-t" #'json-log-viewer-window-at-time
   "C-c C-f" #'json-log-viewer-toggle-auto-follow
   "C-c C-w" #'json-log-viewer-widen)
 

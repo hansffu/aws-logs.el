@@ -15,6 +15,9 @@
   "Return Evil keybindings for `json-log-viewer-show-info` popup."
   '(("TAB" . "toggle entry")
     ("S-TAB" . "toggle all")
+    ("zk" . "load older")
+    ("zj" . "load newer")
+    ("zt" . "window at time")
     ("zn" . "narrow")
     ("zw" . "widen")
     ("?" . "show info")
@@ -32,6 +35,9 @@ Safe to call multiple times."
   (eval
    '(evil-define-key '(motion normal visual) json-log-viewer-mode-map
       (kbd "?") #'json-log-viewer-show-info
+      (kbd "zk") #'json-log-viewer-slide-window-older
+      (kbd "zj") #'json-log-viewer-slide-window-newer
+      (kbd "zt") #'json-log-viewer-window-at-time
       (kbd "zn") #'json-log-viewer-narrow
       (kbd "zw") #'json-log-viewer-widen
       (kbd "zf") #'json-log-viewer-toggle-auto-follow))
