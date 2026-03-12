@@ -1196,15 +1196,16 @@ When VISIBLE-ONLY is non-nil, return only currently visible entries."
          (normalized (and needle (downcase needle)))
          (active (and normalized (not (string-empty-p normalized)))))
     (dolist (entry-overlay json-log-viewer--entry-overlays)
-      (let ((invisible
-             (if (and active
-                      (not (json-log-viewer--filter-managed-by-ingestor-p))
-                      (not (json-log-viewer--filter-match-p entry-overlay normalized)))
-                 'json-log-viewer-filter
-               nil)))
-        (overlay-put entry-overlay 'invisible invisible)
-        (when-let ((fold-ov (overlay-get entry-overlay 'json-log-viewer-fold-overlay)))
-          (overlay-put fold-ov 'invisible invisible))))))
+      (when (overlay-buffer entry-overlay)
+        (let ((invisible
+               (if (and active
+                        (not (json-log-viewer--filter-managed-by-ingestor-p))
+                        (not (json-log-viewer--filter-match-p entry-overlay normalized)))
+                   'json-log-viewer-filter
+                 nil)))
+          (overlay-put entry-overlay 'invisible invisible)
+          (when-let ((fold-ov (overlay-get entry-overlay 'json-log-viewer-fold-overlay)))
+            (overlay-put fold-ov 'invisible invisible)))))))
 
 (defun json-log-viewer--apply-filter-to-overlays (overlays)
   "Apply current filter to OVERLAYS only."
@@ -1251,7 +1252,8 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback is applied."
   "Return number of visible rendered entries in current buffer."
   (let ((visible 0))
     (dolist (entry-overlay json-log-viewer--entry-overlays)
-      (unless (overlay-get entry-overlay 'invisible)
+      (when (and (overlay-buffer entry-overlay)
+                 (not (overlay-get entry-overlay 'invisible)))
         (setq visible (1+ visible))))
     visible))
 
