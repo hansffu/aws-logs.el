@@ -6,7 +6,6 @@ This repository contains five related Emacs Lisp packages:
 - ~kube-logs~: transient-driven Kubernetes logs tooling (pods/deployments via ~kubectl~).
 - ~kafka-logs~: transient-driven Kafka message viewer (via ~kcat~).
 - ~json-log-viewer~: generic foldable JSON log viewer used by ~aws-logs~ and usable standalone.
-- ~composite-json-log-viewer~: composite stream builder for merging multiple ~json-log-viewer~ buffers.
 
 * Package: aws-logs
 
@@ -249,45 +248,6 @@ When Evil is installed and ~json-log-viewer-enable-evil-bindings~ is non-nil
 
 When Evil integration is active, these bindings replace the default list shown
 in the ~?~ info popup.
-
-* Package: composite-json-log-viewer
-
-~composite-json-log-viewer~ builds a composite ~json-log-viewer~ buffer from one
-or more existing ~json-log-viewer~ source buffers.
-
-** Features
-
-- Subscribe to multiple source viewer buffers and ingest new entries as they arrive.
-- Backfill source history into the composite sqlite storage asynchronously.
-- Reuse ~json-log-viewer~ narrowing/widening and fold workflows without custom rendering code.
-- Keep composite entries in the same sqlite-backed format as normal viewer buffers.
-
-** File
-
-- ~composite-json-log-viewer.el~
-
-** Installation
-
-Put these files on your ~load-path~:
-
-- ~composite-json-log-viewer.el~
-- ~json-log-viewer.el~
-- ~json-log-viewer-repository.el~
-
-** use-package example
-
-#+begin_src emacs-lisp
-(use-package composite-json-log-viewer
-  :load-path "~/dev/emacs/aws-logs.el"
-  :commands (composite-json-log-viewer-setup)
-  :custom
-  (composite-json-log-viewer-backfill-async-chunk-size 200))
-#+end_src
-
-** Usage
-
-Run ~M-x composite-json-log-viewer-setup~ and choose one or more source
-~json-log-viewer~ buffers to build a composite stream.
 
 * Package: kube-logs
 

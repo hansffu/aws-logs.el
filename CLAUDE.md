@@ -6,12 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Byte-compile** (catches syntax errors and warnings):
 ```
-emacs -Q --batch -L . -f batch-byte-compile aws-logs.el aws-logs-query.el aws-logs-insights.el aws-logs-tail.el json-log-viewer.el json-log-viewer-shared.el json-log-viewer-repository.el json-log-viewer-async-worker.el async-job-queue.el composite-json-log-viewer.el kube-logs.el kafka-logs.el
+emacs -Q --batch -L . -f batch-byte-compile aws-logs.el aws-logs-query.el aws-logs-insights.el aws-logs-tail.el json-log-viewer.el json-log-viewer-shared.el json-log-viewer-repository.el json-log-viewer-async-worker.el async-job-queue.el kube-logs.el kafka-logs.el
 ```
 
 **Run all ERT tests**:
 ```
-emacs -Q --batch -L . -L test -l test/aws-logs-core-test.el -l test/composite-json-log-viewer-test.el -l test/json-log-viewer-subscribe-test.el -l test/kafka-logs-test.el -l test/kube-logs-test.el -f ert-run-tests-batch-and-exit
+emacs -Q --batch -L . -L test -l test/aws-logs-core-test.el -l test/kafka-logs-test.el -l test/kube-logs-test.el -f ert-run-tests-batch-and-exit
 ```
 
 **Run a single test file**:
@@ -44,20 +44,19 @@ The repo is a family of Emacs Lisp packages built around a shared log viewer cor
 
 - **Data contract**: every source adapter normalizes its output into JSON line strings before handing them to `json-log-viewer`. The viewer never parses source-specific CLI formats.
 - **SQLite-backed storage**: raw JSON and summary metadata are written to a per-buffer SQLite file. Summary lines are rendered eagerly; full details are loaded lazily on expand. This keeps large streaming buffers usable without materializing all detail content.
-- **Buffer-local isolation**: each viewer buffer has its own SQLite handle, async queue, path config, filter state, overlays, and subscriber list — no global data registry.
+- **Buffer-local isolation**: each viewer buffer has its own SQLite handle, async queue, path config, filter state, and overlays — no global data registry.
 - **Narrowing replays from stored JSON**: filter/narrow operations run from the SQLite store, not from visible summary text, so hidden fields in the raw JSON are searchable.
 
 ### File Roles
 
 | File | Role |
 |---|---|
-| `json-log-viewer.el` | Core viewer: buffer API, rendering, overlays, narrow/widen, refresh, subscriptions |
+| `json-log-viewer.el` | Core viewer: buffer API, rendering, overlays, narrow/widen, refresh |
 | `json-log-viewer-shared.el` | JSON parsing + path resolution helpers (dotted-key, escaped-dot, flattening) |
 | `json-log-viewer-repository.el` | SQLite schema + reusable query operations |
 | `json-log-viewer-async-worker.el` | Worker-side ingest, summarize, truncation logic (runs in subordinate Emacs) |
 | `async-job-queue.el` | Ordered async job queue over a subordinate Emacs process |
 | `json-log-viewer-evil.el` | Optional Evil keybindings (pure integration, no data flow) |
-| `composite-json-log-viewer.el` | Merges multiple viewer buffers; backfills history then streams live appends |
 | `aws-logs.el` | CloudWatch transient UI, session state, presets, saved-query workflow |
 | `aws-logs-tail.el` | `aws logs tail` subprocess, ECS JSON streaming pipeline with backpressure |
 | `aws-logs-insights.el` | Async Logs Insights query/poll/render; freezes source context for refresh |

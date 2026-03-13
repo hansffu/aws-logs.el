@@ -10,8 +10,7 @@ The layered design is the standout strength of this codebase:
 
 - **Data contract**: All source adapters normalize to JSON lines before handing to `json-log-viewer` -- this keeps the viewer generic and makes adding new sources straightforward.
 - **SQLite-backed storage**: Smart choice for large streaming buffers. Lazy detail loading and async ingestion via subordinate Emacs processes keeps the UI responsive.
-- **Buffer-local isolation**: No global state registries; each buffer owns its SQLite handle, async queue, and subscriber list. This prevents cross-buffer interference.
-- **Subscriber/notification system**: Clean pub/sub enabling composite buffers without the viewer needing to know about multi-source merging.
+- **Buffer-local isolation**: No global state registries; each buffer owns its SQLite handle, async queue, filter state, and overlays. This prevents cross-buffer interference.
 
 ## Code Quality & Style (Very Good)
 
@@ -68,20 +67,15 @@ The shared helpers in `json-log-viewer-shared.el` exist precisely for this purpo
 - `json-log-viewer--make-async-job` (`json-log-viewer.el:421`): Compatibility wrapper with an unused `_preserve-filter` parameter. Only referenced internally.
 - `async-job-queue--worker-main` (`async-job-queue.el:284`): Standalone worker entrypoint that duplicates the logic already inlined in `async-job-queue--worker-eval-form`. Appears unused.
 
-### 6. Potential Resource Leak in Composite Buffer
+### 6. `json-log-viewer.el` Size
 
-`composite-json-log-viewer.el` requires the `async` package (`(require 'async)`) and uses `async-start` for backfill chunks. If the composite buffer is killed mid-backfill, `composite-json-log-viewer--cleanup` unsubscribes from sources and resets counts, but doesn't cancel in-flight `async-start` processes. The async callback checks `(buffer-live-p composite-buffer)`, so it won't crash, but the subordinate Emacs processes may linger until completion.
-
-### 7. `json-log-viewer.el` Size
-
-At 1,873 lines, this file handles buffer management, overlay rendering, filtering, streaming, SQLite coordination, async queue management, UI rendering, and subscriber notifications. Some of this (particularly the async queue coordination and streaming eviction logic) could be extracted to keep the file more focused.
+At 1,873 lines, this file handles buffer management, overlay rendering, filtering, streaming, SQLite coordination, async queue management, and UI rendering. Some of this (particularly the async queue coordination and streaming eviction logic) could be extracted to keep the file more focused.
 
 ## Test Coverage
 
 - **58/60 tests pass** (2 failures described above).
 - **Core viewer**: Well-tested -- path resolution, SQLite storage, narrowing, streaming, eviction, auto-follow.
 - **Source adapters**: Arg-building and line normalization tested; no subprocess integration tests.
-- **Composite buffer**: Good async integration tests with real queue processing.
 - **Gap**: No error-path testing (malformed JSON, subprocess failures, auth errors). No stress/concurrency tests.
 
 ## Security Considerations
@@ -108,5 +102,4 @@ At 1,873 lines, this file handles buffer management, overlay rendering, filterin
 
 **Recommended improvements:**
 1. Consolidate duplicated utility functions to use `json-log-viewer-shared.el`
-2. Cancel in-flight async backfill processes on composite buffer kill
-3. Consider splitting `json-log-viewer.el` (extract streaming/eviction or async coordination)
+2. Consider splitting `json-log-viewer.el` (extract streaming/eviction or async coordination)

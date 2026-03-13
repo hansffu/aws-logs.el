@@ -14,7 +14,6 @@ The current packages are:
 - =kube-logs=: Kubernetes log viewing through =kubectl logs=.
 - =kafka-logs=: Kafka message viewing through =kcat=.
 - =json-log-viewer=: generic viewer, storage, filtering, and rendering engine.
-- =composite-json-log-viewer=: merged stream built from other =json-log-viewer= buffers.
 
 * Architectural Style
 
@@ -107,14 +106,6 @@ This keeps source-specific logic mostly separate from rendering/storage logic.
   - =payload=
 - Uses =json-log-viewer= for both one-shot and streaming consumption.
 
-*** =composite-json-log-viewer.el=
-
-- Creates a derived aggregate stream by subscribing to other =json-log-viewer= buffers.
-- Has two ingestion paths:
-  - Initial backfill by copying SQLite rows from source buffers into the composite buffer's SQLite database.
-  - Live append by subscribing to source-buffer append events and ingesting the corresponding source entries.
-- Reuses =json-log-viewer= for storage, filtering, and display instead of inventing a separate renderer.
-
 ** Shared Viewer and Storage
 
 *** =json-log-viewer.el=
@@ -139,7 +130,6 @@ Responsibilities:
   - narrow/widen replay from stored JSON
   - refresh callbacks
   - auto-follow
-  - subscriber notifications
 
 Important design choice:
 
@@ -232,7 +222,6 @@ The rendered buffer uses summary metadata for the visible line and retrieves ful
 6. =json-log-viewer= submits ingest jobs to the async worker queue.
 7. Worker writes raw JSON plus summary metadata into SQLite.
 8. Callback appends visible entries into the viewer buffer.
-9. Viewer publishes append events to subscribers.
 
 ** 2. AWS Logs Insights
 
@@ -242,13 +231,6 @@ The rendered buffer uses summary metadata for the visible line and retrieves ful
 4. Rows are transformed into JSON lines with synthetic summary fields.
 5. =json-log-viewer= replaces the viewer contents.
 6. Later refreshes rerun the frozen query context from the viewer buffer.
-
-** 3. Composite viewer
-
-1. Composite buffer subscribes to one or more source viewer buffers.
-2. Historical rows are copied from source SQLite files into the composite SQLite file in async chunks.
-3. Composite viewer widens/rebuilds from its own SQLite store after backfill completes.
-4. New source append events trigger live ingestion of source rows into the composite buffer.
 
 * Data Flow Diagram
 
@@ -310,12 +292,6 @@ The rendered buffer uses summary metadata for the visible line and retrieves ful
         +-----------------------------+
         | json-log-viewer buffer      |
         | overlays, narrow, refresh   |
-        +-------------+---------------+
-                      |
-                      v
-        +-----------------------------+
-        | Subscribers                 |
-        | composite-json-log-viewer   |
         +-----------------------------+
 #+end_example
 
@@ -329,8 +305,6 @@ The rendered buffer uses summary metadata for the visible line and retrieves ful
   - =json-log-viewer-repository=
   - =json-log-viewer-async-worker=
   - =async-job-queue=
-- =composite-json-log-viewer.el= depends on =json-log-viewer= and =json-log-viewer-repository= and consumes subscriber events emitted by viewer buffers.
-
 * Concurrency and State Boundaries
 
 ** Main Emacs process
@@ -364,7 +338,6 @@ The tests reinforce a few important invariants:
 - Path resolution works for both nested keys and dotted JSON keys.
 - Narrowing and widening operate from stored JSON, not only from visible summary text.
 - Streaming viewers ingest entries asynchronously but preserve callback order.
-- Composite buffers merge history first, then stay live through append subscriptions.
 - Source adapters normalize into viewer-friendly JSON instead of letting the viewer parse source-specific CLI formats directly.
 
 * Extension Points

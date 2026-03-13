@@ -218,12 +218,6 @@ to `js-mode`."
 (defvar json-log-viewer--keybindings-function nil
   "Optional callback returning popup keybindings for `json-log-viewer-show-info`.")
 
-(defconst json-log-viewer--self-subscriber-id :json-log-viewer-self
-  "Reserved subscriber id used for viewer self-subscription.")
-
-(defvar-local json-log-viewer--subscribers nil
-  "Alist of (ID . CALLBACK) subscribers for current viewer buffer.")
-
 (defun json-log-viewer-get-buffer (buffer-name)
   "Return validated json-log-viewer buffer from BUFFER-NAME.
 
@@ -238,29 +232,6 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
       (unless (derived-mode-p 'json-log-viewer-mode)
         (user-error "Not a json-log-viewer buffer: %s" (buffer-name buffer))))
     buffer))
-
-(defun json-log-viewer-subscribe (id callback)
-  "Subscribe ID with CALLBACK in current viewer buffer.
-
-CALLBACK is called as (ACTION SOURCE-BUFFER ENTRY-OVERLAYS)."
-  (unless (derived-mode-p 'json-log-viewer-mode)
-    (user-error "Not a json-log-viewer buffer: %s" (buffer-name (current-buffer))))
-  (unless id
-    (user-error "Subscriber id cannot be nil"))
-  (unless (functionp callback)
-    (user-error "Subscriber callback must be a function, got: %S" callback))
-  (setq-local json-log-viewer--subscribers
-              (assoc-delete-all id json-log-viewer--subscribers))
-  (push (cons id callback) json-log-viewer--subscribers)
-  id)
-
-(defun json-log-viewer-unsubscribe (id)
-  "Unsubscribe ID from current viewer buffer."
-  (unless (derived-mode-p 'json-log-viewer-mode)
-    (user-error "Not a json-log-viewer buffer: %s" (buffer-name (current-buffer))))
-  (setq-local json-log-viewer--subscribers
-              (assoc-delete-all id json-log-viewer--subscribers))
-  id)
 
 (defun json-log-viewer--normalize-fields (fields)
   "Normalize FIELDS into an alist of (string . string)."
@@ -895,23 +866,6 @@ Returns cons cell (ENTRIES . NEXT-ID)."
         :filter json-log-viewer--filter-string
         :row-count json-log-viewer--entry-count
         :visible-row-count (json-log-viewer--visible-entry-count)))
-
-(defun json-log-viewer--self-subscriber (_action _source-buffer _entry-overlays)
-  "Default no-op subscriber used for self-subscription.")
-
-(defun json-log-viewer--publish (action entry-overlays)
-  "Publish ACTION and ENTRY-OVERLAYS to current buffer subscribers."
-  (let ((source-buffer (current-buffer)))
-    (dolist (subscriber (append json-log-viewer--subscribers nil))
-      (let ((id (car subscriber))
-            (callback (cdr subscriber)))
-        (when (functionp callback)
-          (condition-case err
-              (funcall callback action source-buffer entry-overlays)
-            (error
-             (message "json-log-viewer subscriber %S failed: %s"
-                      id
-                      (error-message-string err)))))))))
 
 (defun json-log-viewer--set-point-to-latest-entry ()
   "Move point and all visible windows for current buffer to latest entry."
@@ -1799,25 +1753,21 @@ stops before the next chunk would exceed the active max-entries cap."
                   (- json-log-viewer--entry-count (length victims)))
             (setq remaining (- remaining chunk-drop))))))))
 
-(defun json-log-viewer-replace-entries (entries &optional preserve-filter storage-prepared)
+(defun json-log-viewer-replace-entries (entries &optional preserve-filter)
   "Replace rendered entries with ENTRIES.
 
-When PRESERVE-FILTER is non-nil, keep the current active filter.
-STORAGE-PREPARED is kept for API compatibility and ignored."
+When PRESERVE-FILTER is non-nil, keep the current active filter."
   (let ((active-filter (and preserve-filter json-log-viewer--filter-string))
         (inhibit-read-only t)
-        (ordered (json-log-viewer--sort-entries entries))
-        (inserted-overlays nil))
+        (ordered (json-log-viewer--sort-entries entries)))
     (setq json-log-viewer--filter-string active-filter)
     (json-log-viewer--clear-overlays)
-    (ignore storage-prepared)
     (setq json-log-viewer--seen-signatures (make-hash-table :test 'equal))
     (erase-buffer)
     (if (null ordered)
         (insert "No results.\n")
       (dolist (entry ordered)
-        (push (json-log-viewer--insert-entry entry) inserted-overlays)))
-    (setq inserted-overlays (nreverse inserted-overlays))
+        (json-log-viewer--insert-entry entry)))
     (setq json-log-viewer--entry-count (length ordered))
     (json-log-viewer--mark-seen-entries ordered)
     (json-log-viewer--apply-filter)
@@ -1825,8 +1775,7 @@ STORAGE-PREPARED is kept for API compatibility and ignored."
     (if json-log-viewer--auto-follow
         (json-log-viewer--set-point-to-latest-entry)
       (goto-char (point-min)))
-    (json-log-viewer--highlight-current-line)
-    (json-log-viewer--publish 'replace inserted-overlays)))
+    (json-log-viewer--highlight-current-line)))
 
 (defun json-log-viewer-prepend-entries (entries)
   "Prepend ENTRIES into current viewer buffer.
@@ -1870,8 +1819,7 @@ New entries are inserted at the top."
       (json-log-viewer--mark-seen-entries ordered)
       (json-log-viewer--apply-filter-to-overlays inserted-overlays)
       (json-log-viewer--refresh-header)
-      (json-log-viewer--highlight-current-line)
-      (json-log-viewer--publish 'prepend inserted-overlays))
+      (json-log-viewer--highlight-current-line))
     ordered))
 
 (defun json-log-viewer-append-entries (entries)
@@ -1902,8 +1850,7 @@ New entries are always appended to the bottom."
       (json-log-viewer--refresh-header)
       (when json-log-viewer--auto-follow
         (json-log-viewer--set-point-to-latest-entry))
-      (json-log-viewer--highlight-current-line)
-      (json-log-viewer--publish 'append inserted-overlays))
+      (json-log-viewer--highlight-current-line))
     ordered))
 
 (defvar-keymap json-log-viewer-mode-map
@@ -2018,12 +1965,9 @@ Returns the created buffer."
       (setq-local json-log-viewer--json-paths normalized-json-paths)
       (setq-local json-log-viewer--json-header-lines-function header-lines-function)
       (setq-local json-log-viewer--seen-signatures (make-hash-table :test 'equal))
-      (setq-local json-log-viewer--subscribers nil)
-      (json-log-viewer-subscribe json-log-viewer--self-subscriber-id
-                                 #'json-log-viewer--self-subscriber)
       (json-log-viewer--start-async-queue)
       (json-log-viewer--ensure-async-queue-running)
-      (json-log-viewer-replace-entries nil nil t)
+      (json-log-viewer-replace-entries nil)
     target)))
 
 (defun json-log-viewer-push (buffer-or-name log-lines)
@@ -2052,7 +1996,7 @@ When PRESERVE-FILTER is non-nil, keep the current active filter."
         (json-log-viewer--async-submit
          (json-log-viewer--make-async-job 'reset nil)
          t)
-        (json-log-viewer-replace-entries nil preserve-filter t)
+        (json-log-viewer-replace-entries nil preserve-filter)
         (dolist (line normalized-lines)
           (json-log-viewer--async-submit
            (json-log-viewer--make-async-job 'ingest line)))))))
