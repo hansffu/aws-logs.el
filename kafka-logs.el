@@ -744,8 +744,9 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
   "Convert kcat output LINES to json-log-viewer JSON lines."
   (delq nil (mapcar #'kafka-logs--line->json-line lines)))
 
-(defun kafka-logs--make-viewer-buffer ()
-  "Create kafka logs viewer buffer."
+(defun kafka-logs--make-viewer-buffer (&optional on-ready)
+  "Create kafka logs viewer buffer.
+ON-READY is called once the async worker is ready to receive jobs."
   (let* ((buffer-name (kafka-logs--viewer-buffer-name))
          (existing (get-buffer buffer-name))
          (extra-paths
@@ -767,7 +768,8 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
            :extra-paths extra-paths
            :json-paths kafka-logs-json-paths
            :mode #'kafka-logs-viewer-mode
-           :header-lines-function #'kafka-logs--viewer-header-lines))
+           :header-lines-function #'kafka-logs--viewer-header-lines
+           :on-ready on-ready))
     (with-current-buffer buffer
       (setq-local kafka-logs--process nil)
       (setq-local kafka-logs--pending-fragment "")
@@ -966,29 +968,28 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
 
 (defun kafka-logs--run-stream ()
   "Start Kafka stream and render in json-log-viewer."
-  (let* ((buffer (kafka-logs--make-viewer-buffer))
-         (args (kafka-logs--consume-args))
+  (let* ((args (kafka-logs--consume-args))
          (command (kafka-logs--command-with-filter args t))
-         (process (make-process
-                   :name (kafka-logs--process-name)
-                   :buffer buffer
-                   :command command
-                   :noquery t
-                   :connection-type 'pipe)))
-    (with-current-buffer buffer
-      (setq-local kafka-logs--process process)
-      (setq-local kafka-logs--pending-fragment "")
-      (setq-local kafka-logs--stream-chunks-in nil)
-      (setq-local kafka-logs--stream-chunks-out nil)
-      (setq-local kafka-logs--stream-pending-lines nil)
-      (setq-local kafka-logs--stream-drain-timer nil)
-      (display-buffer buffer))
-    (set-process-filter process #'kafka-logs--stream-process-filter)
-    (set-process-sentinel process #'kafka-logs--stream-process-sentinel)
-    (set-process-query-on-exit-flag process nil)
-    (message "Started Kafka stream for %s/%s"
-             (or kafka-logs-connection "-")
-             (or kafka-logs-topic "-"))))
+         (label (format "%s/%s"
+                        (or kafka-logs-connection "-")
+                        (or kafka-logs-topic "-")))
+         buffer)
+    (setq buffer
+          (kafka-logs--make-viewer-buffer
+           (lambda ()
+             (let ((process (make-process
+                             :name (kafka-logs--process-name)
+                             :buffer buffer
+                             :command command
+                             :noquery t
+                             :connection-type 'pipe)))
+               (set-process-filter process #'kafka-logs--stream-process-filter)
+               (set-process-sentinel process #'kafka-logs--stream-process-sentinel)
+               (set-process-query-on-exit-flag process nil)
+               (with-current-buffer buffer
+                 (setq-local kafka-logs--process process))
+               (message "Started Kafka stream for %s" label)))))
+    (display-buffer buffer)))
 
 (defun kafka-logs-run ()
   "Run kcat consume using current session selections."

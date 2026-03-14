@@ -162,6 +162,15 @@ to `js-mode`."
 (defvar-local json-log-viewer--async-next-request-id 0
   "Monotonic request id used to correlate async worker responses.")
 
+(defvar-local json-log-viewer--on-worker-ready nil
+  "Function called once when the async worker signals readiness.")
+
+(defvar-local json-log-viewer--pending-render-queue nil
+  "FIFO queue of (entries . prepend) pairs awaiting deferred rendering.")
+
+(defvar-local json-log-viewer--render-drain-timer nil
+  "Active timer draining `json-log-viewer--pending-render-queue'.")
+
 (defvar-local json-log-viewer--load-more-in-flight nil
   "Non-nil when a load-more request is currently in flight.")
 
@@ -313,7 +322,8 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
 (defun json-log-viewer--async-await-pending-count (target-count)
   "Wait until pending async count reaches TARGET-COUNT, with timeout."
   (let ((deadline (+ (float-time) 15.0)))
-    (while (and (> json-log-viewer--async-pending-count target-count)
+    (while (and (or (> json-log-viewer--async-pending-count target-count)
+                    json-log-viewer--pending-render-queue)
                 (< (float-time) deadline))
       (accept-process-output nil 0.01))
     (when (> json-log-viewer--async-pending-count target-count)
@@ -346,7 +356,8 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
 
 (defun json-log-viewer--finalize-rebuild-if-empty ()
   "Ensure empty rebuilds render the no-results placeholder."
-  (when (= json-log-viewer--entry-count 0)
+  (when (and (= json-log-viewer--entry-count 0)
+             (null json-log-viewer--pending-render-queue))
     (let ((inhibit-read-only t))
       (erase-buffer)
       (insert "No results.\n")
@@ -354,32 +365,75 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
       (json-log-viewer--refresh-header)
       (json-log-viewer--highlight-current-line))))
 
+(defun json-log-viewer--cancel-render-queue ()
+  "Cancel pending render queue and any scheduled drain timer."
+  (when json-log-viewer--render-drain-timer
+    (cancel-timer json-log-viewer--render-drain-timer)
+    (setq json-log-viewer--render-drain-timer nil))
+  (setq json-log-viewer--pending-render-queue nil))
+
+(defun json-log-viewer--render-apply-batch (entries prepend)
+  "Render one ENTRIES batch, dropping overflow when over max-entries."
+  (when entries
+    (if prepend
+        (json-log-viewer-prepend-entries entries)
+      (json-log-viewer-append-entries entries)))
+  (when (and (integerp json-log-viewer--stream-max-entries)
+             (> json-log-viewer--stream-max-entries 0)
+             (> json-log-viewer--entry-count json-log-viewer--stream-max-entries))
+    (let* ((over (- json-log-viewer--entry-count
+                    json-log-viewer--stream-max-entries))
+           (chunk-size (max 1 (or json-log-viewer-stream-chunk-size 1)))
+           ;; Drop at least one full chunk once over limit to avoid
+           ;; constant +1/-1 churn around the cap.
+           (drop (* chunk-size
+                    (/ (+ over chunk-size -1) chunk-size))))
+      (if prepend
+          (json-log-viewer--drop-newest-rendered-entries drop)
+        (json-log-viewer--drop-oldest-rendered-entries drop)))))
+
+(defun json-log-viewer--drain-render-queue ()
+  "Process one pending render batch and reschedule if more remain."
+  (setq json-log-viewer--render-drain-timer nil)
+  (when json-log-viewer--pending-render-queue
+    (let* ((item (pop json-log-viewer--pending-render-queue))
+           (entries (car item))
+           (prepend (cdr item)))
+      (json-log-viewer--render-apply-batch entries prepend))
+    (if json-log-viewer--pending-render-queue
+        (let ((buf (current-buffer)))
+          (setq json-log-viewer--render-drain-timer
+                (run-with-timer
+                 0 nil
+                 (lambda ()
+                   (when (buffer-live-p buf)
+                     (with-current-buffer buf
+                       (json-log-viewer--drain-render-queue)))))))
+      (json-log-viewer--finalize-rebuild-if-empty))))
+
 (defun json-log-viewer--async-apply-command (command)
   "Apply worker COMMAND in current viewer buffer."
   (pcase (plist-get command :cmd)
     ('clear
+     (json-log-viewer--cancel-render-queue)
      (json-log-viewer--clear-rendered-buffer))
     ('render-entries
      (let* ((entries (json-log-viewer--worker-entries->entries
                       (plist-get command :entries)))
             (prepend (plist-get command :prepend)))
        (when entries
-         (if prepend
-             (json-log-viewer-prepend-entries entries)
-           (json-log-viewer-append-entries entries)))
-       (when (and (integerp json-log-viewer--stream-max-entries)
-                  (> json-log-viewer--stream-max-entries 0)
-                  (> json-log-viewer--entry-count json-log-viewer--stream-max-entries))
-         (let* ((over (- json-log-viewer--entry-count
-                         json-log-viewer--stream-max-entries))
-                (chunk-size (max 1 (or json-log-viewer-stream-chunk-size 1)))
-                ;; Drop at least one full chunk once over limit to avoid
-                ;; constant +1/-1 churn around the cap.
-                (drop (* chunk-size
-                         (/ (+ over chunk-size -1) chunk-size))))
-           (if prepend
-               (json-log-viewer--drop-newest-rendered-entries drop)
-             (json-log-viewer--drop-oldest-rendered-entries drop))))))
+         (setq json-log-viewer--pending-render-queue
+               (append json-log-viewer--pending-render-queue
+                       (list (cons entries prepend))))
+         (unless json-log-viewer--render-drain-timer
+           (let ((buf (current-buffer)))
+             (setq json-log-viewer--render-drain-timer
+                   (run-with-timer
+                    0 nil
+                    (lambda ()
+                      (when (buffer-live-p buf)
+                        (with-current-buffer buf
+                          (json-log-viewer--drain-render-queue)))))))))))
     ('expand-details
      (json-log-viewer--apply-entry-fields-result command))
     ('load-more-complete
@@ -421,7 +475,8 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
             (error "Missing async worker entrypoint in %s" worker-file)))
         (json-log-viewer-async-worker-process-log-ingestor-job job)))))
 
-(defun json-log-viewer--make-async-queue-init-func (worker-file max-entries chunk-size)
+(defun json-log-viewer--make-async-queue-init-func
+    (worker-file max-entries chunk-size rebuild-chunk-size)
   "Return worker init function for WORKER-FILE."
   (eval
    `(lambda ()
@@ -437,7 +492,11 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
           (unless (fboundp 'json-log-viewer-async-worker-init)
             (error "Missing async worker init entrypoint in %s" worker-file)))
         (json-log-viewer-async-worker-init
-         (list :max-entries ,max-entries :chunk-size ,chunk-size))))))
+         (list :max-entries ,max-entries
+               :chunk-size ,chunk-size
+               :rebuild-chunk-size ,rebuild-chunk-size))
+        (funcall async-job-queue--worker-send-func
+                 '(:event nil (:worker-ready t)))))))
 
 (defun json-log-viewer--make-async-queue-teardown-func (worker-file)
   "Return worker teardown function for WORKER-FILE."
@@ -458,6 +517,7 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
 
 (defun json-log-viewer--stop-async-queue ()
   "Stop async queue for current buffer."
+  (json-log-viewer--cancel-render-queue)
   (when json-log-viewer--async-queue
     (ignore-errors (async-job-queue-stop json-log-viewer--async-queue))
     (setq json-log-viewer--async-queue nil))
@@ -473,7 +533,8 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
   (let ((buffer (current-buffer))
         (worker-file (json-log-viewer--async-worker-file))
         (max-entries json-log-viewer--stream-max-entries)
-        (chunk-size json-log-viewer-stream-chunk-size))
+        (chunk-size json-log-viewer-stream-chunk-size)
+        (rebuild-chunk-size json-log-viewer-rebuild-chunk-size))
     (setq-local json-log-viewer--async-next-request-id 0)
     (setq-local json-log-viewer--async-queue
                 (async-job-queue-create
@@ -481,14 +542,21 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
                  (lambda (result)
                    (when (buffer-live-p buffer)
                      (with-current-buffer buffer
-                       (unless (and (listp result) (plist-member result :cmd))
-                         (setq json-log-viewer--async-pending-count
-                               (max 0 (1- json-log-viewer--async-pending-count))))
-                       (json-log-viewer--async-handle-result result))))
+                       (cond
+                        ((and (listp result) (plist-member result :worker-ready))
+                         (when json-log-viewer--on-worker-ready
+                           (funcall json-log-viewer--on-worker-ready)
+                           (setq json-log-viewer--on-worker-ready nil)))
+                        (t
+                         (unless (and (listp result) (plist-member result :cmd))
+                           (setq json-log-viewer--async-pending-count
+                                 (max 0 (1- json-log-viewer--async-pending-count))))
+                         (json-log-viewer--async-handle-result result))))))
                  :init-func (json-log-viewer--make-async-queue-init-func
                              worker-file
                              max-entries
-                             chunk-size)
+                             chunk-size
+                             rebuild-chunk-size)
                  :teardown-func (json-log-viewer--make-async-queue-teardown-func
                                  worker-file)))))
 
@@ -1902,7 +1970,8 @@ New entries are always appended to the bottom."
                                        json-paths
                                        (mode #'json-log-viewer-mode)
                                        (max-entries json-log-viewer-stream-max-entries)
-                                       header-lines-function)
+                                       header-lines-function
+                                       on-ready)
   "Create BUFFER-NAME for JSON log rendering.
 
 Summary rendering is configured with explicit JSON paths.
@@ -1965,6 +2034,7 @@ Returns the created buffer."
       (setq-local json-log-viewer--json-paths normalized-json-paths)
       (setq-local json-log-viewer--json-header-lines-function header-lines-function)
       (setq-local json-log-viewer--seen-signatures (make-hash-table :test 'equal))
+      (setq-local json-log-viewer--on-worker-ready on-ready)
       (json-log-viewer--start-async-queue)
       (json-log-viewer--ensure-async-queue-running)
       (json-log-viewer-replace-entries nil)

@@ -323,8 +323,9 @@ Returns (NORMALIZED-LINES . NEW-PENDING)."
           (kill-buffer aws-logs--tail-once-output-buffer))
         (setq aws-logs--tail-once-output-buffer nil)))))
 
-(defun aws-logs--tail-make-ecs-buffer ()
-  "Create ECS viewer buffer."
+(defun aws-logs--tail-make-ecs-buffer (&optional on-ready)
+  "Create ECS viewer buffer.
+ON-READY is called once the async worker is ready to receive jobs."
   (let* ((buffer-name (aws-logs--tail-viewer-buffer-name))
          (existing (get-buffer buffer-name))
          (buffer nil))
@@ -337,7 +338,8 @@ Returns (NORMALIZED-LINES . NEW-PENDING)."
            :level-path "log.level"
            :message-path "message"
            :mode #'aws-logs-tail-viewer-mode
-           :header-lines-function #'aws-logs--tail-header-lines))
+           :header-lines-function #'aws-logs--tail-header-lines
+           :on-ready on-ready))
     (with-current-buffer buffer
       (setq-local aws-logs--tail-process nil)
       (setq-local aws-logs--tail-pending-fragment "")
@@ -667,34 +669,26 @@ When FLUSH-NOW is non-nil, flush immediately."
 
 (defun aws-logs--tail-run-ecs-stream ()
   "Run ECS tail in follow mode and stream lines into json-log-viewer."
-  (let* ((buffer (aws-logs--tail-make-ecs-buffer))
-         (args (append (aws-logs--tail-global-args) (aws-logs--tail-args)))
+  (let* ((args (append (aws-logs--tail-global-args) (aws-logs--tail-args)))
          (command (aws-logs--tail-command-with-filter args t))
-         (process (make-process
-                   :name (aws-logs--tail-process-name)
-                   :buffer buffer
-                   :command command
-                   :noquery t
-                   :connection-type 'pipe
-                   :filter #'aws-logs--tail-ecs-process-filter
-                   :sentinel #'aws-logs--tail-ecs-process-sentinel)))
-    (with-current-buffer buffer
-      (setq-local aws-logs--tail-process process)
-      (setq-local aws-logs--tail-pending-fragment "")
-      (setq-local aws-logs--tail-pending-json-lines nil)
-      (setq-local aws-logs--tail-pending-viewer-lines nil)
-      (setq-local aws-logs--tail-pending-viewer-count 0)
-      (setq-local aws-logs--tail-flush-timer nil)
-      (setq-local aws-logs--tail-chunk-timer nil)
-      (setq-local aws-logs--tail-normalize-timer nil)
-      (setq-local aws-logs--tail-pending-output-chunks nil)
-      (setq-local aws-logs--tail-pending-output-chunk-count 0)
-      (setq-local aws-logs--tail-pending-raw-lines nil)
-      (setq-local aws-logs--tail-pending-raw-count 0)
-      (setq-local aws-logs--tail-backpressure-paused nil)
-      (display-buffer buffer))
-    (set-process-query-on-exit-flag process nil)
-    (message "Started ECS logs tail for %s" aws-logs-log-group)))
+         (log-group aws-logs-log-group)
+         buffer)
+    (setq buffer
+          (aws-logs--tail-make-ecs-buffer
+           (lambda ()
+             (let ((process (make-process
+                             :name (aws-logs--tail-process-name)
+                             :buffer buffer
+                             :command command
+                             :noquery t
+                             :connection-type 'pipe
+                             :filter #'aws-logs--tail-ecs-process-filter
+                             :sentinel #'aws-logs--tail-ecs-process-sentinel)))
+               (set-process-query-on-exit-flag process nil)
+               (with-current-buffer buffer
+                 (setq-local aws-logs--tail-process process))
+               (message "Started ECS logs tail for %s" log-group)))))
+    (display-buffer buffer)))
 
 (defun aws-logs-tail-run ()
   "Run logs tail based on current session selections.

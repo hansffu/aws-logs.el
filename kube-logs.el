@@ -368,8 +368,9 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
   (kube-logs--kill-buffer-process (current-buffer))
   (quit-window t))
 
-(defun kube-logs--make-viewer-buffer ()
-  "Create kube logs viewer buffer."
+(defun kube-logs--make-viewer-buffer (&optional on-ready)
+  "Create kube logs viewer buffer.
+ON-READY is called once the async worker is ready to receive jobs."
   (let* ((buffer-name (kube-logs--viewer-buffer-name))
          (existing (get-buffer buffer-name))
          buffer)
@@ -383,7 +384,8 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
            :message-path kube-logs-message-path
            :extra-paths kube-logs-extra-paths
            :mode #'kube-logs-viewer-mode
-           :header-lines-function #'kube-logs--viewer-header-lines))
+           :header-lines-function #'kube-logs--viewer-header-lines
+           :on-ready on-ready))
     (with-current-buffer buffer
       (setq-local kube-logs--process nil)
       (setq-local kube-logs--pending-fragment "")
@@ -536,23 +538,26 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
 
 (defun kube-logs--run-stream ()
   "Start streaming logs and render them in json-log-viewer."
-  (let* ((buffer (kube-logs--make-viewer-buffer))
-         (args (kube-logs--logs-args))
+  (let* ((args (kube-logs--logs-args))
          (command (kube-logs--command-with-filter args t))
-         (process (make-process
-                   :name (kube-logs--process-name)
-                   :buffer buffer
-                   :command command
-                   :noquery t
-                   :connection-type 'pipe)))
-    (with-current-buffer buffer
-      (setq-local kube-logs--process process)
-      (setq-local kube-logs--pending-fragment "")
-      (display-buffer buffer))
-    (set-process-filter process #'kube-logs--stream-process-filter)
-    (set-process-sentinel process #'kube-logs--stream-process-sentinel)
-    (set-process-query-on-exit-flag process nil)
-    (message "Started kube logs stream for %s" (kube-logs--target-description))))
+         (description (kube-logs--target-description))
+         buffer)
+    (setq buffer
+          (kube-logs--make-viewer-buffer
+           (lambda ()
+             (let ((process (make-process
+                             :name (kube-logs--process-name)
+                             :buffer buffer
+                             :command command
+                             :noquery t
+                             :connection-type 'pipe)))
+               (set-process-filter process #'kube-logs--stream-process-filter)
+               (set-process-sentinel process #'kube-logs--stream-process-sentinel)
+               (set-process-query-on-exit-flag process nil)
+               (with-current-buffer buffer
+                 (setq-local kube-logs--process process))
+               (message "Started kube logs stream for %s" description)))))
+    (display-buffer buffer)))
 
 (defun kube-logs-run ()
   "Run kubectl logs using current session selections."

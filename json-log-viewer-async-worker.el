@@ -343,7 +343,10 @@
   "Worker-local rerender/narrow result cap, or nil for unbounded.")
 
 (defvar json-log-viewer-async-worker--chunk-size 1
-  "Worker-local chunk size used for render command batches.")
+  "Worker-local chunk size for live-streaming render batches.")
+
+(defvar json-log-viewer-async-worker--rebuild-chunk-size 1
+  "Worker-local chunk size for rerender/narrow bulk-replay batches.")
 
 (defvar json-log-viewer-async-worker--render-mode 'all
   "Worker-local render mode: `all' or `narrow'.")
@@ -362,7 +365,7 @@
   "Publish clear/render commands for current worker render mode."
   (let ((narrow-string (and (eq json-log-viewer-async-worker--render-mode 'narrow)
                             json-log-viewer-async-worker--render-narrow-string))
-        (chunk-size (max 1 (or json-log-viewer-async-worker--chunk-size 1)))
+        (chunk-size (max 1 (or json-log-viewer-async-worker--rebuild-chunk-size 1)))
         (entry-limit (and (integerp json-log-viewer-async-worker--max-entries)
                           (> json-log-viewer-async-worker--max-entries 0)
                           json-log-viewer-async-worker--max-entries)))
@@ -394,6 +397,10 @@
         (plist-get config :max-entries))
   (setq json-log-viewer-async-worker--chunk-size
         (max 1 (or (plist-get config :chunk-size) 1)))
+  (setq json-log-viewer-async-worker--rebuild-chunk-size
+        (max 1 (or (plist-get config :rebuild-chunk-size)
+                   (plist-get config :chunk-size)
+                   1)))
   (setq json-log-viewer-async-worker--render-mode 'all)
   (setq json-log-viewer-async-worker--render-narrow-string nil)
   (setq json-log-viewer-async-worker--publish-mode 'live)
