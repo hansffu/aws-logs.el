@@ -29,3 +29,15 @@ run-Q:
 
 run:
     emacs -L {{dir}} &
+
+mock-run:
+    emacs -L {{dir}} \
+        -l aws-logs.el -l kube-logs.el -l kafka-logs.el \
+        --eval "(setq kube-logs-kubectl \"{{dir}}/test/mock-kubectl\")" \
+        --eval "(setq kube-logs-level-path \"payload.log.level\")" \
+        --eval "(setq kube-logs-message-path \"payload.message\")" \
+        --eval "(setq kube-logs-default-target-kind \"pod\")" \
+        --eval "(setq kube-logs-default-namespace \"app\")" \
+        --eval "(setq kube-logs-context \"mock-dev\")" \
+        --eval "(setq kube-logs-target \"api\")" \
+        --eval "(kube-logs)" &

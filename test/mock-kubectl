@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""mock-kubectl — fake kubectl for testing kube-logs without a real cluster.
+
+Configure kube-logs to use it:
+  (setq kube-logs-kubectl \"/path/to/mock-kubectl\")
+  (setq kube-logs-level-path \"payload.log.level\")
+  (setq kube-logs-message-path \"payload.message\")
+"""
+
+import sys
+import json
+import random
+import time
+import datetime
+import argparse
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+FOLLOW_MESSAGES_PER_SECOND = 20
+
+# ---------------------------------------------------------------------------
+# Mock cluster data
+# ---------------------------------------------------------------------------
+
+CONTEXTS = ["mock-prod", "mock-staging", "mock-dev"]
+NAMESPACES = ["default", "kube-system", "monitoring", "app"]
+PODS = ["api-abc123", "api-def456", "worker-ghi789"]
+DEPLOYMENTS = ["api", "worker", "cache"]
+
+SERVICES = ["payment-service", "auth-service", "order-service", "gateway"]
+LEVELS = ["debug", "info", "info", "info", "info", "warn", "error"]
+MESSAGES = [
+    "Handling incoming request",
+    "Database query completed",
+    "Cache miss, fetching from origin",
+    "Request processed successfully",
+    "Background job started",
+    "Health check passed",
+    "Connection pool refreshed",
+    "Config reloaded",
+    "Rate limit threshold reached",
+    "Retry attempt",
+    "Token validation succeeded",
+    "Upstream response received",
+    "Event published to queue",
+    "Metrics flushed",
+    "Session expired",
+]
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def iso_ts(epoch: float) -> str:
+    dt = datetime.datetime.utcfromtimestamp(epoch)
+    ms = int((epoch - int(epoch)) * 1000)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S") + f".{ms:03d}Z"
+
+
+def ecs_json(ts: str, level: str, msg: str, service: str, trace_id: str,
+             status: int) -> str:
+    obj = {
+        "@timestamp": ts,
+        "log": {"level": level},
+        "message": msg,
+        "service": {"name": service},
+        "trace": {"id": trace_id},
+        "http": {"response": {"status_code": status}},
+    }
+    return json.dumps(obj, separators=(",", ":"))
+
+
+def rand_trace() -> str:
+    return "%016x" % random.getrandbits(64)
+
+
+def log_line(pod: str, ts: str, payload_json: str, prefix: bool) -> str:
+    if prefix:
+        return f"[pod/{pod} mock-container] {ts} {payload_json}"
+    return f"{ts} {payload_json}"
+
+
+# ---------------------------------------------------------------------------
+# Subcommand handlers
+# ---------------------------------------------------------------------------
+
+def handle_config(args):
+    sub = args.config_subcommand
+    if sub == "get-contexts":
+        for ctx in CONTEXTS:
+            print(ctx)
+    else:
+        print(f"mock-kubectl: unsupported config subcommand: {sub}", file=sys.stderr)
+        sys.exit(1)
+
+
+def handle_get(args):
+    resource = args.resource
+    if resource in ("namespaces",):
+        for ns in NAMESPACES:
+            print(ns)
+    elif resource in ("pods",):
+        for pod in PODS:
+            print(f"pod/{pod}")
+    elif resource in ("deployments",):
+        for dep in DEPLOYMENTS:
+            print(f"deployment/{dep}")
+    else:
+        print(f"mock-kubectl: unsupported resource: {resource}", file=sys.stderr)
+        sys.exit(1)
+
+
+def handle_logs(args):
+    target = args.target  # e.g. "pod/api-abc123" or "deployment/api"
+    tail = args.tail if args.tail is not None else 100
+    follow = args.follow
+    use_prefix = args.prefix
+
+    # Derive pod list from target
+    if target.startswith("deployment/"):
+        dep = target[len("deployment/"):]
+        pods = [f"{dep}-abc123", f"{dep}-def456"]
+    else:
+        pods = [target[len("pod/"):] if target.startswith("pod/") else target]
+
+    service = random.choice(SERVICES)
+    trace_id = rand_trace()
+    now = time.time()
+
+    # Historical lines — evenly spaced, all before now, in strict order
+    start = now - tail  # one second per line
+    for i in range(tail):
+        epoch = start + i
+        ts = iso_ts(epoch)
+        pod = pods[i % len(pods)]
+        level = random.choice(LEVELS)
+        msg = random.choice(MESSAGES)
+        status = random.choice([200, 200, 200, 200, 404, 500])
+        if i % 20 == 0:
+            trace_id = rand_trace()
+        payload = ecs_json(ts, level, msg, service, trace_id, status)
+        print(log_line(pod, ts, payload, use_prefix), flush=True)
+
+    # Follow mode — emit new lines at FOLLOW_MESSAGES_PER_SECOND rate
+    if follow:
+        pod_idx = 0
+        interval = 1.0 / max(FOLLOW_MESSAGES_PER_SECOND, 0.01)
+        while True:
+            time.sleep(interval)
+            epoch = time.time()
+            ts = iso_ts(epoch)
+            pod = pods[pod_idx % len(pods)]
+            pod_idx += 1
+            level = random.choice(LEVELS)
+            msg = random.choice(MESSAGES)
+            status = random.choice([200, 200, 200, 200, 404, 500])
+            payload = ecs_json(ts, level, msg, service, trace_id, status)
+            print(log_line(pod, ts, payload, use_prefix), flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def make_parser():
+    p = argparse.ArgumentParser(add_help=False)
+    # Global flags kubectl accepts before the subcommand
+    p.add_argument("--context", default=None)
+    p.add_argument("--namespace", "-n", default="default")
+    sub = p.add_subparsers(dest="subcommand")
+
+    # config get-contexts
+    config_p = sub.add_parser("config", add_help=False)
+    config_p.add_argument("config_subcommand")
+    config_p.add_argument("-o", "--output", default=None)
+
+    # get pods/deployments/namespaces
+    get_p = sub.add_parser("get", add_help=False)
+    get_p.add_argument("resource")
+    get_p.add_argument("-o", "--output", default=None)
+    get_p.add_argument("-n", "--namespace", default="default")
+    # absorb jsonpath string that kube-logs passes as positional after resource
+    get_p.add_argument("rest", nargs="*")
+
+    # logs
+    logs_p = sub.add_parser("logs", add_help=False)
+    logs_p.add_argument("target")
+    logs_p.add_argument("--follow", "-f", action="store_true")
+    logs_p.add_argument("--tail", type=int, default=None)
+    logs_p.add_argument("--since", default=None)
+    logs_p.add_argument("--prefix", action="store_true")
+    logs_p.add_argument("--timestamps", action="store_true")
+    logs_p.add_argument("--all-pods", action="store_true")
+    logs_p.add_argument("-n", "--namespace", default="default")
+
+    return p
+
+
+def main():
+    parser = make_parser()
+    # argparse doesn't handle unknown flags well; strip them first
+    known, _ = parser.parse_known_args()
+
+    if known.subcommand == "config":
+        handle_config(known)
+    elif known.subcommand == "get":
+        handle_get(known)
+    elif known.subcommand == "logs":
+        try:
+            handle_logs(known)
+        except KeyboardInterrupt:
+            pass
+    else:
+        print(f"mock-kubectl: unknown subcommand: {known.subcommand}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
