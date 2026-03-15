@@ -81,6 +81,16 @@ When non-nil, output is piped through grep with this regex."
   :type '(choice (const :tag "No filter" nil) string)
   :group 'kube-logs)
 
+(defcustom kube-logs-stream-drain-interval 0.05
+  "Interval in seconds between stream drain timer ticks for kube-logs."
+  :type 'number
+  :group 'kube-logs)
+
+(defcustom kube-logs-stream-max-lines-per-batch 250
+  "Maximum lines rendered per stream drain tick for kube-logs."
+  :type 'integer
+  :group 'kube-logs)
+
 (defcustom kube-logs-level-path nil
   "Path to the level field in the log JSON.
 Set this to match your log format, e.g. \"payload.log.level\"."
@@ -140,6 +150,18 @@ Each element has the form (NAME . PLIST).")
 
 (defvar-local kube-logs--pending-fragment ""
   "Trailing incomplete process output fragment for streaming buffers.")
+
+(defvar-local kube-logs--stream-chunks-in nil
+  "LIFO queue of pending stream output chunks waiting for reversal.")
+
+(defvar-local kube-logs--stream-chunks-out nil
+  "FIFO queue of pending stream output chunks ready for draining.")
+
+(defvar-local kube-logs--stream-pending-lines nil
+  "Parsed full lines waiting to be converted and rendered.")
+
+(defvar-local kube-logs--stream-drain-timer nil
+  "Per-buffer timer used to drain queued stream data incrementally.")
 
 (defvar-local kube-logs--once-output-buffer nil
   "Temporary process output buffer for one-shot asynchronous fetches.")
@@ -358,6 +380,12 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
           (delete-process proc))
         (setq kube-logs--process nil))
       (setq kube-logs--pending-fragment "")
+      (when (timerp kube-logs--stream-drain-timer)
+        (cancel-timer kube-logs--stream-drain-timer))
+      (setq kube-logs--stream-drain-timer nil)
+      (setq kube-logs--stream-chunks-in nil)
+      (setq kube-logs--stream-chunks-out nil)
+      (setq kube-logs--stream-pending-lines nil)
       (when (buffer-live-p kube-logs--once-output-buffer)
         (kill-buffer kube-logs--once-output-buffer))
       (setq kube-logs--once-output-buffer nil))))
@@ -389,6 +417,10 @@ ON-READY is called once the async worker is ready to receive jobs."
     (with-current-buffer buffer
       (setq-local kube-logs--process nil)
       (setq-local kube-logs--pending-fragment "")
+      (setq-local kube-logs--stream-chunks-in nil)
+      (setq-local kube-logs--stream-chunks-out nil)
+      (setq-local kube-logs--stream-pending-lines nil)
+      (setq-local kube-logs--stream-drain-timer nil)
       (setq-local kube-logs--once-output-buffer nil)
       (setq-local kube-logs--viewer-context kube-logs-context)
       (setq-local kube-logs--viewer-namespace kube-logs-namespace)
@@ -464,21 +496,102 @@ ON-READY is called once the async worker is ready to receive jobs."
       (when-let ((json-line (kube-logs--line->json-line line)))
         (json-log-viewer-push (current-buffer) (list json-line))))))
 
+
+(defun kube-logs--stream-queue-empty-p ()
+  "Return non-nil when no stream output is waiting to be rendered."
+  (and (null kube-logs--stream-chunks-in)
+       (null kube-logs--stream-chunks-out)
+       (null kube-logs--stream-pending-lines)))
+
+(defun kube-logs--stream-cancel-drain-timer ()
+  "Cancel and clear stream drain timer for current buffer."
+  (when (timerp kube-logs--stream-drain-timer)
+    (cancel-timer kube-logs--stream-drain-timer))
+  (setq kube-logs--stream-drain-timer nil))
+
+(defun kube-logs--stream-drain-on-timer (buffer)
+  "Drain queued stream output for BUFFER from timer callbacks."
+  (if (not (buffer-live-p buffer))
+      nil
+    (with-current-buffer buffer
+      (condition-case err
+          (kube-logs--stream-drain nil)
+        (error
+         (kube-logs--stream-cancel-drain-timer)
+         (message "kube-logs drain failed: %s" (error-message-string err)))))))
+
+(defun kube-logs--stream-schedule-drain ()
+  "Ensure periodic draining is scheduled for current buffer."
+  (unless (timerp kube-logs--stream-drain-timer)
+    (let ((interval (max 0.01 (or kube-logs-stream-drain-interval 0.05))))
+      (setq kube-logs--stream-drain-timer
+            (run-at-time interval interval
+                         #'kube-logs--stream-drain-on-timer
+                         (current-buffer))))))
+
+(defun kube-logs--stream-enqueue-chunk (chunk)
+  "Queue one process output CHUNK for later incremental rendering."
+  (when (and (stringp chunk) (> (length chunk) 0))
+    (push chunk kube-logs--stream-chunks-in)
+    (kube-logs--stream-schedule-drain)))
+
+(defun kube-logs--stream-pop-chunk ()
+  "Pop the next queued process output chunk, or nil."
+  (unless kube-logs--stream-chunks-out
+    (when kube-logs--stream-chunks-in
+      (setq kube-logs--stream-chunks-out (nreverse kube-logs--stream-chunks-in))
+      (setq kube-logs--stream-chunks-in nil)))
+  (prog1 (car kube-logs--stream-chunks-out)
+    (setq kube-logs--stream-chunks-out (cdr kube-logs--stream-chunks-out))))
+
+(defun kube-logs--stream-pop-lines (max-lines)
+  "Pop up to MAX-LINES complete streamed lines in order."
+  (let ((lines nil)
+        (count 0))
+    (while (< count max-lines)
+      (unless kube-logs--stream-pending-lines
+        (if-let ((chunk (kube-logs--stream-pop-chunk)))
+            (setq kube-logs--stream-pending-lines
+                  (kube-logs--consume-chunk-lines chunk))
+          (setq count max-lines)))
+      (while (and kube-logs--stream-pending-lines
+                  (< count max-lines))
+        (push (pop kube-logs--stream-pending-lines) lines)
+        (setq count (1+ count))))
+    (nreverse lines)))
+
+(defun kube-logs--stream-drain (&optional drain-all)
+  "Render queued streamed output in batches.
+
+When DRAIN-ALL is non-nil, consume the full queue in one call."
+  (let ((batch-size (max 1 (or kube-logs-stream-max-lines-per-batch 250)))
+        (more t))
+    (while more
+      (let* ((limit (if drain-all most-positive-fixnum batch-size))
+             (lines (kube-logs--stream-pop-lines limit))
+             (json-lines (kube-logs--lines->json-lines lines)))
+        (when json-lines
+          (json-log-viewer-push (current-buffer) json-lines))
+        (setq more (and drain-all
+                        (not (kube-logs--stream-queue-empty-p))))))
+    (when (kube-logs--stream-queue-empty-p)
+      (kube-logs--stream-cancel-drain-timer))))
+
 (defun kube-logs--stream-process-filter (process output)
   "Process filter for streaming kube logs PROCESS OUTPUT."
   (let ((buffer (process-buffer process)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
-        (let* ((lines (kube-logs--consume-chunk-lines output))
-               (json-lines (kube-logs--lines->json-lines lines)))
-          (when json-lines
-            (json-log-viewer-push buffer json-lines)))))))
+        ;; Keep process filter lightweight: queue output and render on timer ticks.
+        (kube-logs--stream-enqueue-chunk output)))))
 
 (defun kube-logs--stream-process-sentinel (process event)
   "Process sentinel for streaming kube logs PROCESS EVENT."
   (let ((buffer (process-buffer process)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
+        (kube-logs--stream-drain t)
+        (kube-logs--stream-cancel-drain-timer)
         (kube-logs--flush-pending-fragment)
         (setq kube-logs--process nil)))
     (when (and (memq (process-status process) '(exit signal))
