@@ -177,6 +177,9 @@ to `js-mode`."
 (defvar-local json-log-viewer--load-more-request-id nil
   "Request id of the active load-more operation, or nil.")
 
+(defvar-local json-log-viewer--load-more-callback nil
+  "Function called once when the current load-more request completes.")
+
 (defvar-local json-log-viewer--entry-count 0
   "Cached count of rendered entry overlays.")
 
@@ -442,7 +445,11 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
                   (or (null request-id)
                       (eq request-id json-log-viewer--load-more-request-id)))
          (setq json-log-viewer--load-more-in-flight nil)
-         (setq json-log-viewer--load-more-request-id nil))))
+         (setq json-log-viewer--load-more-request-id nil)
+         (when json-log-viewer--load-more-callback
+           (let ((cb json-log-viewer--load-more-callback))
+             (setq json-log-viewer--load-more-callback nil)
+             (funcall cb))))))
     ('error
      (message "json-log-viewer async worker error: %s"
               (or (plist-get command :message) "unknown error")))
@@ -525,6 +532,7 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
   (setq json-log-viewer--async-next-request-id 0)
   (setq json-log-viewer--load-more-in-flight nil)
   (setq json-log-viewer--load-more-request-id nil)
+  (setq json-log-viewer--load-more-callback nil)
   nil)
 
 (defun json-log-viewer--start-async-queue ()
@@ -1511,16 +1519,6 @@ ENTRY-ID is an optional boundary id used as a fallback when timestamps are missi
       (user-error "Chunk size must be a positive integer, got: %S" size))
     size))
 
-(defun json-log-viewer--await-load-more-complete (&optional timeout-seconds)
-  "Block until current load-more request finishes.
-
-Raise an error when TIMEOUT-SECONDS elapses."
-  (let ((deadline (+ (float-time) (or timeout-seconds 15.0))))
-    (while (and json-log-viewer--load-more-in-flight
-                (< (float-time) deadline))
-      (accept-process-output nil 0.01))
-    (when json-log-viewer--load-more-in-flight
-      (error "Timed out waiting for load-more completion"))))
 
 (defun json-log-viewer--entry-overlay-timestamp-epoch (entry-overlay)
   "Return ENTRY-OVERLAY timestamp as epoch seconds, or nil."
@@ -1640,6 +1638,40 @@ With prefix ARG, use that many entries; otherwise use
                                (nth 1 boundary))
     (message "Loading %d newer entries..." limit)))
 
+(defun json-log-viewer--window-at-time-step (remaining direction timestamp chunk-size)
+  "Load one chunk for window-at-time, then recurse via callback.
+
+REMAINING is how many entries are left to load.  DIRECTION is the next
+load direction (`before' or `after').  TIMESTAMP is the target anchor.
+CHUNK-SIZE is the entries per chunk."
+  (if (< remaining chunk-size)
+      (progn
+        (when-let ((anchor (json-log-viewer--entry-overlay-closest-to-timestamp timestamp)))
+          (json-log-viewer--set-point-to-entry-overlay anchor))
+        (message "Loaded window around selected time: %d entries (chunk=%d)"
+                 json-log-viewer--entry-count chunk-size))
+    (let* ((entry-overlay (and (> json-log-viewer--entry-count 0)
+                               (json-log-viewer--boundary-overlay direction)))
+           (boundary (and entry-overlay
+                          (json-log-viewer--overlay-load-more-boundary entry-overlay)))
+           (boundary-timestamp (or (nth 0 boundary) timestamp))
+           (boundary-entry-id (nth 1 boundary))
+           (buf (current-buffer))
+           (next-remaining (- remaining chunk-size))
+           (next-direction (if (eq direction 'before) 'after 'before)))
+      (setq json-log-viewer--load-more-callback
+            (lambda ()
+              (when (buffer-live-p buf)
+                (with-current-buffer buf
+                  (json-log-viewer--window-at-time-step
+                   next-remaining next-direction timestamp chunk-size)))))
+      (json-log-viewer-load-more (current-buffer)
+                                 chunk-size
+                                 direction
+                                 boundary-timestamp
+                                 (eq direction 'before)
+                                 boundary-entry-id))))
+
 (defun json-log-viewer-window-at-time (&optional arg)
   "Build a centered window around an interactively selected timestamp.
 
@@ -1658,31 +1690,10 @@ stops before the next chunk would exceed the active max-entries cap."
                                json-log-viewer-stream-max-entries))))
     (unless max-entries
       (user-error "Window-at-time requires a positive max-entries cap"))
-    (let ((timestamp (json-log-viewer--read-jump-timestamp))
-          (remaining max-entries)
-          (direction 'before))
+    (let ((timestamp (json-log-viewer--read-jump-timestamp)))
       (json-log-viewer--clear-rendered-buffer)
-      (while (>= remaining chunk-size)
-        (let* ((entry-overlay (and (> json-log-viewer--entry-count 0)
-                                   (json-log-viewer--boundary-overlay direction)))
-               (boundary (and entry-overlay
-                              (json-log-viewer--overlay-load-more-boundary entry-overlay)))
-               (boundary-timestamp (or (nth 0 boundary) timestamp))
-               (boundary-entry-id (nth 1 boundary)))
-          (json-log-viewer-load-more (current-buffer)
-                                     chunk-size
-                                     direction
-                                     boundary-timestamp
-                                     (eq direction 'before)
-                                     boundary-entry-id))
-        (json-log-viewer--await-load-more-complete)
-        (setq remaining (- remaining chunk-size))
-        (setq direction (if (eq direction 'before) 'after 'before)))
-      (when-let ((anchor (json-log-viewer--entry-overlay-closest-to-timestamp timestamp)))
-        (json-log-viewer--set-point-to-entry-overlay anchor))
-      (message "Loaded window around selected time: %d entries (chunk=%d)"
-               json-log-viewer--entry-count
-               chunk-size))))
+      (message "Loading window around %s..." timestamp)
+      (json-log-viewer--window-at-time-step max-entries 'before timestamp chunk-size))))
 
 (defun json-log-viewer-toggle-auto-follow ()
   "Toggle automatic scrolling to newest entries."
