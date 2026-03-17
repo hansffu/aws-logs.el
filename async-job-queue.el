@@ -158,6 +158,8 @@ function texts."
 PROCESS-FUNC runs in a subordinate Emacs for each pushed element.
 CALLBACK-FUNC runs in the current Emacs with the processed result.
 INIT-FUNC runs once in worker Emacs before processing jobs when non-nil.
+  If INIT-FUNC raises an error the queue is permanently dead: all pending
+  jobs are flushed with an error result and no further jobs can be pushed.
 TEARDOWN-FUNC runs once in worker Emacs during stop when non-nil.
 
 Returns an `async-job-queue' object."
@@ -245,6 +247,19 @@ Returns an `async-job-queue' object."
         (setf (async-job-queue-pending-tail queue) nil))
       id)))
 
+(defun async-job-queue--flush-pending-with-error (queue message-text)
+  "Call QUEUE callback with error for every pending job, then clear pending state.
+MESSAGE-TEXT is the error string passed to each callback."
+  (let ((callback (async-job-queue-callback-func queue)))
+    (while (not (async-job-queue--pending-empty-p queue))
+      (async-job-queue--pending-pop queue)
+      (condition-case err
+          (funcall callback (list :error message-text))
+        (error
+         (message "async-job-queue callback error: %s"
+                  (error-message-string err))))))
+  (clrhash (async-job-queue-ready-results queue)))
+
 (defun async-job-queue--dispatch-ready-results (queue)
   "Dispatch available callback results from QUEUE in push order."
   (let ((ready (async-job-queue-ready-results queue))
@@ -291,7 +306,8 @@ Returns an `async-job-queue' object."
                           (list :error message-text))
                (error
                 (message "async-job-queue callback error: %s"
-                         (error-message-string callback-err)))))
+                         (error-message-string callback-err))))
+             (async-job-queue--flush-pending-with-error queue message-text))
             (_
              (message "async-job-queue: unknown worker message: %S" msg))))
       (error
@@ -326,7 +342,10 @@ Returns an `async-job-queue' object."
   (unless (async-job-queue-stopped-p queue)
     (setf (async-job-queue-stopped-p queue) t)
     (setf (async-job-queue-stopping-p queue) nil)
-    (message "async-job-queue worker exited: %s" (string-trim event)))
+    (message "async-job-queue worker exited: %s" (string-trim event))
+    (unless (async-job-queue--pending-empty-p queue)
+      (async-job-queue--flush-pending-with-error
+       queue "Worker process exited unexpectedly")))
   (async-job-queue--cleanup-buffer queue))
 
 (defun async-job-queue--queue-live-p (queue)
