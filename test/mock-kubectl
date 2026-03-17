@@ -38,6 +38,7 @@ MESSAGES = [
     "Request processed successfully",
     "Background job started",
     "Health check passed",
+    "En norsk feilmelding med æøå",
     "Connection pool refreshed",
     "Config reloaded",
     "Rate limit threshold reached",

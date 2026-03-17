@@ -479,7 +479,8 @@ ON-READY is called once the async worker is ready to receive jobs."
 
 (defun kube-logs--consume-chunk-lines (chunk)
   "Consume process CHUNK and return complete lines in current buffer."
-  (let* ((combined (concat kube-logs--pending-fragment chunk))
+  (let* ((combined (concat kube-logs--pending-fragment
+                           (replace-regexp-in-string "\r" "" chunk)))
          (has-newline (string-suffix-p "\n" combined))
          (parts (split-string combined "\n"))
          (complete-lines (if has-newline parts (butlast parts)))
@@ -615,6 +616,7 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
            :buffer output-buffer
            :command command
            :noquery t
+           :coding 'utf-8-unix
            :connection-type 'pipe
            :sentinel
            (lambda (proc event)
@@ -663,6 +665,7 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
                              :buffer buffer
                              :command command
                              :noquery t
+                             :coding 'utf-8-unix
                              :connection-type 'pipe)))
                (set-process-filter process #'kube-logs--stream-process-filter)
                (set-process-sentinel process #'kube-logs--stream-process-sentinel)

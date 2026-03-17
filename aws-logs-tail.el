@@ -360,7 +360,8 @@ ON-READY is called once the async worker is ready to receive jobs."
 
 (defun aws-logs--tail-consume-chunk-lines (chunk)
   "Consume process CHUNK in current ECS buffer and return complete lines."
-  (let* ((combined (concat aws-logs--tail-pending-fragment chunk))
+  (let* ((combined (concat aws-logs--tail-pending-fragment
+                           (replace-regexp-in-string "\r" "" chunk)))
          (has-newline (string-suffix-p "\n" combined))
          (parts (split-string combined "\n"))
          (complete-lines (if has-newline parts (butlast parts)))
@@ -608,6 +609,7 @@ When FLUSH-NOW is non-nil, flush immediately."
                     :buffer buffer
                     :command command
                     :noquery t
+                    :coding 'utf-8-unix
                     :connection-type 'pipe)))
       (with-current-buffer buffer
         (setq-local aws-logs--tail-process process)
@@ -633,6 +635,7 @@ When FLUSH-NOW is non-nil, flush immediately."
             :buffer output-buffer
             :command command
             :noquery t
+            :coding 'utf-8-unix
             :connection-type 'pipe
             :sentinel
             (lambda (proc event)
@@ -681,6 +684,7 @@ When FLUSH-NOW is non-nil, flush immediately."
                              :buffer buffer
                              :command command
                              :noquery t
+                             :coding 'utf-8-unix
                              :connection-type 'pipe
                              :filter #'aws-logs--tail-ecs-process-filter
                              :sentinel #'aws-logs--tail-ecs-process-sentinel)))

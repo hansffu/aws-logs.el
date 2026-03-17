@@ -698,5 +698,13 @@
       (when (buffer-live-p (get-buffer help-buffer-name))
         (kill-buffer help-buffer-name)))))
 
+(ert-deftest aws-logs-tail-consume-chunk-lines-strips-cr-test ()
+  "Lines from CRLF sources should not contain trailing \\r."
+  (with-temp-buffer
+    (setq-local aws-logs--tail-pending-fragment "")
+    (let ((lines (aws-logs--tail-consume-chunk-lines
+                  "line-one\r\nline-two\r\n")))
+      (should (equal lines '("line-one" "line-two" ""))))))
+
 (provide 'aws-logs-core-test)
 ;;; aws-logs-core-test.el ends here

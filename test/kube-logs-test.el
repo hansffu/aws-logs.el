@@ -167,5 +167,13 @@
     (should (= kube-logs-tail-lines 500))
     (should (equal kube-logs-since "15m"))))
 
+(ert-deftest kube-logs-consume-chunk-lines-strips-cr-test ()
+  "Lines from CRLF sources should not contain trailing \\r."
+  (with-temp-buffer
+    (setq-local kube-logs--pending-fragment "")
+    (let ((lines (kube-logs--consume-chunk-lines
+                  "line-one\r\nline-two\r\n")))
+      (should (equal lines '("line-one" "line-two" ""))))))
+
 (provide 'kube-logs-test)
 ;;; kube-logs-test.el ends here
