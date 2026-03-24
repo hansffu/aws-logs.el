@@ -109,6 +109,12 @@ Set this to match your log format, e.g. \\='(\"payload.service.name\")."
   :type '(repeat string)
   :group 'kube-logs)
 
+(defcustom kube-logs-timestamp-path "timestamp"
+  "Path to the timestamp field in the log JSON.
+Set this to match your log format, e.g. \"@timestamp\"."
+  :type 'string
+  :group 'kube-logs)
+
 (defgroup kube-logs nil
   "Kubernetes logs transient UI and rendering."
   :group 'tools)
@@ -407,7 +413,7 @@ ON-READY is called once the async worker is ready to receive jobs."
     (setq buffer
           (json-log-viewer-make-buffer
            buffer-name
-           :timestamp-path "timestamp"
+           :timestamp-path kube-logs-timestamp-path
            :level-path kube-logs-level-path
            :message-path kube-logs-message-path
            :extra-paths kube-logs-extra-paths
@@ -888,6 +894,110 @@ This stores one active target; choosing pod/deployment replaces the other."
   (kube-logs--sync-session-from-transient)
   (kube-logs-run))
 
+(transient-define-infix kube-logs-infix-timestamp-path ()
+  :description "Timestamp path"
+  :class 'transient-option
+  :allow-empty t
+  :init-value (lambda (obj) (transient-infix-set obj kube-logs-timestamp-path))
+  :reader (lambda (_prompt initial _hist)
+            (let ((input (string-trim (read-string "Timestamp path (empty=unset): "
+                                                   (or initial "")))))
+              (setq kube-logs-timestamp-path
+                    (unless (string-empty-p input) input))
+              input))
+  :argument "--timestamp-path=")
+
+(transient-define-infix kube-logs-infix-level-path ()
+  :description "Level path"
+  :class 'transient-option
+  :allow-empty t
+  :init-value (lambda (obj) (transient-infix-set obj kube-logs-level-path))
+  :reader (lambda (_prompt initial _hist)
+            (let ((input (string-trim (read-string "Level path (empty=unset): "
+                                                   (or initial "")))))
+              (setq kube-logs-level-path
+                    (unless (string-empty-p input) input))
+              input))
+  :argument "--level-path=")
+
+(transient-define-infix kube-logs-infix-message-path ()
+  :description "Message path"
+  :class 'transient-option
+  :allow-empty t
+  :init-value (lambda (obj) (transient-infix-set obj kube-logs-message-path))
+  :reader (lambda (_prompt initial _hist)
+            (let ((input (string-trim (read-string "Message path (empty=unset): "
+                                                   (or initial "")))))
+              (setq kube-logs-message-path
+                    (unless (string-empty-p input) input))
+              input))
+  :argument "--message-path=")
+
+(defun kube-logs--formatting-reprompt ()
+  "Refresh the formatting transient."
+  (transient-quit-one)
+  (transient-setup 'kube-logs-formatting-transient))
+
+(defun kube-logs--formatting-extra-summary ()
+  "Return one-line summary of currently configured extra paths."
+  (if kube-logs-extra-paths
+      (string-join kube-logs-extra-paths ", ")
+    "none"))
+
+(transient-define-suffix kube-logs-formatting-extra-add ()
+  "Add one extra summary path."
+  :transient t
+  (interactive)
+  (let ((input (string-trim (read-string "Add extra path: "))))
+    (when (string-empty-p input)
+      (user-error "Path cannot be empty"))
+    (unless (member input kube-logs-extra-paths)
+      (setq kube-logs-extra-paths
+            (append kube-logs-extra-paths (list input))))
+    (kube-logs--formatting-reprompt)))
+
+(transient-define-suffix kube-logs-formatting-extra-delete ()
+  "Delete one extra summary path."
+  :transient t
+  (interactive)
+  (unless kube-logs-extra-paths
+    (user-error "No extra paths to delete"))
+  (let ((selection (completing-read "Delete extra path: "
+                                    kube-logs-extra-paths nil t)))
+    (setq kube-logs-extra-paths
+          (delete selection (copy-sequence kube-logs-extra-paths)))
+    (kube-logs--formatting-reprompt)))
+
+(transient-define-suffix kube-logs-formatting-done ()
+  "Return from formatting transient to the main transient."
+  :transient nil
+  (interactive)
+  (transient-quit-one)
+  (transient-setup 'kube-logs-transient))
+
+(transient-define-prefix kube-logs-formatting-transient ()
+  "Formatting options for kube-logs JSON-path rendering."
+  :remember-value 'exit
+  [["Fields"
+    ("t" "Timestamp path" kube-logs-infix-timestamp-path)
+    ("l" "Level path" kube-logs-infix-level-path)
+    ("m" "Message path" kube-logs-infix-message-path)]
+
+   [4 :description (lambda () (format "Extras: %s" (kube-logs--formatting-extra-summary)))
+      ("a" "Add extra path" kube-logs-formatting-extra-add)
+      ("d" "Delete extra path" kube-logs-formatting-extra-delete)]]
+
+  [["Done"
+    ("RET" "Back to main" kube-logs-formatting-done)]]
+  (interactive)
+  (transient-setup 'kube-logs-formatting-transient))
+
+(transient-define-suffix kube-logs-open-formatting ()
+  "Open formatting transient."
+  :transient nil
+  (interactive)
+  (transient-setup 'kube-logs-formatting-transient))
+
 (defun kube-logs--sync-session-from-transient ()
   "Sync backing session vars from active `kube-logs-transient` infix args."
   (when (and (boundp 'transient-current-command)
@@ -919,12 +1029,12 @@ This stores one active target; choosing pod/deployment replaces the other."
    ["Target"
     ("c" kube-logs-select-context)
     ("n" kube-logs-set-namespace)
-    ("-n" kube-logs-set-namespace)
     ("p" kube-logs-select-pod)
     ("d" kube-logs-select-deployment)]]
   [[4 :description (lambda () (format "Active target: %s" (kube-logs--target-description)))]]
   [["Actions"
-    ("RET" "Run logs" kube-logs-action-run)]]
+    ("RET" "Run logs" kube-logs-action-run)
+    ("f" "Formatting…" kube-logs-open-formatting)]]
   (interactive)
   (transient-setup 'kube-logs-transient))
 
