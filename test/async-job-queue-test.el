@@ -101,3 +101,33 @@ Return the predicate value when available, nil on timeout."
       (when (file-exists-p marker-path)
         (delete-file marker-path)))))
 
+(ert-deftest async-job-queue-ignores-print-truncation-settings-test ()
+  (let ((events nil)
+        (print-length 3)
+        (print-level 2)
+        queue)
+    (unwind-protect
+        (progn
+          (setq queue
+                (async-job-queue-create
+                 (lambda (job)
+                   (list (plist-get job :line)
+                         (plist-get job :extra-paths)))
+                 (lambda (result) (push result events))))
+          (async-job-queue-push
+           queue
+           (list :op 'ingest
+                 :line "{\"message\":\"hello\"}"
+                 :worker-file "/tmp/worker.el"
+                 :timestamp-path "timestamp"
+                 :level-path "level"
+                 :message-path "message"
+                 :extra-paths '("topic" "partition")
+                 :json-paths '("payload" "headers")))
+          (should (async-job-queue-test--wait-until
+                   (lambda () events)
+                   (async-job-queue-process queue)))
+          (should (equal (car events)
+                         '("{\"message\":\"hello\"}" ("topic" "partition")))))
+      (when (and queue (process-live-p (async-job-queue-process queue)))
+        (async-job-queue-stop queue)))))

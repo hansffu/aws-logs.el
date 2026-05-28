@@ -40,9 +40,17 @@
            (if (and (stringp invocation-directory)
                     (not (string-empty-p invocation-directory)))
                (expand-file-name invocation-name invocation-directory)
-             (executable-find invocation-name)))
+	     (executable-find invocation-name)))
       (executable-find "emacs")
       "emacs"))
+
+(defun async-job-queue--prin1-to-string (object)
+  "Return a complete readable representation of OBJECT for queue protocol."
+  (let ((print-length nil)
+        (print-level nil)
+        (print-escape-newlines t)
+        (print-escape-control-characters t))
+    (prin1-to-string object)))
 
 (defun async-job-queue--serialize-function (func label)
   "Serialize FUNC as readable Lisp source, or raise user-error.
@@ -52,7 +60,7 @@ LABEL is used in error messages."
   (let* ((resolved (if (symbolp func)
                        (or (symbol-function func) func)
                      func))
-         (text (prin1-to-string resolved)))
+         (text (async-job-queue--prin1-to-string resolved)))
     (condition-case err
         (let ((parsed (car (read-from-string text))))
           (unless (functionp parsed)
@@ -76,7 +84,7 @@ LABEL is used in error messages."
 ENCODED-PROCESS-FUNC is base64-encoded PROCESS-FUNC text.
 ENCODED-INIT-FUNC and ENCODED-TEARDOWN-FUNC are optional base64-encoded
 function texts."
-  (prin1-to-string
+  (async-job-queue--prin1-to-string
    `(let* ((process-func-text (base64-decode-string ,encoded-process-func))
            (init-func-text ,encoded-init-func)
            (teardown-func-text ,encoded-teardown-func)
@@ -105,7 +113,9 @@ function texts."
                  (list :event async-job-queue--worker-current-id payload)))
       (let ((debug-on-error nil)
             (send (lambda (message)
-                    (let ((print-escape-newlines t)
+                    (let ((print-length nil)
+                          (print-level nil)
+                          (print-escape-newlines t)
                           (print-escape-control-characters t))
                       (princ (prin1-to-string message) 'external-debugging-output))
                     (princ "\n" 'external-debugging-output)))
@@ -218,7 +228,7 @@ Returns an `async-job-queue' object."
 
 (defun async-job-queue--serialize-command (command)
   "Serialize COMMAND to one protocol line."
-  (concat (prin1-to-string command) "\n"))
+  (concat (async-job-queue--prin1-to-string command) "\n"))
 
 (defun async-job-queue--pending-empty-p (queue)
   "Return non-nil when QUEUE has no pending callback ids."

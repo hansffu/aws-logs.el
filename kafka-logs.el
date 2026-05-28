@@ -753,6 +753,10 @@ ON-READY is called once the async worker is ready to receive jobs."
           (kafka-logs--normalize-extra-paths
            kafka-logs-extra-paths
            "kafka-logs-extra-paths"))
+         (json-paths
+          (kafka-logs--normalize-json-paths
+           kafka-logs-json-paths
+           "kafka-logs-json-paths"))
          (message-path
           (kafka-logs--normalize-message-path
            kafka-logs-message-path
@@ -766,7 +770,7 @@ ON-READY is called once the async worker is ready to receive jobs."
            :timestamp-path "timestamp"
            :message-path message-path
            :extra-paths extra-paths
-           :json-paths kafka-logs-json-paths
+           :json-paths json-paths
            :mode #'kafka-logs-viewer-mode
            :header-lines-function #'kafka-logs--viewer-header-lines
            :on-ready on-ready))
@@ -785,7 +789,7 @@ ON-READY is called once the async worker is ready to receive jobs."
       (setq-local kafka-logs--viewer-filter kafka-logs-filter)
       (setq-local kafka-logs--viewer-payload-format kafka-logs-payload-format)
       (setq-local kafka-logs--viewer-message-path message-path)
-      (setq-local kafka-logs--viewer-json-paths kafka-logs-json-paths)
+      (setq-local kafka-logs--viewer-json-paths json-paths)
       (add-hook 'kill-buffer-hook
                 (lambda ()
                   (kafka-logs--kill-buffer-process (current-buffer)))
