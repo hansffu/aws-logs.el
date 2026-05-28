@@ -480,7 +480,7 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
   "Return worker init function for WORKER-FILE."
   (eval
    `(lambda ()
-      (let ((worker-file ,worker-file))
+      (let ((worker-file ',worker-file))
         (unless (and (stringp worker-file)
                      (file-readable-p worker-file))
           (error "Async worker file is unreadable: %S" worker-file))
@@ -492,9 +492,9 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
           (unless (fboundp 'json-log-viewer-async-worker-init)
             (error "Missing async worker init entrypoint in %s" worker-file)))
         (json-log-viewer-async-worker-init
-         (list :max-entries ,max-entries
-               :chunk-size ,chunk-size
-               :rebuild-chunk-size ,rebuild-chunk-size))
+         (list :max-entries ',max-entries
+               :chunk-size ',chunk-size
+               :rebuild-chunk-size ',rebuild-chunk-size))
         (funcall async-job-queue--worker-send-func
                  '(:event nil (:worker-ready t)))))))
 
@@ -502,7 +502,7 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
   "Return worker teardown function for WORKER-FILE."
   (eval
    `(lambda ()
-      (let ((worker-file ,worker-file))
+      (let ((worker-file ',worker-file))
         (unless (and (stringp worker-file)
                      (file-readable-p worker-file))
           (error "Async worker file is unreadable: %S" worker-file))
@@ -532,9 +532,19 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
   (json-log-viewer--stop-async-queue)
   (let ((buffer (current-buffer))
         (worker-file (json-log-viewer--async-worker-file))
-        (max-entries json-log-viewer--stream-max-entries)
-        (chunk-size json-log-viewer-stream-chunk-size)
-        (rebuild-chunk-size json-log-viewer-rebuild-chunk-size))
+        (max-entries
+         (json-log-viewer--normalize-positive-integer-setting
+          json-log-viewer--stream-max-entries
+          "json-log-viewer-stream-max-entries"
+          t))
+        (chunk-size
+         (json-log-viewer--normalize-positive-integer-setting
+          json-log-viewer-stream-chunk-size
+          "json-log-viewer-stream-chunk-size"))
+        (rebuild-chunk-size
+         (json-log-viewer--normalize-positive-integer-setting
+          json-log-viewer-rebuild-chunk-size
+          "json-log-viewer-rebuild-chunk-size")))
     (setq-local json-log-viewer--async-next-request-id 0)
     (setq-local json-log-viewer--async-queue
                 (async-job-queue-create
@@ -622,6 +632,21 @@ Return request id."
         (when (not (string-empty-p trimmed))
           (push trimmed normalized))))
     (nreverse (delete-dups normalized))))
+
+(defun json-log-viewer--normalize-positive-integer-setting
+    (value setting &optional allow-nil)
+  "Validate VALUE for positive integer SETTING.
+When ALLOW-NIL is non-nil, nil is accepted and returned."
+  (cond
+   ((and allow-nil (null value))
+    nil)
+   ((and (integerp value) (> value 0))
+    value)
+   (t
+    (user-error "%s must be %sa positive integer, got: %S"
+                setting
+                (if allow-nil "nil or " "")
+                value))))
 
 (defun json-log-viewer--fontify-json-string (value)
   "Return VALUE with JSON syntax highlighting."

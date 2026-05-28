@@ -78,6 +78,19 @@
     (should (= 10 (plist-get (car entries) :id)))
     (should (= 11 (plist-get (cadr entries) :id)))))
 
+(ert-deftest json-log-viewer-invalid-stream-max-entries-errors-before-worker-test ()
+  (let ((json-log-viewer-stream-max-entries '\...)
+        err)
+    (setq err
+          (should-error
+           (json-log-viewer-make-buffer "*json-log-viewer-invalid-max*"
+                                        :message-path "message")
+           :type 'user-error))
+    (should (string-match-p "json-log-viewer-stream-max-entries"
+                            (error-message-string err)))
+    (should-not (string-match-p "void"
+                                (error-message-string err)))))
+
 (ert-deftest json-log-viewer-resolve-path-renders-json-on-one-line-test ()
   (let* ((parsed (json-parse-string
                   "{\"payload\":{\"data\":{\"name\":\"alice\"},\"events\":[{\"id\":1},{\"id\":2}]}}"
