@@ -13,6 +13,9 @@
 (defvar kafka-logs-time-range)
 (defvar kafka-logs-filter)
 (defvar kafka-logs-max-messages)
+(defvar kafka-logs-value-format)
+(defvar kafka-logs--detected-value-format)
+(defvar kafka-logs-payload-format)
 (defvar kafka-logs-json-paths)
 (defvar kafka-logs-extra-paths)
 (defvar kafka-logs-message-path)
@@ -45,24 +48,30 @@
   (let ((kafka-logs-topic "orders")
         (kafka-logs-stream t)
         (kafka-logs-time-range nil)
-        (kafka-logs-max-messages nil))
+        (kafka-logs-max-messages nil)
+        (kafka-logs-value-format 'json)
+        (kafka-logs--detected-value-format nil))
     (cl-letf (((symbol-function 'kafka-logs--connection-base-args)
                (lambda () '("-b" "localhost:9092"))))
       (should (equal (kafka-logs--consume-args)
                      '("-b" "localhost:9092"
-                       "-C" "-J" "-u" "-q" "-t" "orders"
+                       "-C" "-u" "-q" "-t" "orders"
+                       "-J"
                        "-o" "end"))))))
 
 (ert-deftest kafka-logs-consume-args-time-span-test ()
   (let ((kafka-logs-topic "orders")
         (kafka-logs-stream nil)
         (kafka-logs-time-range '("1000" . "2000"))
-        (kafka-logs-max-messages 75))
+        (kafka-logs-max-messages 75)
+        (kafka-logs-value-format 'json)
+        (kafka-logs--detected-value-format nil))
     (cl-letf (((symbol-function 'kafka-logs--connection-base-args)
                (lambda () '("-b" "localhost:9092"))))
       (should (equal (kafka-logs--consume-args)
                      '("-b" "localhost:9092"
-                       "-C" "-J" "-u" "-q" "-t" "orders"
+                       "-C" "-u" "-q" "-t" "orders"
+                       "-J"
                        "-o" "s@1000"
                        "-o" "e@2000"
                        "-e"
@@ -72,14 +81,17 @@
   (let ((kafka-logs-topic "orders")
         (kafka-logs-stream nil)
         (kafka-logs-time-range '("1000"))
-        (kafka-logs-max-messages nil))
+        (kafka-logs-max-messages nil)
+        (kafka-logs-value-format 'json)
+        (kafka-logs--detected-value-format nil))
     (cl-letf (((symbol-function 'kafka-logs--connection-base-args)
                (lambda () '("-b" "localhost:9092")))
               ((symbol-function 'float-time)
                (lambda (&optional _time) 2.0)))
       (should (equal (kafka-logs--consume-args)
                      '("-b" "localhost:9092"
-                       "-C" "-J" "-u" "-q" "-t" "orders"
+                       "-C" "-u" "-q" "-t" "orders"
+                       "-J"
                        "-o" "s@1000"
                        "-o" "e@2000"
                        "-e"))))))
@@ -87,7 +99,8 @@
 (ert-deftest kafka-logs-line->json-line-json-payload-test ()
   (with-temp-buffer
     (setq-local kafka-logs--viewer-connection "prod")
-    (let* ((line
+    (let* ((kafka-logs-payload-format nil)
+           (line
             (concat
              "{\"topic\":\"orders\",\"partition\":2,\"offset\":9,"
              "\"ts\":1700000000123,\"key\":\"order-1\","
@@ -105,6 +118,124 @@
                      "{\"level\":\"warn\",\"message\":\"boom\"}"))
       (should (equal (alist-get 'timestamp parsed)
                      (kafka-logs--epoch-ms->iso8601 1700000000123))))))
+
+(ert-deftest kafka-logs-schema-registry-auth-source-test ()
+  (let ((kafka-logs-connection "prod")
+        (kafka-logs-connections
+         '(("prod" . (:brokers "kafka.example.com:9093"
+                     :schema-registry-url "https://sr.example.com:8081"
+                     :schema-registry-auth-source t)))))
+    (cl-letf (((symbol-function 'auth-source-search)
+               (lambda (&rest spec)
+                 (should (equal (plist-get spec :host) "sr.example.com"))
+                 (should (equal (plist-get spec :port) "8081"))
+                 (list '(:user "alice"
+                         :secret (lambda () "pw"))))))
+      (should (equal (kafka-logs--schema-registry-basic-auth-header
+                      (kafka-logs--connection-plist)
+                      "https://sr.example.com:8081")
+                     "Basic YWxpY2U6cHc="))
+      (should (equal (kafka-logs--schema-registry-kcat-url)
+                     "https://alice:pw@sr.example.com:8081")))))
+
+(ert-deftest kafka-logs-schema-registry-kcat-url-uses-raw-userinfo-test ()
+  (let ((kafka-logs-connection "prod")
+        (kafka-logs-connections
+         '(("prod" . (:brokers "kafka.example.com:9093"
+                     :schema-registry-url "https://sr.example.com"
+                     :schema-registry-username "api-key"
+                     :schema-registry-password "a+b/c=")))))
+    (should (equal (kafka-logs--schema-registry-kcat-url)
+                   "https://api-key:a+b/c=@sr.example.com"))))
+
+(ert-deftest kafka-logs-schema-registry-auth-source-omits-default-port-test ()
+  (let ((kafka-logs-connection "prod")
+        (kafka-logs-connections
+         '(("prod" . (:brokers "kafka.example.com:9093"
+                     :schema-registry-url "https://sr.example.com"
+                     :schema-registry-username "alice"
+                     :schema-registry-auth-source t))))
+        seen)
+    (cl-letf (((symbol-function 'auth-source-search)
+               (lambda (&rest spec)
+                 (push spec seen)
+                 (when (not (plist-member spec :port))
+                   (list '(:user "alice"
+                           :secret (lambda () "pw")))))))
+      (should (equal (kafka-logs--schema-registry-credentials
+                      (kafka-logs--connection-plist)
+                      "https://sr.example.com")
+                     '("alice" "pw")))
+      (should (= (length seen) 1))
+      (should-not (plist-member (car seen) :port)))))
+
+(ert-deftest kafka-logs-schema-registry-auth-source-missing-secret-errors-test ()
+  (let ((kafka-logs-connection "prod")
+        (kafka-logs-connections
+         '(("prod" . (:brokers "kafka.example.com:9093"
+                     :schema-registry-url "https://sr.example.com"
+                     :schema-registry-username "alice"
+                     :schema-registry-auth-source t)))))
+    (cl-letf (((symbol-function 'auth-source-search)
+               (lambda (&rest _spec) nil)))
+      (should-error
+       (kafka-logs--schema-registry-basic-auth-header
+        (kafka-logs--connection-plist)
+        "https://sr.example.com")
+       :type 'user-error))))
+
+(ert-deftest kafka-logs-consume-args-avro-test ()
+  (let ((kafka-logs-connection "prod")
+        (kafka-logs-connections
+         '(("prod" . (:brokers "localhost:9092"
+                     :schema-registry-url "https://sr.example.com:8081"
+                     :schema-registry-username "alice"
+                     :schema-registry-password "pw"))))
+        (kafka-logs-topic "orders")
+        (kafka-logs-stream t)
+        (kafka-logs-time-range nil)
+        (kafka-logs-max-messages nil)
+        (kafka-logs-value-format 'avro)
+        (kafka-logs--detected-value-format nil))
+    (should (equal (kafka-logs--consume-args)
+                   '("-b" "localhost:9092"
+                     "-C" "-u" "-q" "-t" "orders"
+                     "-s" "value=avro"
+                     "-r" "https://alice:pw@sr.example.com:8081"
+                     "-f"
+                     "{\"topic\":\"%t\",\"partition\":%p,\"offset\":%o,\"ts\":%T,\"payload\":%s}\\n"
+                     "-o" "end")))))
+
+(ert-deftest kafka-logs-detect-topic-value-format-avro-test ()
+  (let ((kafka-logs-connection "prod")
+        (kafka-logs-connections
+         '(("prod" . (:brokers "localhost:9092"
+                     :schema-registry-url "http://sr:8081"))))
+        captured-subject)
+    (cl-letf (((symbol-function 'kafka-logs--schema-registry-fetch-subject)
+               (lambda (subject)
+                 (setq captured-subject subject)
+                 '((schemaType . "AVRO")))))
+      (should (eq (kafka-logs--detect-topic-value-format "orders") 'avro))
+      (should (equal captured-subject "orders-value")))))
+
+(ert-deftest kafka-logs-apply-topic-selection-switches-auto-format-test ()
+  (let ((kafka-logs-topic nil)
+        (kafka-logs-value-format 'auto)
+        (kafka-logs--detected-value-format nil)
+        (kafka-logs-payload-format nil)
+        (formats '(avro json)))
+    (cl-letf (((symbol-function 'kafka-logs--detect-topic-value-format)
+               (lambda (_topic)
+                 (pop formats))))
+      (kafka-logs--apply-topic-selection "orders")
+      (should (equal kafka-logs-topic "orders"))
+      (should (eq kafka-logs--detected-value-format 'avro))
+      (should (eq kafka-logs-payload-format 'json))
+      (kafka-logs--apply-topic-selection "payments")
+      (should (equal kafka-logs-topic "payments"))
+      (should (eq kafka-logs--detected-value-format 'json))
+      (should (eq kafka-logs-payload-format 'json)))))
 
 (ert-deftest kafka-logs-line->json-line-json-payload-with-message-path-test ()
   (with-temp-buffer

@@ -349,7 +349,9 @@ rendered in ~json-log-viewer~.
 - Stream new messages from topic end.
 - Look up messages in a FROM/TO time span.
 - Optional regex filtering with ~grep~.
-- Optional payload decoding mode for JSON message bodies.
+- Automatic Avro detection through Schema Registry using conventional
+  ~<topic>-value~ subjects.
+- Optional payload rendering mode for JSON message bodies.
 - Configurable summary message JSON path (including nested paths).
 - Configurable summary extra JSON paths.
 - Optional JSON-path detail rendering (for example ~payload~ as pretty JSON block).
@@ -374,6 +376,7 @@ Put ~kafka-logs.el~ and ~json-log-viewer.el~ on your ~load-path~.
   (kafka-logs-default-connection "prod")
   (kafka-logs-default-topic "orders.events")
   (kafka-logs-default-stream t)
+  (kafka-logs-default-value-format 'auto)
   (kafka-logs-default-message-path "payload.data.name")
   (kafka-logs-default-extra-paths '("connection" "topic" "partition"))
   (kafka-logs-default-payload-format 'json)
@@ -387,10 +390,24 @@ Put ~kafka-logs.el~ and ~json-log-viewer.el~ on your ~load-path~.
    :security-protocol "SASL_SSL"
    :sasl-mechanisms "SCRAM-SHA-512"
    :auth-source t
+   :schema-registry-url "https://schema-registry-prod:8081"
+   :schema-registry-auth-source t
    :properties '(("client.id" . "emacs-kafka-logs"))))
 #+end_src
 
-You can provide explicit auth-source query settings with ~:auth-source~ plist:
+For Schema Registry auth-source lookup with an HTTPS URL that omits a port,
+the matching authinfo entry can omit the port too:
+
+#+begin_src authinfo
+machine schema-registry-staging login SR_API_KEY password SR_API_SECRET
+#+end_src
+
+If ~:schema-registry-auth-source~ or ~:schema-registry-username~ is configured
+but no password is found, ~kafka-logs~ fails before making the Schema Registry
+request so Emacs' URL layer does not prompt for HTTP credentials.
+
+You can provide explicit auth-source query settings with ~:auth-source~ and
+~:schema-registry-auth-source~ plists:
 
 #+begin_src emacs-lisp
 (kafka-logs-make-connection
@@ -398,7 +415,10 @@ You can provide explicit auth-source query settings with ~:auth-source~ plist:
  :brokers "kafka-staging:9093"
  :security-protocol "SASL_SSL"
  :sasl-mechanisms "PLAIN"
- :auth-source '(:host "kafka-staging" :port 9093 :user "staging-user"))
+ :auth-source '(:host "kafka-staging" :port 9093 :user "staging-user")
+ :schema-registry-url "https://schema-registry-staging:8081"
+ :schema-registry-auth-source
+ '(:host "schema-registry-staging" :port 8081 :user "sr-api-key"))
 #+end_src
 
 ** Usage
@@ -413,11 +433,28 @@ Main transient keys:
 - ~a~ set FROM time (time-span mode)
 - ~z~ set TO time (time-span mode)
 - ~-F~ set regex filter
+- ~-v~ set value wire format (auto/json/avro/string)
 - ~-M~ set summary message path (for example ~payload~, ~payload.data.name~)
 - ~-j~ set json detail paths (comma-separated, e.g. ~payload,payload.log~)
-- ~-p~ toggle payload format (string/json)
+- ~-p~ toggle payload rendering (string/json)
 - ~-m~ set max message count for time-span mode
 - ~RET~ run logs
+
+In ~auto~ value format, selecting a topic checks Schema Registry for a
+conventional ~<topic>-value~ subject.  If the subject exists and is Avro,
+~kafka-logs~ runs ~kcat~ with ~-s value=avro -r <schema-registry-url>~.
+Selecting a topic without an Avro subject switches the resolved format back to
+JSON.  This detection supports the default TopicNameStrategy; topics using
+RecordNameStrategy or TopicRecordNameStrategy can be selected manually with
+~-v~.
+
+Avro consumption intentionally avoids kcat's ~-J~ envelope and uses a format
+string wrapper instead.  Some kcat builds support both JSON and Avro but lack
+JSON-verbatim support, which is required for ~-J -s value=avro~.
+Schema Registry credentials are embedded in kcat's ~-r~ URL because some
+kcat/libserdes builds reject Schema Registry auth properties passed through
+~-X~.  The userinfo is left unescaped for compatibility with libserdes-backed
+kcat builds.
 
 When the selected message path resolves to a JSON object or array, it is
 rendered as compact one-line JSON in the summary line.

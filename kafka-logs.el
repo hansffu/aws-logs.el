@@ -20,6 +20,9 @@
 (require 'json)
 (require 'subr-x)
 (require 'transient)
+(require 'url)
+(require 'url-parse)
+(require 'url-util)
 
 (require 'json-log-viewer)
 
@@ -92,7 +95,21 @@ When nil, kafka-logs does not set `-c` for kcat."
   :type '(choice (const :tag "No limit" nil) integer)
   :group 'kafka-logs)
 
-(defcustom kafka-logs-default-payload-format nil
+(defcustom kafka-logs-default-value-format 'auto
+  "Default Kafka value wire format for new Emacs sessions.
+
+When set to `auto`, kafka-logs checks Schema Registry for the selected topic
+and uses Avro when a conventional `<topic>-value` Avro subject exists.
+When set to `avro`, kafka-logs asks kcat to deserialize values with Schema
+Registry.  `json` and `string` keep kcat's raw payload and differ only in the
+default payload rendering choice."
+  :type '(choice (const :tag "Auto" auto)
+                 (const :tag "JSON" json)
+                 (const :tag "Avro" avro)
+                 (const :tag "String/raw" string))
+  :group 'kafka-logs)
+
+(defcustom kafka-logs-default-payload-format 'json
   "Default payload rendering format for new Emacs sessions.
 
 When set to `json`, kafka-logs attempts to parse string payloads as JSON and
@@ -163,6 +180,14 @@ Value is nil or (FROM . TO), where both are date-time strings.")
 (defvar kafka-logs-max-messages kafka-logs-default-max-messages
   "Maximum message count for this Emacs session in time-span mode, or nil.")
 
+(defvar kafka-logs-value-format kafka-logs-default-value-format
+  "Kafka value wire format for this Emacs session.
+
+Allowed values are `auto`, `json`, `avro`, and `string`.")
+
+(defvar kafka-logs--detected-value-format nil
+  "Detected Kafka value wire format for the selected topic, or nil.")
+
 (defvar kafka-logs-payload-format kafka-logs-default-payload-format
   "Payload rendering format for this Emacs session, or nil.")
 
@@ -219,6 +244,12 @@ Each element has the form (NAME . PLIST).")
 (defvar-local kafka-logs--viewer-payload-format nil
   "Payload format shown in current viewer buffer header.")
 
+(defvar-local kafka-logs--viewer-value-format nil
+  "Selected value wire format shown in current viewer buffer header.")
+
+(defvar-local kafka-logs--viewer-detected-value-format nil
+  "Detected value wire format shown in current viewer buffer header.")
+
 (defvar-local kafka-logs--viewer-json-paths nil
   "JSON detail paths shown in current viewer buffer header.")
 
@@ -227,8 +258,14 @@ Each element has the form (NAME . PLIST).")
 
 (defconst kafka-logs--connection-keys
   '(:brokers :security-protocol :sasl-mechanisms :username :password
-    :auth-source :properties :kcat-args :description)
+    :auth-source :properties :kcat-args :description
+    :schema-registry-url :schema-registry-username
+    :schema-registry-password :schema-registry-auth-source)
   "Allowed keys for `kafka-logs-make-connection`.")
+
+(defconst kafka-logs--avro-envelope-format
+  "{\"topic\":\"%t\",\"partition\":%p,\"offset\":%o,\"ts\":%T,\"payload\":%s}\\n"
+  "kcat format string used to wrap Avro-decoded payloads as JSON lines.")
 
 (defun kafka-logs--transient-reprompt ()
   "Refresh transient so UI reflects current backing fields."
@@ -275,6 +312,22 @@ SOURCE is an optional user-facing origin label."
   (if (and paths (> (length paths) 0))
       (string-join paths ",")
     "none"))
+
+(defun kafka-logs--normalize-value-format (value &optional source)
+  "Validate and normalize wire format VALUE from SOURCE."
+  (let ((format (or value 'string)))
+    (unless (memq format '(auto json avro string))
+      (user-error "%s must be one of auto, json, avro, or string; got: %S"
+                  (or source "Value format")
+                  value))
+    format))
+
+(defun kafka-logs--value-format-display (value detected)
+  "Return display label for selected VALUE and DETECTED format."
+  (let ((format (kafka-logs--normalize-value-format value)))
+    (if (eq format 'auto)
+        (format "auto -> %s" (or detected "json"))
+      (symbol-name format))))
 
 (defun kafka-logs--normalize-brokers (brokers)
   "Normalize BROKERS to a comma-separated string."
@@ -329,6 +382,11 @@ Supported keys:
 - `:properties`: list of additional librdkafka properties.
   Elements may be strings like \"key=value\" or cons cells (KEY . VALUE).
 - `:kcat-args`: extra string args appended to all kcat commands.
+- `:schema-registry-url`: Schema Registry URL for Avro detection/decoding.
+- `:schema-registry-username`: Schema Registry username (optional).
+- `:schema-registry-password`: Schema Registry password (optional).
+- `:schema-registry-auth-source`: nil, t, or plist used with
+  `auth-source-search` for Schema Registry credentials.
 - `:description`: optional UI description string."
   (let ((connection-name (if (symbolp name) (symbol-name name) name)))
     (unless (stringp connection-name)
@@ -419,6 +477,102 @@ Supported keys:
          (password (or (plist-get connection :password)
                        (kafka-logs--auth-secret entry))))
     (list username password)))
+
+(defun kafka-logs--schema-registry-url (&optional connection)
+  "Return Schema Registry URL for CONNECTION or current connection."
+  (when-let ((url (plist-get (or connection (kafka-logs--connection-plist))
+                             :schema-registry-url)))
+    (let ((trimmed (string-trim url)))
+      (unless (string-empty-p trimmed)
+        trimmed))))
+
+(defun kafka-logs--url-host-port (url)
+  "Return (HOST . PORT) parsed from URL."
+  (let* ((parsed (url-generic-parse-url url))
+         (port (when (string-match
+                      "\\`[[:alpha:]][[:alnum:]+.-]*://\\(?:[^/@]+@\\)?\\(?:\\[[^]]+\\]\\|[^/:?#]+\\):\\([0-9]+\\)"
+                      url)
+                 (match-string 1 url))))
+    (cons (url-host parsed)
+          port)))
+
+(defun kafka-logs--schema-registry-auth-query (connection registry-url)
+  "Return auth-source query plist for CONNECTION using REGISTRY-URL."
+  (let ((spec (plist-get connection :schema-registry-auth-source)))
+    (when spec
+      (let* ((host+port (kafka-logs--url-host-port registry-url))
+             (default-host (car host+port))
+             (default-port (cdr host+port))
+             (query (list :max 1 :require '(:secret))))
+        (when default-host
+          (setq query (plist-put query :host default-host)))
+        (when default-port
+          (setq query (plist-put query :port default-port)))
+        (when (plist-member connection :schema-registry-username)
+          (setq query (plist-put query :user
+                                 (plist-get connection
+                                            :schema-registry-username))))
+        (when (listp spec)
+          (let ((cursor spec))
+            (while cursor
+              (setq query (plist-put query (car cursor) (cadr cursor)))
+              (setq cursor (cddr cursor)))))
+        query))))
+
+(defun kafka-logs--schema-registry-auth-entry (connection registry-url)
+  "Resolve auth-source entry for CONNECTION using REGISTRY-URL."
+  (when-let ((query (kafka-logs--schema-registry-auth-query connection
+                                                            registry-url)))
+    (or (car (apply #'auth-source-search query))
+        (when (plist-member query :port)
+          (let ((fallback-query (cl-copy-list query)))
+            (cl-remf fallback-query :port)
+            (car (apply #'auth-source-search fallback-query)))))))
+
+(defun kafka-logs--schema-registry-auth-configured-p (connection)
+  "Return non-nil when CONNECTION has Schema Registry auth settings."
+  (or (plist-member connection :schema-registry-auth-source)
+      (plist-member connection :schema-registry-username)
+      (plist-member connection :schema-registry-password)))
+
+(defun kafka-logs--schema-registry-credentials (connection registry-url)
+  "Return (USERNAME PASSWORD) for CONNECTION using REGISTRY-URL."
+  (let* ((entry (kafka-logs--schema-registry-auth-entry connection registry-url))
+         (username (or (plist-get connection :schema-registry-username)
+                       (plist-get entry :user)))
+         (password (or (plist-get connection :schema-registry-password)
+                       (kafka-logs--auth-secret entry))))
+    (when (and (kafka-logs--schema-registry-auth-configured-p connection)
+               (not (and username password)))
+      (user-error
+       "Schema Registry credentials not found for %s; check :schema-registry-auth-source or authinfo"
+       registry-url))
+    (list username password)))
+
+(defun kafka-logs--schema-registry-basic-auth-header (connection registry-url)
+  "Return Basic Auth header value for CONNECTION and REGISTRY-URL, or nil."
+  (pcase-let ((`(,username ,password)
+               (kafka-logs--schema-registry-credentials connection registry-url)))
+    (when (and username password)
+      (concat "Basic "
+              (base64-encode-string (format "%s:%s" username password) t)))))
+
+(defun kafka-logs--schema-registry-kcat-url (&optional connection)
+  "Return Schema Registry URL for kcat, including credentials when configured."
+  (let* ((conn (or connection (kafka-logs--connection-plist)))
+         (registry-url (kafka-logs--schema-registry-url conn)))
+    (when registry-url
+      (pcase-let ((`(,username ,password)
+                   (kafka-logs--schema-registry-credentials conn registry-url)))
+        (if (and username password)
+            (let ((parsed (url-generic-parse-url registry-url)))
+              ;; libserdes-backed kcat builds commonly expect raw URL userinfo
+              ;; here; percent-encoded Schema Registry secrets can be sent
+              ;; literally and cause 401s.
+              (setf (url-user parsed) username)
+              (setf (url-password parsed) password)
+              (url-recreate-url parsed))
+          registry-url)))))
 
 (defun kafka-logs--connection-base-args ()
   "Build base kcat args from current selected connection."
@@ -532,6 +686,114 @@ Signals `user-error` on failure."
         (push name names)))
     (sort (delete-dups names) #'string-lessp)))
 
+(defun kafka-logs--schema-registry-subject-path (subject)
+  "Return Schema Registry latest-version path for SUBJECT."
+  (format "/subjects/%s/versions/latest" (url-hexify-string subject)))
+
+(defun kafka-logs--schema-registry-request-json (path)
+  "Fetch Schema Registry PATH and return (STATUS . JSON).
+
+JSON is parsed as an alist.  Signals `user-error` when no Schema Registry URL
+is configured for the current connection."
+  (let* ((connection (kafka-logs--connection-plist))
+         (registry-url (kafka-logs--schema-registry-url connection)))
+    (unless registry-url
+      (user-error "Connection %s has no :schema-registry-url"
+                  kafka-logs-connection))
+    (let* ((base (string-remove-suffix "/" registry-url))
+           (url-request-extra-headers
+            (let ((auth (kafka-logs--schema-registry-basic-auth-header
+                         connection registry-url)))
+              (when auth
+                `(("Authorization" . ,auth)))))
+           (buffer (url-retrieve-synchronously
+                    (concat base path) t t 5)))
+      (unless buffer
+        (user-error "Schema Registry request failed: %s%s" base path))
+      (unwind-protect
+          (with-current-buffer buffer
+            (goto-char (point-min))
+            (unless (re-search-forward
+                     "\\`HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
+              (user-error "Unable to parse Schema Registry response"))
+            (let ((status (string-to-number (match-string 1)))
+                  (body nil))
+              (goto-char (point-min))
+              (when (re-search-forward "\r?\n\r?\n" nil t)
+                (setq body (buffer-substring-no-properties (point) (point-max))))
+              (cons status
+                    (when (and body (not (string-empty-p (string-trim body))))
+                      (json-parse-string body :object-type 'alist
+                                         :array-type 'list
+                                         :null-object nil
+                                         :false-object :false)))))
+        (kill-buffer buffer)))))
+
+(defun kafka-logs--schema-registry-fetch-subject (subject)
+  "Fetch latest Schema Registry SUBJECT.
+
+Return parsed subject metadata, nil for 404, and signal on other failures."
+  (let* ((response (kafka-logs--schema-registry-request-json
+                    (kafka-logs--schema-registry-subject-path subject)))
+         (status (car response))
+         (body (cdr response)))
+    (cond
+     ((and (>= status 200) (< status 300)) body)
+     ((= status 404) nil)
+     (t
+      (user-error "Schema Registry subject lookup failed (%s): %s"
+                  status subject)))))
+
+(defun kafka-logs--schema-registry-topic-value-subject (topic)
+  "Return conventional Schema Registry value subject for TOPIC."
+  (format "%s-value" topic))
+
+(defun kafka-logs--schema-registry-avro-subject-p (subject)
+  "Return non-nil when SUBJECT exists and is Avro."
+  (when-let ((metadata (kafka-logs--schema-registry-fetch-subject subject)))
+    (let ((schema-type (kafka-logs--alist-get-any metadata "schemaType")))
+      (or (null schema-type)
+          (equal (upcase (kafka-logs--value->string schema-type)) "AVRO")))))
+
+(defun kafka-logs--detect-topic-value-format (topic)
+  "Detect value wire format for TOPIC.
+
+Only conventional `<topic>-value` Avro subjects are detected.  Detection
+failures fall back to `json` and are reported as messages."
+  (if (not (kafka-logs--schema-registry-url))
+      'json
+    (condition-case err
+        (if (kafka-logs--schema-registry-avro-subject-p
+             (kafka-logs--schema-registry-topic-value-subject topic))
+            'avro
+          'json)
+      (error
+       (message "kafka-logs Schema Registry detection failed: %s"
+                (error-message-string err))
+       'json))))
+
+(defun kafka-logs--effective-value-format ()
+  "Return currently effective value wire format."
+  (let ((format (kafka-logs--normalize-value-format kafka-logs-value-format)))
+    (if (eq format 'auto)
+        (or kafka-logs--detected-value-format 'json)
+      format)))
+
+(defun kafka-logs--apply-topic-selection (topic)
+  "Set selected TOPIC and update detected value format when needed."
+  (let ((trimmed (string-trim topic)))
+    (when (string-empty-p trimmed)
+      (user-error "Topic cannot be empty"))
+    (setq kafka-logs-topic trimmed)
+    (setq kafka-logs--detected-value-format nil)
+    (when (eq (kafka-logs--normalize-value-format kafka-logs-value-format)
+              'auto)
+      (setq kafka-logs--detected-value-format
+            (kafka-logs--detect-topic-value-format trimmed))
+      ;; Auto mode treats both JSON and Avro as structured payloads.
+      (setq kafka-logs-payload-format 'json))
+    trimmed))
+
 (defun kafka-logs--time-string->ms (value label)
   "Parse VALUE into epoch milliseconds for LABEL."
   (unless (and value (not (string-empty-p value)))
@@ -559,13 +821,30 @@ When TO is omitted, treat it as current time."
       (user-error "FROM must be earlier than TO"))
     (cons from-ms to-ms)))
 
+(defun kafka-logs--value-format-args ()
+  "Return kcat args for the effective value wire format."
+  (pcase (kafka-logs--effective-value-format)
+    ('avro
+     (let ((registry-url (kafka-logs--schema-registry-kcat-url)))
+       (unless registry-url
+         (user-error "Avro value format requires :schema-registry-url"))
+       ;; Do not combine Avro with -J.  Many kcat builds support JSON and
+       ;; Avro but lack JSON-verbatim support, which is required to place the
+       ;; decoded Avro JSON value inside kcat's native -J envelope.
+       (list "-s" "value=avro"
+             "-r" registry-url
+             "-f" kafka-logs--avro-envelope-format)))
+    (_
+     (list "-J"))))
+
 (defun kafka-logs--consume-args ()
   "Build kcat consumer args from current backing fields."
   (unless (and kafka-logs-topic (not (string-empty-p kafka-logs-topic)))
     (user-error "Select a topic first"))
   (append
    (kafka-logs--connection-base-args)
-   (list "-C" "-J" "-u" "-q" "-t" kafka-logs-topic)
+   (list "-C" "-u" "-q" "-t" kafka-logs-topic)
+   (kafka-logs--value-format-args)
    (if kafka-logs-stream
        (list "-o" "end")
      (let* ((range (kafka-logs--resolved-time-range-ms))
@@ -627,9 +906,12 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
                      "start at topic end"
                    (kafka-logs--time-range-display kafka-logs--viewer-time-range)))
    (cons "Filter" (or kafka-logs--viewer-filter "none"))
-   (cons "Payload format" (if (eq kafka-logs--viewer-payload-format 'json)
-                              "json"
-                            "string"))
+   (cons "Value format" (kafka-logs--value-format-display
+                         kafka-logs--viewer-value-format
+                         kafka-logs--viewer-detected-value-format))
+   (cons "Payload rendering" (if (eq kafka-logs--viewer-payload-format 'json)
+                                 "json"
+                               "string"))
    (cons "Message path" (or kafka-logs--viewer-message-path "message"))
    (cons "JSON paths" (kafka-logs--json-paths-display kafka-logs--viewer-json-paths))))
 
@@ -788,6 +1070,9 @@ ON-READY is called once the async worker is ready to receive jobs."
       (setq-local kafka-logs--viewer-time-range kafka-logs-time-range)
       (setq-local kafka-logs--viewer-filter kafka-logs-filter)
       (setq-local kafka-logs--viewer-payload-format kafka-logs-payload-format)
+      (setq-local kafka-logs--viewer-value-format kafka-logs-value-format)
+      (setq-local kafka-logs--viewer-detected-value-format
+                  kafka-logs--detected-value-format)
       (setq-local kafka-logs--viewer-message-path message-path)
       (setq-local kafka-logs--viewer-json-paths json-paths)
       (add-hook 'kill-buffer-hook
@@ -1024,6 +1309,7 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
     (setq kafka-logs-connection value)
     ;; Topic validity depends on selected connection.
     (setq kafka-logs-topic nil)
+    (setq kafka-logs--detected-value-format nil)
     (kafka-logs--transient-reprompt)))
 
 (transient-define-suffix kafka-logs-select-topic ()
@@ -1040,9 +1326,7 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
           (if (and choices (listp choices) (> (length choices) 0))
               (completing-read "Topic: " choices nil t)
             (string-trim (read-string "Topic: ")))))
-    (when (string-empty-p value)
-      (user-error "Topic cannot be empty"))
-    (setq kafka-logs-topic value)
+    (kafka-logs--apply-topic-selection value)
     (kafka-logs--transient-reprompt)))
 
 (transient-define-suffix kafka-logs-toggle-stream ()
@@ -1179,7 +1463,7 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
 (transient-define-suffix kafka-logs-toggle-payload-format ()
   "Toggle payload rendering format."
   :description (lambda ()
-                 (format "Payload format: %s"
+                 (format "Payload rendering: %s"
                          (if (eq kafka-logs-payload-format 'json)
                              "json"
                            "string")))
@@ -1188,6 +1472,32 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
   (setq kafka-logs-payload-format
         (if (eq kafka-logs-payload-format 'json) nil 'json))
   (kafka-logs--transient-reprompt))
+
+(transient-define-suffix kafka-logs-set-value-format ()
+  "Set Kafka value wire format."
+  :description (lambda ()
+                 (format "Value format: %s"
+                         (kafka-logs--value-format-display
+                          kafka-logs-value-format
+                          kafka-logs--detected-value-format)))
+  :transient t
+  (interactive)
+  (let* ((choices '("auto" "json" "avro" "string"))
+         (current (symbol-name
+                   (kafka-logs--normalize-value-format
+                    kafka-logs-value-format)))
+         (input (completing-read "Value format: " choices nil t nil nil current))
+         (format (intern input)))
+    (setq kafka-logs-value-format
+          (kafka-logs--normalize-value-format format))
+    (setq kafka-logs--detected-value-format nil)
+    (pcase kafka-logs-value-format
+      ('string (setq kafka-logs-payload-format nil))
+      ((or 'json 'avro) (setq kafka-logs-payload-format 'json))
+      ('auto
+       (when kafka-logs-topic
+         (kafka-logs--apply-topic-selection kafka-logs-topic))))
+    (kafka-logs--transient-reprompt)))
 
 (transient-define-suffix kafka-logs-action-run ()
   "Run Kafka logs viewer with current selections."
@@ -1203,6 +1513,7 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
     ("t" kafka-logs-select-topic)
     ("-f" kafka-logs-toggle-stream)
     ("-F" kafka-logs-set-filter)
+    ("-v" kafka-logs-set-value-format)
     ("-M" kafka-logs-set-message-path)
     ("-j" kafka-logs-set-json-paths)
     ("-p" kafka-logs-toggle-payload-format)

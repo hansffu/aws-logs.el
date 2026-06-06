@@ -94,8 +94,13 @@ This keeps source-specific logic mostly separate from rendering/storage logic.
 *** =kafka-logs.el=
 
 - Provides a transient UI for =kcat=.
-- Manages connection definitions, topic selection, stream vs time-span mode, filters, payload format, message path, JSON detail paths, and extra summary paths.
+- Manages connection definitions, topic selection, stream vs time-span mode,
+  filters, value wire format, payload rendering, message path, JSON detail
+  paths, and extra summary paths.
 - Resolves credentials from =auth-source= when configured.
+- Resolves Schema Registry credentials from =auth-source= when configured.
+- Auto-detects Avro topics by checking Schema Registry for conventional
+  =<topic>-value= subjects, then delegates Avro decoding to =kcat=.
 - Converts kcat JSON envelopes into normalized JSON objects with fields such as:
   - =timestamp=
   - =level=
