@@ -128,7 +128,7 @@ Values are dot-separated paths understood by json-log-viewer, for example
   :group 'kafka-logs)
 
 (defcustom kafka-logs-default-extra-paths
-  '("topic" "partition")
+  '("topic" "key" "partition")
   "Default JSON paths rendered as summary extra segments."
   :type '(repeat string)
   :group 'kafka-logs)
@@ -264,7 +264,7 @@ Each element has the form (NAME . PLIST).")
   "Allowed keys for `kafka-logs-make-connection`.")
 
 (defconst kafka-logs--avro-envelope-format
-  "{\"topic\":\"%t\",\"partition\":%p,\"offset\":%o,\"ts\":%T,\"payload\":%s}\\n"
+  "{\"topic\":\"%t\",\"partition\":%p,\"offset\":%o,\"ts\":%T,\"key_size\":%K,\"key\":\"%k\",\"payload\":%s}\\n"
   "kcat format string used to wrap Avro-decoded payloads as JSON lines.")
 
 (defun kafka-logs--transient-reprompt ()
@@ -987,7 +987,9 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
              (timestamp
               (when (numberp ts)
                 (kafka-logs--epoch-ms->iso8601 ts)))
-             (key (kafka-logs--alist-get-any envelope "key"))
+             (key-size (kafka-logs--alist-get-any envelope "key_size"))
+             (key (unless (and (numberp key-size) (< key-size 0))
+                    (kafka-logs--alist-get-any envelope "key")))
              (payload (kafka-logs--alist-get-any envelope "payload"))
              (payload-node
               (cond

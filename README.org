@@ -378,7 +378,7 @@ Put ~kafka-logs.el~ and ~json-log-viewer.el~ on your ~load-path~.
   (kafka-logs-default-stream t)
   (kafka-logs-default-value-format 'auto)
   (kafka-logs-default-message-path "payload.data.name")
-  (kafka-logs-default-extra-paths '("connection" "topic" "partition"))
+  (kafka-logs-default-extra-paths '("connection" "topic" "key" "partition"))
   (kafka-logs-default-payload-format 'json)
   (kafka-logs-default-json-paths '("payload"))
   :config

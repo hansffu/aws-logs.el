@@ -203,7 +203,7 @@
                      "-s" "value=avro"
                      "-r" "https://alice:pw@sr.example.com:8081"
                      "-f"
-                     "{\"topic\":\"%t\",\"partition\":%p,\"offset\":%o,\"ts\":%T,\"payload\":%s}\\n"
+                     "{\"topic\":\"%t\",\"partition\":%p,\"offset\":%o,\"ts\":%T,\"key_size\":%K,\"key\":\"%k\",\"payload\":%s}\\n"
                      "-o" "end")))))
 
 (ert-deftest kafka-logs-detect-topic-value-format-avro-test ()
@@ -268,6 +268,34 @@
       (should (listp payload))
       (should (equal (alist-get 'externalTransactionId first) "c12345d6789"))
       (should (equal (alist-get 'loyaltyAccountId first) 1)))))
+
+(ert-deftest kafka-logs-line->json-line-avro-envelope-key-test ()
+  (with-temp-buffer
+    (let* ((line
+            (concat
+             "{\"topic\":\"orders\",\"partition\":2,\"offset\":9,"
+             "\"ts\":1700000000123,\"key_size\":7,\"key\":\"order-1\","
+             "\"payload\":{\"level\":\"warn\",\"message\":\"boom\"}}"))
+           (json-line (kafka-logs--line->json-line line))
+           (parsed (json-parse-string json-line :object-type 'alist)))
+      (should (equal (alist-get 'key parsed) "order-1"))
+      (should (equal (alist-get 'level parsed) "warn"))
+      (should (equal (alist-get 'payload parsed)
+                     '((level . "warn") (message . "boom")))))))
+
+(ert-deftest kafka-logs-line->json-line-avro-envelope-null-key-test ()
+  (with-temp-buffer
+    (let* ((line
+            (concat
+             "{\"topic\":\"orders\",\"partition\":2,\"offset\":9,"
+             "\"ts\":1700000000123,\"key_size\":-1,\"key\":\"\","
+             "\"payload\":{\"level\":\"warn\",\"message\":\"boom\"}}"))
+           (json-line (kafka-logs--line->json-line line))
+           (parsed (json-parse-string json-line :object-type 'alist)))
+      (should-not (assoc 'key parsed))
+      (should (equal (alist-get 'level parsed) "warn"))
+      (should (equal (alist-get 'payload parsed)
+                     '((level . "warn") (message . "boom")))))))
 
 (ert-deftest kafka-logs-list-topics-parses-metadata-json-test ()
   (let ((kafka-logs-connection "dev")
