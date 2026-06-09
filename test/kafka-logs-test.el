@@ -269,6 +269,26 @@
       (should (equal (alist-get 'externalTransactionId first) "c12345d6789"))
       (should (equal (alist-get 'loyaltyAccountId first) 1)))))
 
+(ert-deftest kafka-logs-line->json-line-headers-test ()
+  (with-temp-buffer
+    (let* ((line
+            (concat
+             "{\"topic\":\"orders\",\"partition\":2,\"offset\":9,"
+             "\"key\":\"order-1\","
+             "\"headers\":[\"trace-id\",\"abc\","
+             "\"empty\",\"\",\"nil-header\",null,"
+             "\"trace-id\",\"def\"],"
+             "\"payload\":\"ok\"}"))
+           (json-line (kafka-logs--line->json-line line))
+           (parsed (json-parse-string json-line :object-type 'alist
+                                      :array-type 'list))
+           (headers (alist-get 'headers parsed)))
+      (should (equal (alist-get 'key parsed) "order-1"))
+      (should (equal (alist-get 'trace-id headers) '("abc" "def")))
+      (should (equal (alist-get 'empty headers) ""))
+      (should (assoc 'nil-header headers))
+      (should (null (alist-get 'nil-header headers))))))
+
 (ert-deftest kafka-logs-line->json-line-avro-envelope-key-test ()
   (with-temp-buffer
     (let* ((line

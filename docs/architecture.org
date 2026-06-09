@@ -108,6 +108,7 @@ This keeps source-specific logic mostly separate from rendering/storage logic.
   - =partition=
   - =offset=
   - =key=
+  - =headers=
   - =payload=
 - Uses =json-log-viewer= for both one-shot and streaming consumption.
 

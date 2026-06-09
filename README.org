@@ -351,6 +351,7 @@ rendered in ~json-log-viewer~.
 - Optional regex filtering with ~grep~.
 - Automatic Avro detection through Schema Registry using conventional
   ~<topic>-value~ subjects.
+- Kafka message headers are shown in expanded message details.
 - Optional payload rendering mode for JSON message bodies.
 - Configurable summary message JSON path (including nested paths).
 - Configurable summary extra JSON paths.

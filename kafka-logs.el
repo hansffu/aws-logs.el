@@ -967,6 +967,45 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
           (throw 'found value))))
     nil))
 
+(defun kafka-logs--normalize-headers (headers)
+  "Normalize kcat HEADERS into a viewer-friendly JSON object.
+
+Native kcat JSON output represents headers as a flat array of alternating
+header names and values.  Duplicate header names are valid in Kafka, so
+duplicates are preserved as arrays."
+  (cond
+   ((null headers) nil)
+   ((or (hash-table-p headers)
+        (kafka-logs--alist-like-p headers))
+    headers)
+   ((listp headers)
+    (let ((cursor headers)
+          (sentinel (make-symbol "missing"))
+          (table (make-hash-table :test 'equal))
+          keys)
+      (while cursor
+        (let ((name (kafka-logs--value->string (car cursor)))
+              (value (cadr cursor)))
+          (when name
+            (let ((existing (gethash name table sentinel)))
+              (when (eq existing sentinel)
+                (push name keys))
+              (puthash name
+                       (cond
+                        ((eq existing sentinel) value)
+                        ((and (listp existing)
+                              (not (kafka-logs--alist-like-p existing)))
+                         (append existing (list value)))
+                        (t
+                         (list existing value)))
+                       table))))
+        (setq cursor (cddr cursor)))
+      (when keys
+        (mapcar (lambda (key)
+                  (cons key (gethash key table)))
+                (nreverse keys)))))
+   (t headers)))
+
 (defun kafka-logs--epoch-ms->iso8601 (ms)
   "Convert epoch milliseconds MS to UTC ISO-8601 string."
   (format-time-string "%Y-%m-%dT%H:%M:%S.%3NZ"
@@ -990,6 +1029,8 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
              (key-size (kafka-logs--alist-get-any envelope "key_size"))
              (key (unless (and (numberp key-size) (< key-size 0))
                     (kafka-logs--alist-get-any envelope "key")))
+             (headers (kafka-logs--normalize-headers
+                       (kafka-logs--alist-get-any envelope "headers")))
              (payload (kafka-logs--alist-get-any envelope "payload"))
              (payload-node
               (cond
@@ -1020,6 +1061,8 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
           (puthash "offset" offset obj))
         (when key
           (puthash "key" key obj))
+        (when headers
+          (puthash "headers" headers obj))
         (when display-payload
           (puthash "payload" display-payload obj))
         (json-serialize (kafka-logs--normalize-json-value obj))))))
