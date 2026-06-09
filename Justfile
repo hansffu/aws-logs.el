@@ -20,6 +20,12 @@ compile:
         json-log-viewer-async-worker.el async-job-queue.el \
         kube-logs.el kafka-logs.el
 
+worker-build:
+    cargo build
+
+worker-build-nix:
+    nix build .#json-log-viewer-worker
+
 clean:
     rm -f {{dir}}/*.elc
 

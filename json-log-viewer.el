@@ -11,27 +11,12 @@
 (require 'cl-lib)
 (require 'json)
 (require 'subr-x)
-(require 'async-job-queue)
 
 (require 'json-log-viewer-shared)
 
 (declare-function json-pretty-print-buffer "json" ())
 (declare-function org-read-date "org"
                   (&optional with-time to-time from-string prompt default-time default-input))
-(declare-function async-job-queue-create "async-job-queue"
-                  (process-func callback-func &rest _))
-(declare-function async-job-queue-push "async-job-queue" (queue element))
-(declare-function async-job-queue-stop "async-job-queue" (queue))
-(declare-function json-log-viewer-async-worker-init
-                  "json-log-viewer-async-worker"
-                  (&optional config))
-(declare-function json-log-viewer-async-worker-teardown
-                  "json-log-viewer-async-worker"
-                  ())
-(declare-function json-log-viewer-async-worker-process-log-ingestor-job
-                  "json-log-viewer-async-worker"
-                  (job))
-
 (defgroup json-log-viewer nil
   "Foldable JSON log viewer buffers."
   :group 'tools)
@@ -111,6 +96,24 @@ to `js-mode`."
   :type 'symbol
   :group 'json-log-viewer)
 
+(defcustom json-log-viewer-worker-program nil
+  "Path to the json-log-viewer Rust worker executable.
+
+When nil, the viewer searches next to the source tree under
+target/debug, target/release, then `exec-path'."
+  :type '(choice (const :tag "Auto-detect" nil) file)
+  :group 'json-log-viewer)
+
+(cl-defstruct (json-log-viewer--worker
+               (:constructor json-log-viewer--worker-create))
+  "Runtime state for the Rust json-log-viewer worker."
+  process
+  command-partial-output
+  socket-path
+  ingest-process
+  ready-p
+  pending-ingest-lines)
+
 (defvar-local json-log-viewer--fold-overlays nil
   "Detail overlays for expanded entries in the current viewer buffer.")
 
@@ -154,7 +157,7 @@ to `js-mode`."
   "Non-streaming direction: `newest-first' or `oldest-first'.")
 
 (defvar-local json-log-viewer--async-queue nil
-  "Per-buffer async queue that processes all storage jobs.")
+  "Per-buffer Rust worker that processes storage jobs.")
 
 (defvar-local json-log-viewer--async-pending-count 0
   "Count of queued async jobs awaiting callbacks.")
@@ -296,28 +299,38 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
         (push (cons key rendered) fields)))
     (nreverse fields)))
 
+(defun json-log-viewer--worker-program ()
+  "Return an executable path for the Rust json-log-viewer worker."
+  (let* ((source-root (and json-log-viewer--source-directory
+                           (file-name-as-directory json-log-viewer--source-directory)))
+         (debug-candidate (and source-root
+                               (expand-file-name
+                                "target/debug/json-log-viewer-worker"
+                                source-root)))
+         (release-candidate (and source-root
+                                 (expand-file-name
+                                  "target/release/json-log-viewer-worker"
+                                  source-root)))
+         (configured json-log-viewer-worker-program)
+         (found (or (and configured
+                         (file-executable-p configured)
+                         configured)
+                    (and debug-candidate
+                         (file-executable-p debug-candidate)
+                         debug-candidate)
+                    (and release-candidate
+                         (file-executable-p release-candidate)
+                         release-candidate)
+                    (executable-find "json-log-viewer-worker"))))
+    (or found
+        (user-error "Cannot find json-log-viewer-worker executable; run `cargo build' or customize json-log-viewer-worker-program"))))
+
 (defun json-log-viewer--async-worker-file ()
-  "Return a readable path to `json-log-viewer-async-worker.el'."
-  (let* ((candidate-from-source
-          (and json-log-viewer--source-directory
-               (expand-file-name "json-log-viewer-async-worker.el"
-                                 json-log-viewer--source-directory)))
-         (main-file (locate-library "json-log-viewer"))
-         (candidate-from-library
-          (and main-file
-               (expand-file-name "json-log-viewer-async-worker.el"
-                                 (file-name-directory main-file)))))
-    (cond
-     ((and (stringp candidate-from-source)
-           (file-readable-p candidate-from-source))
-      candidate-from-source)
-     ((and (stringp candidate-from-library)
-           (file-readable-p candidate-from-library))
-      candidate-from-library)
-     ((file-readable-p "json-log-viewer-async-worker.el")
-      (expand-file-name "json-log-viewer-async-worker.el"))
-     (t
-      (user-error "Cannot find json-log-viewer-async-worker.el")))))
+  "Return legacy worker file path for compatibility with old tests/helpers."
+  (or (and json-log-viewer--source-directory
+           (expand-file-name "json-log-viewer-async-worker.el"
+                             json-log-viewer--source-directory))
+      "json-log-viewer-async-worker.el"))
 
 (defun json-log-viewer--async-await-pending-count (target-count)
   "Wait until pending async count reaches TARGET-COUNT, with timeout."
@@ -328,6 +341,17 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
       (accept-process-output nil 0.01))
     (when (> json-log-viewer--async-pending-count target-count)
       (error "Timed out waiting for async queue callback"))))
+
+(defun json-log-viewer--json-line (object)
+  "Serialize OBJECT as one JSON protocol line."
+  (concat (json-serialize object
+                          :null-object nil
+                          :false-object :false)
+          "\n"))
+
+(defun json-log-viewer--parse-worker-line (line)
+  "Parse one Lisp-readable worker protocol LINE into a plist."
+  (car (read-from-string line)))
 
 (defun json-log-viewer--worker-entry->entry (worker-entry)
   "Normalize WORKER-ENTRY into a renderable entry plist."
@@ -413,7 +437,19 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
 
 (defun json-log-viewer--async-apply-command (command)
   "Apply worker COMMAND in current viewer buffer."
-  (pcase (plist-get command :cmd)
+  (pcase (let ((cmd (plist-get command :cmd)))
+           (if (stringp cmd) (intern cmd) cmd))
+    ('worker-ready
+     (when-let ((worker json-log-viewer--async-queue))
+       (setf (json-log-viewer--worker-ready-p worker) t)
+       (json-log-viewer--ensure-ingest-process)
+       (json-log-viewer--flush-pending-ingest-lines)
+       (when json-log-viewer--on-worker-ready
+         (funcall json-log-viewer--on-worker-ready)
+         (setq json-log-viewer--on-worker-ready nil))))
+    ('request-complete
+     (setq json-log-viewer--async-pending-count
+           (max 0 (1- json-log-viewer--async-pending-count))))
     ('clear
      (json-log-viewer--cancel-render-queue)
      (json-log-viewer--clear-rendered-buffer))
@@ -450,76 +486,26 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
      (message "json-log-viewer async worker returned unknown cmd: %S" cmd))))
 
 (defun json-log-viewer--async-handle-result (result)
-  "Handle queue RESULT in current viewer buffer."
-  (if (and (listp result) (eq (car result) :error))
-      (progn
-        (message "json-log-viewer async worker error: %s" (or (cadr result) "unknown error")))
-    (when (and (listp result) (plist-member result :cmd))
-      (json-log-viewer--async-apply-command result)
-      (json-log-viewer--finalize-rebuild-if-empty))))
-
-(defun json-log-viewer--make-async-queue-process-func ()
-  "Return a serialization-safe PROCESS-FUNC for the worker queue."
-  (eval
-   '(lambda (job)
-      (let ((worker-file (plist-get job :worker-file)))
-        (unless (and (stringp worker-file)
-                     (file-readable-p worker-file))
-          (error "Async worker file is unreadable: %S" worker-file))
-        (let ((worker-dir (file-name-directory worker-file)))
-          (when worker-dir
-            (add-to-list 'load-path worker-dir)))
-        (unless (fboundp 'json-log-viewer-async-worker-process-log-ingestor-job)
-          (load worker-file nil t)
-          (unless (fboundp 'json-log-viewer-async-worker-process-log-ingestor-job)
-            (error "Missing async worker entrypoint in %s" worker-file)))
-        (json-log-viewer-async-worker-process-log-ingestor-job job)))))
-
-(defun json-log-viewer--make-async-queue-init-func
-    (worker-file max-entries chunk-size rebuild-chunk-size)
-  "Return worker init function for WORKER-FILE."
-  (eval
-   `(lambda ()
-      (let ((worker-file ',worker-file))
-        (unless (and (stringp worker-file)
-                     (file-readable-p worker-file))
-          (error "Async worker file is unreadable: %S" worker-file))
-        (let ((worker-dir (file-name-directory worker-file)))
-          (when worker-dir
-            (add-to-list 'load-path worker-dir)))
-        (unless (fboundp 'json-log-viewer-async-worker-init)
-          (load worker-file nil t)
-          (unless (fboundp 'json-log-viewer-async-worker-init)
-            (error "Missing async worker init entrypoint in %s" worker-file)))
-        (json-log-viewer-async-worker-init
-         (list :max-entries ',max-entries
-               :chunk-size ',chunk-size
-               :rebuild-chunk-size ',rebuild-chunk-size))
-        (funcall async-job-queue--worker-send-func
-                 '(:event nil (:worker-ready t)))))))
-
-(defun json-log-viewer--make-async-queue-teardown-func (worker-file)
-  "Return worker teardown function for WORKER-FILE."
-  (eval
-   `(lambda ()
-      (let ((worker-file ',worker-file))
-        (unless (and (stringp worker-file)
-                     (file-readable-p worker-file))
-          (error "Async worker file is unreadable: %S" worker-file))
-        (let ((worker-dir (file-name-directory worker-file)))
-          (when worker-dir
-            (add-to-list 'load-path worker-dir)))
-        (unless (fboundp 'json-log-viewer-async-worker-teardown)
-          (load worker-file nil t)
-          (unless (fboundp 'json-log-viewer-async-worker-teardown)
-            (error "Missing async worker teardown entrypoint in %s" worker-file)))
-        (json-log-viewer-async-worker-teardown)))))
+  "Handle worker RESULT in current viewer buffer."
+  (when (and (listp result) (plist-member result :cmd))
+    (json-log-viewer--async-apply-command result)
+    (json-log-viewer--finalize-rebuild-if-empty)))
 
 (defun json-log-viewer--stop-async-queue ()
-  "Stop async queue for current buffer."
+  "Stop worker for current buffer."
   (json-log-viewer--cancel-render-queue)
-  (when json-log-viewer--async-queue
-    (ignore-errors (async-job-queue-stop json-log-viewer--async-queue))
+  (when-let ((worker json-log-viewer--async-queue))
+    (when-let ((ingest (json-log-viewer--worker-ingest-process worker)))
+      (when (process-live-p ingest)
+        (delete-process ingest)))
+    (when-let ((proc (json-log-viewer--worker-process worker)))
+      (when (process-live-p proc)
+        (ignore-errors
+          (process-send-string proc (json-log-viewer--json-line '(:cmd "stop"))))
+        (delete-process proc)))
+    (when-let ((socket-path (json-log-viewer--worker-socket-path worker)))
+      (when (file-exists-p socket-path)
+        (ignore-errors (delete-file socket-path))))
     (setq json-log-viewer--async-queue nil))
   (setq json-log-viewer--async-pending-count 0)
   (setq json-log-viewer--async-next-request-id 0)
@@ -527,11 +513,175 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
   (setq json-log-viewer--load-more-request-id nil)
   nil)
 
+(defun json-log-viewer--worker-handle-output (buffer worker output)
+  "Handle command OUTPUT from WORKER for BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (let* ((combined (concat (or (json-log-viewer--worker-command-partial-output worker) "")
+                               output))
+             (parts (split-string combined "\n"))
+             (rest (car (last parts)))
+             (lines (butlast parts)))
+        (setf (json-log-viewer--worker-command-partial-output worker) (or rest ""))
+        (dolist (line lines)
+          (unless (string-empty-p line)
+            (condition-case err
+                (json-log-viewer--async-handle-result
+                 (json-log-viewer--parse-worker-line line))
+              (error
+               (message "json-log-viewer worker parse error: %s"
+                        (error-message-string err))))))))))
+
+(defun json-log-viewer--worker-handle-exit (buffer worker event)
+  "Handle worker process EVENT for WORKER in BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when-let ((ingest (json-log-viewer--worker-ingest-process worker)))
+        (when (process-live-p ingest)
+          (delete-process ingest)))
+      (when-let ((socket-path (json-log-viewer--worker-socket-path worker)))
+        (when (file-exists-p socket-path)
+          (ignore-errors (delete-file socket-path))))
+      (when (eq worker json-log-viewer--async-queue)
+        (setq json-log-viewer--async-queue nil)
+        (setq json-log-viewer--async-pending-count 0))
+      (message "json-log-viewer worker exited: %s" (string-trim event)))))
+
+(defun json-log-viewer--worker-config ()
+  "Return worker config plist for current buffer."
+  (list :timestamp-path json-log-viewer--timestamp-path
+        :level-path json-log-viewer--level-path
+        :message-path json-log-viewer--message-path
+        :extra-paths (vconcat (or json-log-viewer--extra-paths nil))
+        :json-paths (vconcat (or json-log-viewer--json-paths nil))))
+
+(defun json-log-viewer--send-worker-command (command)
+  "Send COMMAND plist to the current buffer worker stdin."
+  (let* ((worker (or json-log-viewer--async-queue
+                     (error "json-log-viewer worker is not running")))
+         (proc (json-log-viewer--worker-process worker)))
+    (unless (process-live-p proc)
+      (error "json-log-viewer worker process is not running"))
+    (process-send-string proc (json-log-viewer--json-line command))))
+
+(defun json-log-viewer--connect-ingest-process ()
+  "Open and return the Unix socket process used for ingestion."
+  (let* ((worker (or json-log-viewer--async-queue
+                     (error "json-log-viewer worker is not running")))
+         (socket-path (json-log-viewer--worker-socket-path worker)))
+    (make-network-process
+     :name (format "json-log-viewer-ingest:%s" (buffer-name))
+     :family 'local
+     :service socket-path
+     :coding 'utf-8-unix
+     :noquery t)))
+
+(defun json-log-viewer--ensure-ingest-process ()
+  "Ensure current buffer has a connected worker ingestion socket."
+  (let ((worker (or json-log-viewer--async-queue
+                    (error "json-log-viewer worker is not running"))))
+    (unless (json-log-viewer--worker-ready-p worker)
+      (error "json-log-viewer worker is not ready"))
+    (unless (process-live-p (json-log-viewer--worker-ingest-process worker))
+      (setf (json-log-viewer--worker-ingest-process worker)
+            (json-log-viewer--connect-ingest-process)))
+    (json-log-viewer--worker-ingest-process worker)))
+
+(defun json-log-viewer--send-ingest-lines (lines)
+  "Send raw log LINES over the worker ingestion socket."
+  (let ((process (json-log-viewer--ensure-ingest-process)))
+    (dolist (line lines)
+      (process-send-string process "L ")
+      (process-send-string process (substring-no-properties line))
+      (process-send-string process "\n"))))
+
+(defun json-log-viewer--send-ingest-flush (request-id)
+  "Send an ingestion flush barrier REQUEST-ID over the worker socket."
+  (process-send-string
+   (json-log-viewer--ensure-ingest-process)
+   (format "F %d\n" request-id)))
+
+(defun json-log-viewer--await-worker-ready ()
+  "Wait for current worker to report readiness."
+  (let ((deadline (+ (float-time) 15.0))
+        (worker (or json-log-viewer--async-queue
+                    (error "json-log-viewer worker is not running"))))
+    (while (and (not (json-log-viewer--worker-ready-p worker))
+                (< (float-time) deadline))
+      (accept-process-output (json-log-viewer--worker-process worker) 0.01))
+    (unless (json-log-viewer--worker-ready-p worker)
+      (error "Timed out waiting for json-log-viewer worker readiness"))))
+
+(defun json-log-viewer--flush-pending-ingest-lines ()
+  "Send lines buffered while the worker was starting."
+  (when-let* ((worker json-log-viewer--async-queue)
+              (lines (json-log-viewer--worker-pending-ingest-lines worker)))
+    (setf (json-log-viewer--worker-pending-ingest-lines worker) nil)
+    (json-log-viewer--send-ingest-lines (nreverse lines))))
+
+(defun json-log-viewer--ingest-lines (lines &optional wait-for-callback)
+  "Send LINES to the worker ingestion socket.
+
+When WAIT-FOR-CALLBACK is non-nil, wait for a socket barrier response."
+  (let ((worker (or json-log-viewer--async-queue
+                    (error "json-log-viewer worker is not running"))))
+    (if (not (json-log-viewer--worker-ready-p worker))
+        (setf (json-log-viewer--worker-pending-ingest-lines worker)
+              (append (reverse lines)
+                      (json-log-viewer--worker-pending-ingest-lines worker)))
+      (json-log-viewer--send-ingest-lines lines))
+    (when (or wait-for-callback noninteractive)
+      (unless (json-log-viewer--worker-ready-p worker)
+        (json-log-viewer--await-worker-ready))
+      (let ((request-id (prog1 json-log-viewer--async-next-request-id
+                          (setq json-log-viewer--async-next-request-id
+                                (1+ json-log-viewer--async-next-request-id))))
+            (before json-log-viewer--async-pending-count))
+        (setq json-log-viewer--async-pending-count
+              (1+ json-log-viewer--async-pending-count))
+        (json-log-viewer--send-ingest-flush request-id)
+        (json-log-viewer--async-await-pending-count before)))))
+
+(defun json-log-viewer--worker-command-from-job (job)
+  "Translate legacy async JOB plist into the Rust worker command protocol."
+  (let ((op (plist-get job :op))
+        (request-id (plist-get job :request-id)))
+    (pcase op
+      ('reset
+       (list :cmd "reset" :request-id request-id))
+      ('narrow
+       (list :cmd "narrow"
+             :needle (or (plist-get job :narrow-string) "")
+             :request-id request-id))
+      ('rerender
+       (let ((needle (plist-get job :narrow-string)))
+         (if needle
+             (list :cmd "rerender" :needle needle :request-id request-id)
+           (list :cmd "rerender" :request-id request-id))))
+      ('load-more
+       (append
+        (list :cmd "load-more"
+              :limit (plist-get job :limit)
+              :direction (symbol-name (plist-get job :direction))
+              :timestamp (plist-get job :timestamp)
+              :request-id request-id)
+        (when (plist-get job :entry-id)
+          (list :entry-id (plist-get job :entry-id)))
+        (when (plist-get job :prepend)
+          (list :prepend t))))
+      ((or 'entry-details 'entry-fields)
+       (list :cmd "entry-details"
+             :entry-id (plist-get job :entry-id)
+             :request-id request-id))
+      (_
+       (user-error "Unsupported json-log-viewer worker op: %S" op)))))
+
 (defun json-log-viewer--start-async-queue ()
-  "Start async queue for current buffer."
+  "Start the Rust worker for current buffer."
   (json-log-viewer--stop-async-queue)
   (let ((buffer (current-buffer))
-        (worker-file (json-log-viewer--async-worker-file))
+        (program (json-log-viewer--worker-program))
+        (socket-path (make-temp-file "json-log-viewer-worker-socket-"))
         (max-entries
          (json-log-viewer--normalize-positive-integer-setting
           json-log-viewer--stream-max-entries
@@ -545,30 +695,40 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
          (json-log-viewer--normalize-positive-integer-setting
           json-log-viewer-rebuild-chunk-size
           "json-log-viewer-rebuild-chunk-size")))
+    (delete-file socket-path)
     (setq-local json-log-viewer--async-next-request-id 0)
-    (setq-local json-log-viewer--async-queue
-                (async-job-queue-create
-                 (json-log-viewer--make-async-queue-process-func)
-                 (lambda (result)
-                   (when (buffer-live-p buffer)
-                     (with-current-buffer buffer
-                       (cond
-                        ((and (listp result) (plist-member result :worker-ready))
-                         (when json-log-viewer--on-worker-ready
-                           (funcall json-log-viewer--on-worker-ready)
-                           (setq json-log-viewer--on-worker-ready nil)))
-                        (t
-                         (unless (and (listp result) (plist-member result :cmd))
-                           (setq json-log-viewer--async-pending-count
-                                 (max 0 (1- json-log-viewer--async-pending-count))))
-                         (json-log-viewer--async-handle-result result))))))
-                 :init-func (json-log-viewer--make-async-queue-init-func
-                             worker-file
-                             max-entries
-                             chunk-size
-                             rebuild-chunk-size)
-                 :teardown-func (json-log-viewer--make-async-queue-teardown-func
-                                 worker-file)))))
+    (let* ((process (make-process
+                     :name (format "json-log-viewer-worker:%s" (buffer-name))
+                     :buffer (generate-new-buffer
+                              (format " *json-log-viewer-worker:%s*" (buffer-name)))
+                     :command (list program)
+                     :coding 'utf-8-unix
+                     :connection-type 'pipe
+                     :noquery t))
+           (worker (json-log-viewer--worker-create
+                    :process process
+                    :command-partial-output ""
+                    :socket-path socket-path
+                    :ingest-process nil
+                    :ready-p nil
+                    :pending-ingest-lines nil)))
+      (set-process-query-on-exit-flag process nil)
+      (setq-local json-log-viewer--async-queue worker)
+      (set-process-filter
+       process
+       (lambda (_proc output)
+         (json-log-viewer--worker-handle-output buffer worker output)))
+      (set-process-sentinel
+       process
+       (lambda (_proc event)
+         (json-log-viewer--worker-handle-exit buffer worker event)))
+      (json-log-viewer--send-worker-command
+       (list :cmd "start"
+             :socket-path socket-path
+             :max-entries max-entries
+             :chunk-size chunk-size
+             :rebuild-chunk-size rebuild-chunk-size
+             :config (json-log-viewer--worker-config))))))
 
 (defun json-log-viewer--normalize-narrow-string (&optional needle)
   "Normalize NEEDLE into a downcased substring filter, or nil when empty."
@@ -594,7 +754,7 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
   (json-log-viewer--make-async-job op line narrow-string))
 
 (defun json-log-viewer--async-submit (job &optional wait-for-callback)
-  "Submit JOB to current buffer queue.
+  "Submit command JOB to current buffer worker.
 
 When WAIT-FOR-CALLBACK is non-nil, block until callback has applied.
 Return request id."
@@ -604,13 +764,14 @@ Return request id."
                          (prog1 json-log-viewer--async-next-request-id
                            (setq json-log-viewer--async-next-request-id
                                  (1+ json-log-viewer--async-next-request-id)))))
-         (payload (if (plist-member job :request-id)
-                      job
-                    (plist-put (copy-sequence job) :request-id request-id)))
+         (payload (json-log-viewer--worker-command-from-job
+                   (if (plist-member job :request-id)
+                       job
+                     (plist-put (copy-sequence job) :request-id request-id))))
          (before json-log-viewer--async-pending-count))
     (setq json-log-viewer--async-pending-count
           (1+ json-log-viewer--async-pending-count))
-    (async-job-queue-push json-log-viewer--async-queue payload)
+    (json-log-viewer--send-worker-command payload)
     (when (or wait-for-callback noninteractive)
       (json-log-viewer--async-await-pending-count before))
     request-id))
@@ -2075,9 +2236,8 @@ BUFFER-OR-NAME must identify a live `json-log-viewer-mode` buffer created by
       (let ((normalized-lines (json-log-viewer--ensure-log-lines
                                log-lines "json-log-viewer-push")))
         (json-log-viewer--ensure-async-queue-running)
-        (dolist (line normalized-lines)
-          (json-log-viewer--async-submit
-           (json-log-viewer--make-async-job 'ingest line)))))))
+        (when normalized-lines
+          (json-log-viewer--ingest-lines normalized-lines))))))
 
 (defun json-log-viewer-replace-log-lines (buffer-or-name log-lines &optional preserve-filter)
   "Replace raw LOG-LINES in BUFFER-OR-NAME.
@@ -2092,9 +2252,8 @@ When PRESERVE-FILTER is non-nil, keep the current active filter."
          (json-log-viewer--make-async-job 'reset nil)
          t)
         (json-log-viewer-replace-entries nil preserve-filter)
-        (dolist (line normalized-lines)
-          (json-log-viewer--async-submit
-           (json-log-viewer--make-async-job 'ingest line)))))))
+        (when normalized-lines
+          (json-log-viewer--ingest-lines normalized-lines))))))
 
 (provide 'json-log-viewer)
 ;;; json-log-viewer.el ends here

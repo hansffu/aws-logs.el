@@ -133,6 +133,34 @@ It is callback-driven, keeps runtime state buffer-local, and supports:
 - non-streaming mode (replace full dataset)
 - streaming mode (append new lines)
 
+** Worker
+
+~json-log-viewer~ uses a Rust worker process for JSON normalization, SQLite
+storage, narrowing, and lazy detail expansion. Build it before opening viewer
+buffers:
+
+#+begin_src sh
+cargo build
+#+end_src
+
+With Nix flakes:
+
+#+begin_src sh
+nix develop -c cargo generate-lockfile
+nix build .#json-log-viewer-worker
+#+end_src
+
+By default the Elisp client looks for ~target/debug/json-log-viewer-worker~,
+~target/release/json-log-viewer-worker~, then ~json-log-viewer-worker~ on
+~exec-path~. Set ~json-log-viewer-worker-program~ to an explicit executable path
+when installing the worker elsewhere.
+
+The control channel uses stdin/stdout. Emacs sends low-volume commands as JSON;
+the worker sends Lisp-readable result forms back so Emacs can use ~read~ instead
+of JSON parsing. High-volume log ingestion goes over a Unix socket as raw
+line-framed records; the Rust worker owns UTF-8 cleanup, parsing, storage, and
+summary production.
+
 ** Quick API
 
 - ~json-log-viewer-make-buffer BUFFER-NAME &key ...~ -> create/initialize a viewer buffer.
