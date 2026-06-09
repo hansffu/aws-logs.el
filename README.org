@@ -159,7 +159,11 @@ The control channel uses stdin/stdout. Emacs sends low-volume commands as JSON;
 the worker sends Lisp-readable result forms back so Emacs can use ~read~ instead
 of JSON parsing. High-volume log ingestion goes over a Unix socket as raw
 line-framed records; the Rust worker owns UTF-8 cleanup, parsing, storage, and
-summary production.
+summary production. Live display updates are pull-based: Emacs sends a small
+non-blocking ~pull~ command every ~json-log-viewer-pull-interval~ seconds, and
+the worker replies with the batch size before sending entries. Pending live
+entries are held in Rust, capped to the configured maximum buffer size, and
+discard older entries when throughput exceeds that cap.
 
 ** Quick API
 

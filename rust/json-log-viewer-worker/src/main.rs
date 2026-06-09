@@ -2,7 +2,7 @@ use chrono::{DateTime, NaiveDateTime};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
@@ -78,6 +78,10 @@ enum Command {
         #[serde(rename = "request-id")]
         request_id: Option<i64>,
     },
+    Pull {
+        #[serde(rename = "max-messages")]
+        max_messages: Option<usize>,
+    },
     Stop,
 }
 
@@ -144,6 +148,7 @@ struct Store {
     render_mode: RenderMode,
     render_narrow: Option<String>,
     publish_mode: PublishMode,
+    pending_entries: VecDeque<Entry>,
     output: Output,
 }
 
@@ -157,6 +162,7 @@ impl Store {
             render_mode: RenderMode::All,
             render_narrow: None,
             publish_mode: PublishMode::Live,
+            pending_entries: VecDeque::new(),
             output,
         })
     }
@@ -165,6 +171,7 @@ impl Store {
         self.publish_mode = PublishMode::Live;
         self.render_mode = RenderMode::All;
         self.render_narrow = None;
+        self.pending_entries.clear();
         let _ = self.db.execute("DELETE FROM log_entry", []);
         self.output.send(json!({"cmd": "clear"}));
     }
@@ -176,7 +183,6 @@ impl Store {
             None
         };
         let viewer_config = self.config.viewer.clone();
-        let chunk_size = self.config.chunk_size.max(1);
         let publish_live = self.publish_mode == PublishMode::Live;
         let tx = self.db.transaction()?;
         let mut entries = Vec::new();
@@ -189,22 +195,22 @@ impl Store {
         }
         tx.commit()?;
         if publish_live {
-            for batch in entries.chunks(chunk_size) {
-                self.output
-                    .send(json!({"cmd": "render-entries", "entries": batch}));
-            }
+            self.queue_pending_entries(entries);
         }
         Ok(())
     }
 
     fn narrow(&mut self, needle: String) {
+        self.publish_mode = PublishMode::Live;
         self.render_mode = RenderMode::Narrow;
         self.render_narrow = Some(normalize_needle(Some(&needle)).unwrap_or_default());
+        self.pending_entries.clear();
         self.publish_rerender_chunks();
     }
 
     fn rerender(&mut self, needle: Option<String>) {
         self.publish_mode = PublishMode::Live;
+        self.pending_entries.clear();
         if let Some(needle) = normalize_needle(needle.as_deref()) {
             self.render_mode = RenderMode::Narrow;
             self.render_narrow = Some(needle);
@@ -213,6 +219,36 @@ impl Store {
             self.render_narrow = None;
         }
         self.publish_rerender_chunks();
+    }
+
+    fn queue_pending_entries(&mut self, entries: Vec<Entry>) {
+        let max_entries = self.config.max_entries;
+        for entry in entries {
+            self.pending_entries.push_back(entry);
+            if let Some(max_entries) = max_entries {
+                while self.pending_entries.len() > max_entries {
+                    self.pending_entries.pop_front();
+                }
+            }
+        }
+    }
+
+    fn pull(&mut self, max_messages: Option<usize>) {
+        let max_messages = max_messages.or(self.config.max_entries);
+        if let Some(max_messages) = max_messages {
+            while self.pending_entries.len() > max_messages {
+                self.pending_entries.pop_front();
+            }
+        }
+
+        let entries: Vec<Entry> = self.pending_entries.drain(..).collect();
+        self.output
+            .send(json!({"cmd": "pull-begin", "count": entries.len()}));
+        for batch in entries.chunks(self.config.chunk_size.max(1)) {
+            self.output
+                .send(json!({"cmd": "render-entries", "entries": batch}));
+        }
+        self.output.send(json!({"cmd": "pull-complete"}));
     }
 
     fn publish_rerender_chunks(&self) {
@@ -435,6 +471,10 @@ fn command_thread(store: Arc<Mutex<Store>>, output: Output, shutdown_tx: Sender<
                 if let Err(err) = store.entry_details(entry_id, request_id) {
                     store.output.error(err.to_string());
                 }
+            }
+            Ok(Command::Pull { max_messages }) => {
+                let mut store = store.lock().unwrap();
+                store.pull(max_messages);
             }
             Ok(Command::Stop) => {
                 let _ = shutdown_tx.send(());

@@ -104,6 +104,13 @@ target/debug, target/release, then `exec-path'."
   :type '(choice (const :tag "Auto-detect" nil) file)
   :group 'json-log-viewer)
 
+(defcustom json-log-viewer-pull-interval 1.0
+  "Seconds between non-blocking pulls from the Rust worker.
+
+Set to nil or 0 to disable periodic live pulls."
+  :type '(choice (const :tag "Disabled" nil) number)
+  :group 'json-log-viewer)
+
 (cl-defstruct (json-log-viewer--worker
                (:constructor json-log-viewer--worker-create))
   "Runtime state for the Rust json-log-viewer worker."
@@ -111,6 +118,8 @@ target/debug, target/release, then `exec-path'."
   command-partial-output
   socket-path
   ingest-process
+  pull-timer
+  pull-in-flight-p
   ready-p
   pending-ingest-lines)
 
@@ -444,9 +453,21 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
        (setf (json-log-viewer--worker-ready-p worker) t)
        (json-log-viewer--ensure-ingest-process)
        (json-log-viewer--flush-pending-ingest-lines)
+       (json-log-viewer--start-pull-timer)
        (when json-log-viewer--on-worker-ready
          (funcall json-log-viewer--on-worker-ready)
          (setq json-log-viewer--on-worker-ready nil))))
+    ('pull-begin
+     (let ((count (plist-get command :count)))
+       (when (and (integerp count) (> count 0))
+         (let ((max-messages (json-log-viewer--pull-max-messages)))
+           (when max-messages
+             (let ((drop (max 0 (- (+ json-log-viewer--entry-count count)
+                                   max-messages))))
+               (json-log-viewer--drop-oldest-rendered-entries drop)))))))
+    ('pull-complete
+     (when-let ((worker json-log-viewer--async-queue))
+       (setf (json-log-viewer--worker-pull-in-flight-p worker) nil)))
     ('request-complete
      (setq json-log-viewer--async-pending-count
            (max 0 (1- json-log-viewer--async-pending-count))))
@@ -494,6 +515,7 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
 (defun json-log-viewer--stop-async-queue ()
   "Stop worker for current buffer."
   (json-log-viewer--cancel-render-queue)
+  (json-log-viewer--stop-pull-timer)
   (when-let ((worker json-log-viewer--async-queue))
     (when-let ((ingest (json-log-viewer--worker-ingest-process worker)))
       (when (process-live-p ingest)
@@ -536,6 +558,7 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
   "Handle worker process EVENT for WORKER in BUFFER."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
+      (json-log-viewer--stop-pull-timer worker)
       (when-let ((ingest (json-log-viewer--worker-ingest-process worker)))
         (when (process-live-p ingest)
           (delete-process ingest)))
@@ -555,6 +578,15 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
         :extra-paths (vconcat (or json-log-viewer--extra-paths nil))
         :json-paths (vconcat (or json-log-viewer--json-paths nil))))
 
+(defun json-log-viewer--pull-max-messages ()
+  "Return the current maximum number of live messages to pull."
+  (or (and (integerp json-log-viewer--stream-max-entries)
+           (> json-log-viewer--stream-max-entries 0)
+           json-log-viewer--stream-max-entries)
+      (and (integerp json-log-viewer-stream-max-entries)
+           (> json-log-viewer-stream-max-entries 0)
+           json-log-viewer-stream-max-entries)))
+
 (defun json-log-viewer--send-worker-command (command)
   "Send COMMAND plist to the current buffer worker stdin."
   (let* ((worker (or json-log-viewer--async-queue
@@ -563,6 +595,69 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
     (unless (process-live-p proc)
       (error "json-log-viewer worker process is not running"))
     (process-send-string proc (json-log-viewer--json-line command))))
+
+(defun json-log-viewer--pull-worker ()
+  "Request pending live messages from the Rust worker without blocking."
+  (when-let ((worker json-log-viewer--async-queue))
+    (when (and (json-log-viewer--worker-ready-p worker)
+               (not (json-log-viewer--worker-pull-in-flight-p worker)))
+      (setf (json-log-viewer--worker-pull-in-flight-p worker) t)
+      (condition-case err
+          (let ((max-messages (json-log-viewer--pull-max-messages)))
+            (json-log-viewer--send-worker-command
+             (append (list :cmd "pull")
+                     (when max-messages
+                       (list :max-messages max-messages)))))
+        (error
+         (setf (json-log-viewer--worker-pull-in-flight-p worker) nil)
+         (message "json-log-viewer pull failed: %s"
+                  (error-message-string err)))))))
+
+(defun json-log-viewer--await-pull-idle (worker deadline)
+  "Wait until WORKER has no pull in flight, before DEADLINE."
+  (while (and (json-log-viewer--worker-pull-in-flight-p worker)
+              (< (float-time) deadline))
+    (accept-process-output (json-log-viewer--worker-process worker) 0.01))
+  (when (json-log-viewer--worker-pull-in-flight-p worker)
+    (setf (json-log-viewer--worker-pull-in-flight-p worker) nil)
+    (error "Timed out waiting for json-log-viewer pull response")))
+
+(defun json-log-viewer--await-pull-complete ()
+  "Send one explicit pull and wait for its response."
+  (let ((deadline (+ (float-time) 15.0))
+        (worker (or json-log-viewer--async-queue
+                    (error "json-log-viewer worker is not running"))))
+    (json-log-viewer--await-pull-idle worker deadline)
+    (json-log-viewer--pull-worker)
+    (while (and (or (json-log-viewer--worker-pull-in-flight-p worker)
+                    json-log-viewer--pending-render-queue
+                    json-log-viewer--render-drain-timer)
+                (< (float-time) deadline))
+      (accept-process-output (json-log-viewer--worker-process worker) 0.01))
+    (json-log-viewer--await-pull-idle worker deadline)))
+
+(defun json-log-viewer--stop-pull-timer (&optional worker)
+  "Cancel WORKER's pull timer, or the current worker timer when nil."
+  (when-let* ((worker (or worker json-log-viewer--async-queue))
+              (timer (json-log-viewer--worker-pull-timer worker)))
+    (cancel-timer timer)
+    (setf (json-log-viewer--worker-pull-timer worker) nil)
+    (setf (json-log-viewer--worker-pull-in-flight-p worker) nil)))
+
+(defun json-log-viewer--start-pull-timer ()
+  "Start periodic non-blocking pulls for the current worker."
+  (json-log-viewer--stop-pull-timer)
+  (when-let ((worker json-log-viewer--async-queue))
+    (let ((interval json-log-viewer-pull-interval))
+      (when (and (numberp interval) (> interval 0))
+        (let ((buf (current-buffer)))
+          (setf (json-log-viewer--worker-pull-timer worker)
+                (run-with-timer
+                 0 interval
+                 (lambda ()
+                   (when (buffer-live-p buf)
+                     (with-current-buffer buf
+                       (json-log-viewer--pull-worker)))))))))))
 
 (defun json-log-viewer--connect-ingest-process ()
   "Open and return the Unix socket process used for ingestion."
@@ -640,7 +735,8 @@ When WAIT-FOR-CALLBACK is non-nil, wait for a socket barrier response."
         (setq json-log-viewer--async-pending-count
               (1+ json-log-viewer--async-pending-count))
         (json-log-viewer--send-ingest-flush request-id)
-        (json-log-viewer--async-await-pending-count before)))))
+        (json-log-viewer--async-await-pending-count before)
+        (json-log-viewer--await-pull-complete)))))
 
 (defun json-log-viewer--worker-command-from-job (job)
   "Translate legacy async JOB plist into the Rust worker command protocol."
@@ -710,6 +806,8 @@ When WAIT-FOR-CALLBACK is non-nil, wait for a socket barrier response."
                     :command-partial-output ""
                     :socket-path socket-path
                     :ingest-process nil
+                    :pull-timer nil
+                    :pull-in-flight-p nil
                     :ready-p nil
                     :pending-ingest-lines nil)))
       (set-process-query-on-exit-flag process nil)

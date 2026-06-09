@@ -34,6 +34,7 @@
                 in
                 rel == "Cargo.toml"
                 || rel == "Cargo.lock"
+                || rel == "rust"
                 || lib.hasPrefix "rust/" rel;
             };
 
