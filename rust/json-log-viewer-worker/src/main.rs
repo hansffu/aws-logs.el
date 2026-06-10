@@ -6,8 +6,8 @@ use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -142,27 +142,39 @@ enum PublishMode {
     OnDemand,
 }
 
+enum ProcessMessage {
+    Command(Command),
+    IngestLine(String),
+    Flush(Option<i64>),
+    Shutdown,
+}
+
 struct Store {
     db: Connection,
+    storage_path: PathBuf,
     config: RuntimeConfig,
     render_mode: RenderMode,
     render_narrow: Option<String>,
     publish_mode: PublishMode,
     pending_entries: VecDeque<Entry>,
+    total_count: i64,
     output: Output,
 }
 
 impl Store {
-    fn new(config: RuntimeConfig, output: Output) -> rusqlite::Result<Self> {
-        let db = Connection::open_in_memory()?;
+    fn new(config: RuntimeConfig, output: Output, storage_path: PathBuf) -> rusqlite::Result<Self> {
+        cleanup_storage_files(&storage_path);
+        let db = Connection::open(&storage_path)?;
         setup_db(&db)?;
         Ok(Self {
             db,
+            storage_path,
             config,
             render_mode: RenderMode::All,
             render_narrow: None,
             publish_mode: PublishMode::Live,
             pending_entries: VecDeque::new(),
+            total_count: 0,
             output,
         })
     }
@@ -172,6 +184,7 @@ impl Store {
         self.render_mode = RenderMode::All;
         self.render_narrow = None;
         self.pending_entries.clear();
+        self.total_count = 0;
         let _ = self.db.execute("DELETE FROM log_entry", []);
         self.output.send(json!({"cmd": "clear"}));
         self.output.send(json!({
@@ -191,14 +204,17 @@ impl Store {
         let publish_live = self.publish_mode == PublishMode::Live;
         let tx = self.db.transaction()?;
         let mut entries = Vec::new();
+        let mut inserted_count = 0;
         for line in lines {
             if let Some(entry) =
                 insert_log_entry(&tx, line, &viewer_config, active_narrow.as_deref())?
             {
                 entries.push(entry);
             }
+            inserted_count += 1;
         }
         tx.commit()?;
+        self.total_count += inserted_count;
         if publish_live {
             self.queue_pending_entries(entries);
         }
@@ -227,7 +243,7 @@ impl Store {
     }
 
     fn queue_pending_entries(&mut self, entries: Vec<Entry>) {
-        let max_entries = self.config.max_entries;
+        let max_entries = self.config.max_entries.map(|limit| limit.saturating_add(1));
         for entry in entries {
             self.pending_entries.push_back(entry);
             if let Some(max_entries) = max_entries {
@@ -238,13 +254,10 @@ impl Store {
         }
     }
 
-    fn total_count(&self) -> rusqlite::Result<i64> {
-        self.db
-            .query_row("SELECT COUNT(*) FROM log_entry", [], |row| row.get(0))
-    }
-
-    fn pull(&mut self, max_messages: Option<usize>) -> rusqlite::Result<()> {
-        let max_messages = max_messages.or(self.config.max_entries);
+    fn pull(&mut self, max_messages: Option<usize>) {
+        let max_messages = max_messages
+            .or(self.config.max_entries)
+            .map(|limit| limit.saturating_add(1));
         if let Some(max_messages) = max_messages {
             while self.pending_entries.len() > max_messages {
                 self.pending_entries.pop_front();
@@ -255,14 +268,13 @@ impl Store {
         self.output.send(json!({
             "cmd": "status",
             "pending-pull-count": entries.len(),
-            "total-count": self.total_count()?
+            "total-count": self.total_count
         }));
         for batch in entries.chunks(self.config.chunk_size.max(1)) {
             self.output
                 .send(json!({"cmd": "render-entries", "entries": batch}));
         }
         self.output.send(json!({"cmd": "pull-complete"}));
-        Ok(())
     }
 
     fn publish_rerender_chunks(&self) {
@@ -386,6 +398,135 @@ fn output_thread(rx: Receiver<String>) {
     }
 }
 
+fn process_thread(mut store: Store, rx: Receiver<ProcessMessage>) {
+    let storage_path = store.storage_path.clone();
+    let mut pending_message = None;
+    let mut disconnected = false;
+
+    loop {
+        let message = match pending_message.take() {
+            Some(message) => message,
+            None => match rx.recv() {
+                Ok(message) => message,
+                Err(_) => break,
+            },
+        };
+
+        match message {
+            ProcessMessage::Command(command) => {
+                if handle_process_command(&mut store, command) {
+                    break;
+                }
+            }
+            ProcessMessage::IngestLine(line) => {
+                let mut lines = vec![line];
+                while lines.len() < 1000 {
+                    match rx.try_recv() {
+                        Ok(ProcessMessage::IngestLine(line)) => lines.push(line),
+                        Ok(message) => {
+                            pending_message = Some(message);
+                            break;
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+                if let Err(err) = store.ingest_lines(&lines) {
+                    store.output.error(err.to_string());
+                }
+                if disconnected {
+                    break;
+                }
+            }
+            ProcessMessage::Flush(request_id) => {
+                store.output.complete(request_id);
+            }
+            ProcessMessage::Shutdown => break,
+        }
+    }
+
+    drop(store);
+    cleanup_storage_files(&storage_path);
+}
+
+fn handle_process_command(store: &mut Store, command: Command) -> bool {
+    match command {
+        Command::Start { .. } => {
+            store
+                .output
+                .error("start command is only valid as the first worker command");
+        }
+        Command::Reset { request_id } => {
+            store.reset();
+            store.output.complete(request_id);
+        }
+        Command::Narrow { needle, request_id } => {
+            store.narrow(needle);
+            store.output.complete(request_id);
+        }
+        Command::Rerender { needle, request_id } => {
+            store.rerender(needle);
+            store.output.complete(request_id);
+        }
+        Command::LoadMore {
+            limit,
+            direction,
+            timestamp,
+            entry_id,
+            prepend,
+            request_id,
+        } => {
+            if let Err(err) = store.load_more(
+                limit,
+                &direction,
+                &timestamp,
+                entry_id,
+                prepend.unwrap_or(false),
+                request_id,
+            ) {
+                store.output.error(err.to_string());
+            }
+        }
+        Command::EntryDetails {
+            entry_id,
+            request_id,
+        } => {
+            if let Err(err) = store.entry_details(entry_id, request_id) {
+                store.output.error(err.to_string());
+            }
+        }
+        Command::Pull { max_messages } => store.pull(max_messages),
+        Command::Stop => return true,
+    }
+    false
+}
+
+fn storage_path_from_socket_path(socket_path: &str) -> PathBuf {
+    let mut path = PathBuf::from(socket_path);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("{name}.sqlite"))
+        .unwrap_or_else(|| "json-log-viewer-worker.sqlite".to_string());
+    path.set_file_name(file_name);
+    path
+}
+
+fn cleanup_storage_files(path: &Path) {
+    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(sqlite_sidecar_path(path, "-wal"));
+    let _ = fs::remove_file(sqlite_sidecar_path(path, "-shm"));
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
+}
+
 fn value_to_lisp(value: &Value) -> String {
     match value {
         Value::Null => "nil".to_string(),
@@ -434,7 +575,7 @@ fn lisp_string(text: &str) -> String {
     out
 }
 
-fn command_thread(store: Arc<Mutex<Store>>, output: Output, shutdown_tx: Sender<()>) {
+fn command_thread(process_tx: Sender<ProcessMessage>, output: Output, shutdown_tx: Sender<()>) {
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
@@ -445,69 +586,26 @@ fn command_thread(store: Arc<Mutex<Store>>, output: Output, shutdown_tx: Sender<
             Ok(Command::Start { .. }) => {
                 output.error("start command is only valid as the first worker command");
             }
-            Ok(Command::Reset { request_id }) => {
-                let mut store = store.lock().unwrap();
-                store.reset();
-                store.output.complete(request_id);
-            }
-            Ok(Command::Narrow { needle, request_id }) => {
-                let mut store = store.lock().unwrap();
-                store.narrow(needle);
-                store.output.complete(request_id);
-            }
-            Ok(Command::Rerender { needle, request_id }) => {
-                let mut store = store.lock().unwrap();
-                store.rerender(needle);
-                store.output.complete(request_id);
-            }
-            Ok(Command::LoadMore {
-                limit,
-                direction,
-                timestamp,
-                entry_id,
-                prepend,
-                request_id,
-            }) => {
-                let mut store = store.lock().unwrap();
-                if let Err(err) = store.load_more(
-                    limit,
-                    &direction,
-                    &timestamp,
-                    entry_id,
-                    prepend.unwrap_or(false),
-                    request_id,
-                ) {
-                    store.output.error(err.to_string());
-                }
-            }
-            Ok(Command::EntryDetails {
-                entry_id,
-                request_id,
-            }) => {
-                let store = store.lock().unwrap();
-                if let Err(err) = store.entry_details(entry_id, request_id) {
-                    store.output.error(err.to_string());
-                }
-            }
-            Ok(Command::Pull { max_messages }) => {
-                let mut store = store.lock().unwrap();
-                if let Err(err) = store.pull(max_messages) {
-                    store.output.error(err.to_string());
-                }
-            }
             Ok(Command::Stop) => {
                 let _ = shutdown_tx.send(());
+                let _ = process_tx.send(ProcessMessage::Shutdown);
                 break;
+            }
+            Ok(command) => {
+                if process_tx.send(ProcessMessage::Command(command)).is_err() {
+                    break;
+                }
             }
             Err(err) => output.error(format!("failed to parse command: {err}")),
         }
     }
     let _ = shutdown_tx.send(());
+    let _ = process_tx.send(ProcessMessage::Shutdown);
 }
 
 fn ingestion_thread(
     socket_path: String,
-    store: Arc<Mutex<Store>>,
+    process_tx: Sender<ProcessMessage>,
     output: Output,
     shutdown_rx: Receiver<()>,
 ) {
@@ -527,9 +625,9 @@ fn ingestion_thread(
         }
         match listener.accept() {
             Ok((stream, _addr)) => {
-                let store = Arc::clone(&store);
+                let process_tx = process_tx.clone();
                 let output = output.clone();
-                thread::spawn(move || handle_ingest_stream(stream, store, output));
+                thread::spawn(move || handle_ingest_stream(stream, process_tx, output));
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(std::time::Duration::from_millis(10));
@@ -543,7 +641,7 @@ fn ingestion_thread(
     let _ = fs::remove_file(&socket_path);
 }
 
-fn handle_ingest_stream(stream: UnixStream, store: Arc<Mutex<Store>>, output: Output) {
+fn handle_ingest_stream(stream: UnixStream, process_tx: Sender<ProcessMessage>, output: Output) {
     let mut reader = BufReader::new(stream);
     let mut raw_line = Vec::new();
     loop {
@@ -565,16 +663,19 @@ fn handle_ingest_stream(stream: UnixStream, store: Arc<Mutex<Store>>, output: Ou
         }
         if raw_line.starts_with(b"L ") {
             let line = String::from_utf8_lossy(&raw_line[2..]).into_owned();
-            let mut store = store.lock().unwrap();
-            if let Err(err) = store.ingest_lines(&[line]) {
-                store.output.error(err.to_string());
+            if process_tx.send(ProcessMessage::IngestLine(line)).is_err() {
+                break;
             }
         } else if raw_line.starts_with(b"F ") {
             let request_id_text = String::from_utf8_lossy(&raw_line[2..]);
             match request_id_text.parse::<i64>() {
                 Ok(request_id) => {
-                    let store = store.lock().unwrap();
-                    store.output.complete(Some(request_id));
+                    if process_tx
+                        .send(ProcessMessage::Flush(Some(request_id)))
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
                 Err(err) => output.error(format!("invalid ingest flush frame: {err}")),
             }
@@ -615,35 +716,40 @@ fn main() {
         chunk_size: chunk_size.unwrap_or(100).max(1),
         rebuild_chunk_size: rebuild_chunk_size.or(chunk_size).unwrap_or(500).max(1),
     };
-    let store = match Store::new(runtime_config, output_for_store) {
+    let (process_tx, process_rx) = mpsc::channel::<ProcessMessage>();
+    let storage_path = storage_path_from_socket_path(&socket_path);
+    let store = match Store::new(runtime_config, output_for_store, storage_path) {
         Ok(store) => store,
         Err(err) => {
             output.error(format!("failed to initialize store: {err}"));
             return;
         }
     };
-    let store = Arc::new(Mutex::new(store));
+    let process_handle = thread::spawn(move || process_thread(store, process_rx));
 
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
-    let ingest_store = Arc::clone(&store);
+    let ingest_process_tx = process_tx.clone();
     let ingest_output = output.clone();
     let socket_path_for_thread = socket_path.clone();
-    thread::spawn(move || {
+    let ingest_handle = thread::spawn(move || {
         ingestion_thread(
             socket_path_for_thread,
-            ingest_store,
+            ingest_process_tx,
             ingest_output,
             shutdown_rx,
         );
     });
-    let command_store = Arc::clone(&store);
     let command_output = output.clone();
     let command_shutdown_tx = shutdown_tx.clone();
-    let command_handle =
-        thread::spawn(move || command_thread(command_store, command_output, command_shutdown_tx));
+    let command_process_tx = process_tx.clone();
+    let command_handle = thread::spawn(move || {
+        command_thread(command_process_tx, command_output, command_shutdown_tx)
+    });
     let _ = command_handle.join();
     let _ = shutdown_tx.send(());
-    drop(store);
+    let _ = process_tx.send(ProcessMessage::Shutdown);
+    let _ = ingest_handle.join();
+    let _ = process_handle.join();
     drop(output);
     drop(out_tx);
     let _ = output_handle;
@@ -984,6 +1090,11 @@ fn flatten_node(
 }
 
 fn pretty_json_value(value: &Value) -> String {
+    let parsed_string_value = match value {
+        Value::String(text) if looks_like_json(text) => serde_json::from_str::<Value>(text).ok(),
+        _ => None,
+    };
+    let value = parsed_string_value.as_ref().unwrap_or(value);
     serde_json::to_string_pretty(value)
         .unwrap_or_else(|_| value_to_string(value).unwrap_or_default())
 }
