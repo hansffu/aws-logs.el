@@ -104,6 +104,11 @@ target/debug, target/release, then `exec-path'."
   :type '(choice (const :tag "Auto-detect" nil) file)
   :group 'json-log-viewer)
 
+(defcustom json-log-viewer-auto-delete-worker-files t
+  "When non-nil, delete worker socket and SQLite files when buffers close."
+  :type 'boolean
+  :group 'json-log-viewer)
+
 (defcustom json-log-viewer-ingest-wrapper-program nil
   "Path to the json-log-viewer Rust ingestion wrapper executable.
 
@@ -594,9 +599,9 @@ When BUFFER-OR-NAME is nil, use the current buffer."
         (ignore-errors
           (process-send-string proc (json-log-viewer--json-line '(:cmd "stop"))))
         (delete-process proc)))
-    (when-let ((socket-path (json-log-viewer--worker-socket-path worker)))
-      (when (file-exists-p socket-path)
-        (ignore-errors (delete-file socket-path))))
+    (when json-log-viewer-auto-delete-worker-files
+      (json-log-viewer--delete-worker-files
+       (json-log-viewer--worker-socket-path worker)))
     (setq json-log-viewer--async-queue nil))
   (setq json-log-viewer--async-pending-count 0)
   (setq json-log-viewer--async-next-request-id 0)
@@ -631,13 +636,30 @@ When BUFFER-OR-NAME is nil, use the current buffer."
       (when-let ((ingest (json-log-viewer--worker-ingest-process worker)))
         (when (process-live-p ingest)
           (delete-process ingest)))
-      (when-let ((socket-path (json-log-viewer--worker-socket-path worker)))
-        (when (file-exists-p socket-path)
-          (ignore-errors (delete-file socket-path))))
+      (when json-log-viewer-auto-delete-worker-files
+        (json-log-viewer--delete-worker-files
+         (json-log-viewer--worker-socket-path worker)))
       (when (eq worker json-log-viewer--async-queue)
         (setq json-log-viewer--async-queue nil)
         (setq json-log-viewer--async-pending-count 0))
       (message "json-log-viewer worker exited: %s" (string-trim event)))))
+
+(defun json-log-viewer--worker-storage-path (socket-path)
+  "Return SQLite storage path derived from SOCKET-PATH."
+  (when socket-path
+    (concat socket-path ".sqlite")))
+
+(defun json-log-viewer--delete-worker-files (socket-path)
+  "Delete worker socket and SQLite files derived from SOCKET-PATH."
+  (when socket-path
+    (let ((db-path (json-log-viewer--worker-storage-path socket-path)))
+      (dolist (path (delq nil
+                          (list socket-path
+                                db-path
+                                (and db-path (concat db-path "-wal"))
+                                (and db-path (concat db-path "-shm")))))
+      (when (file-exists-p path)
+        (ignore-errors (delete-file path)))))))
 
 (defun json-log-viewer--worker-config ()
   "Return worker config plist for current buffer."
@@ -906,6 +928,8 @@ When WAIT-FOR-CALLBACK is non-nil, wait for a socket barrier response."
       (json-log-viewer--send-worker-command
        (list :cmd "start"
              :socket-path socket-path
+             :auto-delete-worker-files
+             (if json-log-viewer-auto-delete-worker-files t :false)
              :max-entries max-entries
              :chunk-size chunk-size
              :rebuild-chunk-size rebuild-chunk-size

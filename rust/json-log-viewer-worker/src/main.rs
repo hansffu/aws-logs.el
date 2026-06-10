@@ -44,6 +44,8 @@ enum Command {
         chunk_size: Option<usize>,
         #[serde(rename = "rebuild-chunk-size")]
         rebuild_chunk_size: Option<usize>,
+        #[serde(rename = "auto-delete-worker-files", default = "default_true")]
+        auto_delete_worker_files: bool,
         config: ViewerConfig,
     },
     Reset {
@@ -130,6 +132,10 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RenderMode {
     All,
@@ -152,6 +158,7 @@ enum ProcessMessage {
 struct Store {
     db: Connection,
     storage_path: PathBuf,
+    auto_delete_worker_files: bool,
     config: RuntimeConfig,
     render_mode: RenderMode,
     render_narrow: Option<String>,
@@ -162,13 +169,19 @@ struct Store {
 }
 
 impl Store {
-    fn new(config: RuntimeConfig, output: Output, storage_path: PathBuf) -> rusqlite::Result<Self> {
+    fn new(
+        config: RuntimeConfig,
+        output: Output,
+        storage_path: PathBuf,
+        auto_delete_worker_files: bool,
+    ) -> rusqlite::Result<Self> {
         cleanup_storage_files(&storage_path);
         let db = Connection::open(&storage_path)?;
         setup_db(&db)?;
         Ok(Self {
             db,
             storage_path,
+            auto_delete_worker_files,
             config,
             render_mode: RenderMode::All,
             render_narrow: None,
@@ -400,6 +413,7 @@ fn output_thread(rx: Receiver<String>) {
 
 fn process_thread(mut store: Store, rx: Receiver<ProcessMessage>) {
     let storage_path = store.storage_path.clone();
+    let auto_delete_worker_files = store.auto_delete_worker_files;
     let mut pending_message = None;
     let mut disconnected = false;
 
@@ -449,7 +463,9 @@ fn process_thread(mut store: Store, rx: Receiver<ProcessMessage>) {
     }
 
     drop(store);
-    cleanup_storage_files(&storage_path);
+    if auto_delete_worker_files {
+        cleanup_storage_files(&storage_path);
+    }
 }
 
 fn handle_process_command(store: &mut Store, command: Command) -> bool {
@@ -608,6 +624,7 @@ fn ingestion_thread(
     process_tx: Sender<ProcessMessage>,
     output: Output,
     shutdown_rx: Receiver<()>,
+    auto_delete_worker_files: bool,
 ) {
     let _ = fs::remove_file(&socket_path);
     let listener = match UnixListener::bind(&socket_path) {
@@ -638,7 +655,9 @@ fn ingestion_thread(
             }
         }
     }
-    let _ = fs::remove_file(&socket_path);
+    if auto_delete_worker_files {
+        let _ = fs::remove_file(&socket_path);
+    }
 }
 
 fn handle_ingest_stream(stream: UnixStream, process_tx: Sender<ProcessMessage>, output: Output) {
@@ -703,6 +722,7 @@ fn main() {
         max_entries,
         chunk_size,
         rebuild_chunk_size,
+        auto_delete_worker_files,
         config,
     } = first_command
     else {
@@ -718,7 +738,12 @@ fn main() {
     };
     let (process_tx, process_rx) = mpsc::channel::<ProcessMessage>();
     let storage_path = storage_path_from_socket_path(&socket_path);
-    let store = match Store::new(runtime_config, output_for_store, storage_path) {
+    let store = match Store::new(
+        runtime_config,
+        output_for_store,
+        storage_path,
+        auto_delete_worker_files,
+    ) {
         Ok(store) => store,
         Err(err) => {
             output.error(format!("failed to initialize store: {err}"));
@@ -737,6 +762,7 @@ fn main() {
             ingest_process_tx,
             ingest_output,
             shutdown_rx,
+            auto_delete_worker_files,
         );
     });
     let command_output = output.clone();

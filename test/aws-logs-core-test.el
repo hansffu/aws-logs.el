@@ -749,6 +749,28 @@
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
+(ert-deftest json-log-viewer-worker-storage-path-follows-socket-path-test ()
+  (should (equal (json-log-viewer--worker-storage-path
+                  "/tmp/json-log-viewer-worker-socket-abc123")
+                 "/tmp/json-log-viewer-worker-socket-abc123.sqlite")))
+
+(ert-deftest json-log-viewer-delete-worker-files-removes-socket-and-db-test ()
+  (let* ((socket-path (make-temp-file "json-log-viewer-worker-socket-test-"))
+         (db-path (json-log-viewer--worker-storage-path socket-path))
+         (wal-path (concat db-path "-wal"))
+         (shm-path (concat db-path "-shm")))
+    (unwind-protect
+        (progn
+          (dolist (path (list db-path wal-path shm-path))
+            (with-temp-file path
+              (insert "")))
+          (json-log-viewer--delete-worker-files socket-path)
+          (dolist (path (list socket-path db-path wal-path shm-path))
+            (should-not (file-exists-p path))))
+      (dolist (path (list socket-path db-path wal-path shm-path))
+        (when (file-exists-p path)
+          (delete-file path))))))
+
 (ert-deftest json-log-viewer-status-updates-total-count-test ()
   (with-temp-buffer
     (json-log-viewer-mode)
