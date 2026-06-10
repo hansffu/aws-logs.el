@@ -62,6 +62,10 @@
           type = "app";
           program = "${self.packages.${pkgs.system}.json-log-viewer-worker}/bin/json-log-viewer-ingest-wrapper";
         };
+        kube-log-supervisor = {
+          type = "app";
+          program = "${self.packages.${pkgs.system}.json-log-viewer-worker}/bin/kube-log-supervisor";
+        };
         default = self.apps.${pkgs.system}.json-log-viewer-worker;
       });
 

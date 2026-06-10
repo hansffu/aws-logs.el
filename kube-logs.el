@@ -18,6 +18,7 @@
 (require 'json-log-viewer)
 
 (declare-function json-log-viewer-ingest-wrapper-executable "json-log-viewer" ())
+(declare-function json-log-viewer-kube-log-supervisor-executable "json-log-viewer" ())
 (declare-function json-log-viewer-worker-socket-path "json-log-viewer"
                   (&optional buffer-or-name))
 
@@ -93,6 +94,22 @@ When non-nil, output is piped through grep with this regex."
 (defcustom kube-logs-stream-max-lines-per-batch 250
   "Maximum lines rendered per stream drain tick for kube-logs."
   :type 'integer
+  :group 'kube-logs)
+
+(defcustom kube-logs-stream-backend 'rust
+  "Backend used for streaming kube logs.
+
+`rust' uses the kube-rs supervisor for pod/deployment follow mode.
+`kubectl' keeps the legacy kubectl logs stream."
+  :type '(choice (const :tag "Rust kube-rs supervisor" rust)
+                 (const :tag "kubectl logs" kubectl))
+  :group 'kube-logs)
+
+(defcustom kube-logs-debug-process-buffer nil
+  "When non-nil, keep a process buffer for Rust supervisor diagnostics.
+
+Supervisor stderr is always forwarded to `message'."
+  :type 'boolean
   :group 'kube-logs)
 
 (defcustom kube-logs-level-path nil
@@ -175,6 +192,12 @@ Each element has the form (NAME . PLIST).")
 
 (defvar-local kube-logs--once-output-buffer nil
   "Temporary process output buffer for one-shot asynchronous fetches.")
+
+(defvar-local kube-logs--process-log-buffer nil
+  "Diagnostics buffer for the current kube-logs process.")
+
+(defvar-local kube-logs--process-log-pending-fragment ""
+  "Pending incomplete diagnostics line for the current kube-logs process.")
 
 (defvar-local kube-logs--viewer-context nil
   "Context displayed in the current viewer buffer header.")
@@ -386,6 +409,61 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
          "--")
    command))
 
+(defun kube-logs--supervisor-command (socket-path)
+  "Return kube-rs supervisor command for SOCKET-PATH."
+  (append
+   (list (json-log-viewer-kube-log-supervisor-executable)
+         "--socket" socket-path)
+   (when (and kube-logs-context (not (string-empty-p kube-logs-context)))
+     (list "--context" kube-logs-context))
+   (when kube-logs-namespace-enabled
+     (when (or (null kube-logs-namespace) (string-empty-p kube-logs-namespace))
+       (user-error "Set a namespace first or disable namespace override with -n"))
+     (list "--namespace" kube-logs-namespace))
+   (list "--target-kind" kube-logs-target-kind
+         "--target" kube-logs-target)
+   (when kube-logs-tail-lines
+     (list "--tail" (number-to-string kube-logs-tail-lines)))
+   (when (and kube-logs-since (not (string-empty-p kube-logs-since)))
+     (list "--since" kube-logs-since))
+   (when (and kube-logs-filter (not (string-empty-p kube-logs-filter)))
+     (list "--filter" kube-logs-filter))))
+
+(defun kube-logs--process-log-buffer-name ()
+  "Return process diagnostics buffer name for the current kube log stream."
+  (format "*Kube logs process - %s/%s*"
+          (kube-logs--namespace-display kube-logs-namespace-enabled kube-logs-namespace)
+          (or kube-logs-target "-")))
+
+(defun kube-logs--make-process-log-buffer ()
+  "Create and initialize the current kube log diagnostics buffer."
+  (when kube-logs-debug-process-buffer
+    (let ((buffer (get-buffer-create (kube-logs--process-log-buffer-name))))
+      (with-current-buffer buffer
+        (let ((inhibit-read-only t))
+          (erase-buffer))
+        (fundamental-mode))
+      buffer)))
+
+(defun kube-logs--supervisor-process-filter (viewer-buffer proc output)
+  "Forward supervisor PROC stderr OUTPUT to messages and optional debug buffer."
+  (when (buffer-live-p viewer-buffer)
+    (with-current-buffer viewer-buffer
+      (when-let ((process-buffer (and proc (process-buffer proc))))
+        (with-current-buffer process-buffer
+          (let ((inhibit-read-only t))
+            (goto-char (point-max))
+            (insert output))))
+      (let* ((combined (concat kube-logs--process-log-pending-fragment output))
+             (parts (split-string combined "\n"))
+             (complete-lines (if (string-suffix-p "\n" combined) parts (butlast parts)))
+             (rest (if (string-suffix-p "\n" combined) "" (car (last parts)))))
+        (setq kube-logs--process-log-pending-fragment (or rest ""))
+        (dolist (line complete-lines)
+          (let ((text (string-trim line)))
+            (unless (string-empty-p text)
+              (message "%s" text))))))))
+
 (defun kube-logs--install-viewer-keymap ()
   "Install buffer-local keymap tweaks for kube logs viewer buffers."
   (let ((map (copy-keymap (current-local-map))))
@@ -410,7 +488,9 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
       (setq kube-logs--stream-pending-lines nil)
       (when (buffer-live-p kube-logs--once-output-buffer)
         (kill-buffer kube-logs--once-output-buffer))
-      (setq kube-logs--once-output-buffer nil))))
+      (setq kube-logs--once-output-buffer nil)
+      (setq kube-logs--process-log-buffer nil)
+      (setq kube-logs--process-log-pending-fragment ""))))
 
 (defun kube-logs-quit-process-and-window ()
   "Stop log process for current buffer and close the window."
@@ -444,6 +524,8 @@ ON-READY is called once the async worker is ready to receive jobs."
       (setq-local kube-logs--stream-pending-lines nil)
       (setq-local kube-logs--stream-drain-timer nil)
       (setq-local kube-logs--once-output-buffer nil)
+      (setq-local kube-logs--process-log-buffer nil)
+      (setq-local kube-logs--process-log-pending-fragment "")
       (setq-local kube-logs--viewer-context kube-logs-context)
       (setq-local kube-logs--viewer-namespace kube-logs-namespace)
       (setq-local kube-logs--viewer-namespace-enabled kube-logs-namespace-enabled)
@@ -677,8 +759,8 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
     (with-current-buffer buffer
       (setq-local kube-logs--process process))))
 
-(defun kube-logs--run-stream ()
-  "Start streaming logs and render them in json-log-viewer."
+(defun kube-logs--run-stream-kubectl ()
+  "Start streaming logs through kubectl and render them in json-log-viewer."
   (let* ((args (kube-logs--logs-args))
          (command (kube-logs--command-with-filter args t))
          (description (kube-logs--target-description))
@@ -702,6 +784,59 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
                  (setq-local kube-logs--process process))
                (message "Started kube logs stream for %s" description)))))
     (display-buffer buffer)))
+
+(defun kube-logs--supervisor-sentinel (viewer-buffer proc event)
+  "Handle kube supervisor PROC lifecycle EVENT for VIEWER-BUFFER."
+  (when (memq (process-status proc) '(exit signal))
+    (when (buffer-live-p viewer-buffer)
+      (with-current-buffer viewer-buffer
+        (when (eq kube-logs--process proc)
+          (setq kube-logs--process nil))))
+    (when (not (zerop (process-exit-status proc)))
+      (message "kube log supervisor exited (%s): %s"
+               (process-exit-status proc)
+               (string-trim event)))))
+
+(defun kube-logs--run-stream-rust ()
+  "Start streaming logs through the Rust kube supervisor."
+  (let ((description (kube-logs--target-description))
+        buffer)
+    (setq
+     buffer
+     (kube-logs--make-viewer-buffer
+      (lambda ()
+        (let* ((socket-path (json-log-viewer-worker-socket-path buffer))
+               (command (kube-logs--supervisor-command socket-path))
+               (log-buffer (kube-logs--make-process-log-buffer))
+               (process
+                (make-process
+                 :name (kube-logs--process-name)
+                 :buffer log-buffer
+                 :command command
+                 :noquery t
+                 :connection-type 'pipe
+                 :filter
+                 (lambda (proc output)
+                   (kube-logs--supervisor-process-filter buffer proc output))
+                 :sentinel
+                 (lambda (proc event)
+                   (kube-logs--supervisor-sentinel buffer proc event)))))
+          (set-process-query-on-exit-flag process nil)
+          (with-current-buffer buffer
+            (setq-local kube-logs--process process)
+            (setq-local kube-logs--process-log-buffer log-buffer))
+          (if log-buffer
+              (message "Started kube log supervisor for %s; debug buffer %s"
+                       description
+                       (buffer-name log-buffer))
+            (message "Started kube log supervisor for %s" description))))))
+    (display-buffer buffer)))
+
+(defun kube-logs--run-stream ()
+  "Start streaming logs and render them in json-log-viewer."
+  (if (eq kube-logs-stream-backend 'rust)
+      (kube-logs--run-stream-rust)
+    (kube-logs--run-stream-kubectl)))
 
 (defun kube-logs-run ()
   "Run kubectl logs using current session selections."
@@ -778,6 +913,26 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
   :transient t
   (interactive)
   (setq kube-logs-follow (not kube-logs-follow))
+  (kube-logs--transient-reprompt))
+
+(transient-define-suffix kube-logs-toggle-stream-backend ()
+  "Toggle stream backend for follow mode."
+  :description (lambda ()
+                 (format "Stream backend: %s" kube-logs-stream-backend))
+  :transient t
+  (interactive)
+  (setq kube-logs-stream-backend
+        (if (eq kube-logs-stream-backend 'rust) 'kubectl 'rust))
+  (kube-logs--transient-reprompt))
+
+(transient-define-suffix kube-logs-toggle-debug-process-buffer ()
+  "Toggle Rust supervisor debug process buffer."
+  :description (lambda ()
+                 (format "Debug process buffer: %s"
+                         (if kube-logs-debug-process-buffer "on" "off")))
+  :transient t
+  (interactive)
+  (setq kube-logs-debug-process-buffer (not kube-logs-debug-process-buffer))
   (kube-logs--transient-reprompt))
 
 (transient-define-suffix kube-logs-select-context ()
@@ -1043,14 +1198,16 @@ This stores one active target; choosing pod/deployment replaces the other."
             (unless (or (null filter) (string-empty-p filter)) filter)))))
 
 (transient-define-prefix kube-logs-transient ()
-  "Transient menu for selecting and running kubectl logs."
+  "Transient menu for selecting and running Kubernetes logs."
   :remember-value 'exit
   [[("@" "Apply preset…" kube-logs-apply-preset)]]
   [["Config"
     ("-m" "Tail lines" kube-logs-infix-tail-lines)
     ("-s" "Since" kube-logs-infix-since)
     ("-F" "Filter" kube-logs-infix-filter)
-    ("-f" kube-logs-toggle-follow)]
+    ("-f" kube-logs-toggle-follow)
+    ("-b" kube-logs-toggle-stream-backend)
+    ("-D" kube-logs-toggle-debug-process-buffer)]
    ["Target"
     ("c" kube-logs-select-context)
     ("n" kube-logs-set-namespace)

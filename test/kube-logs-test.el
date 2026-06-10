@@ -14,6 +14,8 @@
 (defvar kube-logs-follow)
 (defvar kube-logs-tail-lines)
 (defvar kube-logs-since)
+(defvar kube-logs-filter)
+(defvar kube-logs-debug-process-buffer)
 (defvar kube-logs-presets)
 
 (ert-deftest kube-logs-target-ref-test ()
@@ -63,6 +65,64 @@
                      "--prefix"
                      "--timestamps")))))
 
+(ert-deftest kube-logs-supervisor-command-test ()
+  (let ((kube-logs-context "prod-cluster")
+        (kube-logs-namespace "payments")
+        (kube-logs-namespace-enabled t)
+        (kube-logs-target-kind "deployment")
+        (kube-logs-target "payments-api")
+        (kube-logs-tail-lines 150)
+        (kube-logs-since "10m")
+        (kube-logs-filter "ERROR|WARN"))
+    (cl-letf (((symbol-function 'json-log-viewer-kube-log-supervisor-executable)
+               (lambda () "/tmp/kube-log-supervisor")))
+      (should (equal (kube-logs--supervisor-command "/tmp/socket")
+                     '("/tmp/kube-log-supervisor"
+                       "--socket" "/tmp/socket"
+                       "--context" "prod-cluster"
+                       "--namespace" "payments"
+                       "--target-kind" "deployment"
+                       "--target" "payments-api"
+                       "--tail" "150"
+                       "--since" "10m"
+                       "--filter" "ERROR|WARN"))))))
+
+(ert-deftest kube-logs-process-log-buffer-disabled-by-default-test ()
+  (let ((kube-logs-namespace "payments")
+        (kube-logs-namespace-enabled t)
+        (kube-logs-target "payments-api")
+        (kube-logs-debug-process-buffer nil))
+    (should-not (kube-logs--make-process-log-buffer))))
+
+(ert-deftest kube-logs-process-log-buffer-created-when-debug-enabled-test ()
+  (let ((kube-logs-namespace "payments")
+        (kube-logs-namespace-enabled t)
+        (kube-logs-target "payments-api")
+        (kube-logs-debug-process-buffer t))
+    (let ((buffer (kube-logs--make-process-log-buffer)))
+      (unwind-protect
+          (with-current-buffer buffer
+            (should (equal (buffer-name) "*Kube logs process - payments/payments-api*"))
+            (should (equal (buffer-string) "")))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest kube-logs-supervisor-process-filter-messages-lines-test ()
+  (let ((viewer (generate-new-buffer "*kube-logs-filter-viewer-test*"))
+        captured)
+    (unwind-protect
+        (with-current-buffer viewer
+          (setq-local kube-logs--process-log-pending-fragment "")
+          (cl-letf (((symbol-function 'message)
+                     (lambda (fmt &rest args)
+                       (push (apply #'format fmt args) captured))))
+            (kube-logs--supervisor-process-filter viewer nil "first")
+            (should-not captured)
+            (kube-logs--supervisor-process-filter viewer nil " line\nsecond line\n")
+            (should (equal (nreverse captured)
+                           '("first line" "second line")))))
+      (when (buffer-live-p viewer)
+        (kill-buffer viewer)))))
 
 (ert-deftest kube-logs-line->json-line-json-message-test ()
   (with-temp-buffer

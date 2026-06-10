@@ -112,6 +112,14 @@ target/debug, target/release, then `exec-path'."
   :type '(choice (const :tag "Auto-detect" nil) file)
   :group 'json-log-viewer)
 
+(defcustom json-log-viewer-kube-log-supervisor-program nil
+  "Path to the kube-log-supervisor Rust executable.
+
+When nil, the viewer searches next to the source tree under
+target/debug, target/release, then `exec-path'."
+  :type '(choice (const :tag "Auto-detect" nil) file)
+  :group 'json-log-viewer)
+
 (defcustom json-log-viewer-pull-interval 1.0
   "Seconds between non-blocking pulls from the Rust worker.
 
@@ -334,6 +342,12 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
    "json-log-viewer-ingest-wrapper"
    json-log-viewer-ingest-wrapper-program))
 
+(defun json-log-viewer--kube-log-supervisor-program ()
+  "Return an executable path for the Rust kube log supervisor."
+  (json-log-viewer--find-rust-program
+   "kube-log-supervisor"
+   json-log-viewer-kube-log-supervisor-program))
+
 (defun json-log-viewer--find-rust-program (program configured)
   "Return executable PROGRAM, preferring CONFIGURED and local cargo builds."
   (let* ((source-root (and json-log-viewer--source-directory
@@ -363,6 +377,10 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
 (defun json-log-viewer-ingest-wrapper-executable ()
   "Return an executable path for the Rust ingestion wrapper."
   (json-log-viewer--ingest-wrapper-program))
+
+(defun json-log-viewer-kube-log-supervisor-executable ()
+  "Return an executable path for the Rust kube log supervisor."
+  (json-log-viewer--kube-log-supervisor-program))
 
 (defun json-log-viewer-worker-socket-path (&optional buffer-or-name)
   "Return the Rust worker ingestion socket path for BUFFER-OR-NAME.
