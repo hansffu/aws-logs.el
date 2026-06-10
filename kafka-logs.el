@@ -28,6 +28,9 @@
 
 (declare-function json-log-viewer-make-buffer "json-log-viewer"
                   (buffer-name &rest args))
+(declare-function json-log-viewer-ingest-wrapper-executable "json-log-viewer" ())
+(declare-function json-log-viewer-worker-socket-path "json-log-viewer"
+                  (&optional buffer-or-name))
 (declare-function json-log-viewer-push "json-log-viewer"
                   (buffer-or-name log-lines))
 (declare-function json-log-viewer-replace-log-lines "json-log-viewer"
@@ -878,6 +881,20 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
              (full (format "%s | %s" kcat-cmd grep-cmd)))
         (list shell-file-name shell-command-switch full)))))
 
+(defun kafka-logs--wrapper-command (socket-path command)
+  "Return Rust ingestion wrapper command for SOCKET-PATH and source COMMAND."
+  (append
+   (list (json-log-viewer-ingest-wrapper-executable)
+         "--socket" socket-path
+         "kafka"
+         "--connection" (or kafka-logs--viewer-connection kafka-logs-connection "")
+         "--topic" (or kafka-logs--viewer-topic kafka-logs-topic "")
+         "--payload-format" (if (eq kafka-logs--viewer-payload-format 'json)
+                                "json"
+                              "raw")
+         "--")
+   command))
+
 (defun kafka-logs--viewer-buffer-name ()
   "Return viewer buffer name for current connection/topic."
   (format "*Kafka logs - %s/%s*"
@@ -1234,6 +1251,12 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
         ;; Keep process filter lightweight: queue output and render on timer ticks.
         (kafka-logs--stream-enqueue-chunk output)))))
 
+(defun kafka-logs--wrapper-process-filter (_process output)
+  "Report low-volume wrapper diagnostics from OUTPUT."
+  (let ((text (string-trim output)))
+    (unless (string-empty-p text)
+      (message "kafka-logs wrapper: %s" text))))
+
 (defun kafka-logs--stream-process-sentinel (process event)
   "Process sentinel for streaming kcat PROCESS EVENT."
   (let ((buffer (process-buffer process)))
@@ -1311,13 +1334,16 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
     (setq buffer
           (kafka-logs--make-viewer-buffer
            (lambda ()
-             (let ((process (make-process
-                             :name (kafka-logs--process-name)
-                             :buffer buffer
-                             :command command
-                             :noquery t
-                             :connection-type 'pipe)))
-               (set-process-filter process #'kafka-logs--stream-process-filter)
+             (let* ((socket-path (json-log-viewer-worker-socket-path buffer))
+                    (wrapper-command
+                     (kafka-logs--wrapper-command socket-path command))
+                    (process (make-process
+                              :name (kafka-logs--process-name)
+                              :buffer buffer
+                              :command wrapper-command
+                              :noquery t
+                              :connection-type 'pipe
+                              :filter #'kafka-logs--wrapper-process-filter)))
                (set-process-sentinel process #'kafka-logs--stream-process-sentinel)
                (set-process-query-on-exit-flag process nil)
                (with-current-buffer buffer

@@ -7,8 +7,13 @@ edition = "2021"
 name = "json-log-viewer-worker"
 path = "rust/json-log-viewer-worker/src/main.rs"
 
+[[bin]]
+name = "json-log-viewer-ingest-wrapper"
+path = "rust/json-log-viewer-ingest-wrapper/src/main.rs"
+
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+libc = "0.2"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

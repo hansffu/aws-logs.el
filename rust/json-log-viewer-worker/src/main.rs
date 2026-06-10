@@ -5,7 +5,7 @@ use serde_json::{json, Map, Value};
 use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -296,8 +296,9 @@ impl Store {
             "before" => select_entries_before(&self.db, ts, limit, active_narrow, entry_id)?,
             "after" => select_entries_after(&self.db, ts, limit, active_narrow, entry_id)?,
             _ => {
-                self.output
-                    .error(format!("load-more direction must be before/after, got {direction}"));
+                self.output.error(format!(
+                    "load-more direction must be before/after, got {direction}"
+                ));
                 Vec::new()
             }
         };
@@ -379,7 +380,11 @@ fn value_to_lisp(value: &Value) -> String {
         Value::Number(number) => number.to_string(),
         Value::String(text) => lisp_string(text),
         Value::Array(items) => {
-            let body = items.iter().map(value_to_lisp).collect::<Vec<_>>().join(" ");
+            let body = items
+                .iter()
+                .map(value_to_lisp)
+                .collect::<Vec<_>>()
+                .join(" ");
             format!("({body})")
         }
         Value::Object(map) => object_to_lisp_plist(map),
@@ -423,9 +428,7 @@ fn command_thread(store: Arc<Mutex<Store>>, output: Output, shutdown_tx: Sender<
             continue;
         }
         match serde_json::from_str::<Command>(&line) {
-            Ok(Command::Start {
-                ..
-            }) => {
+            Ok(Command::Start { .. }) => {
                 output.error("start command is only valid as the first worker command");
             }
             Ok(Command::Reset { request_id }) => {
@@ -508,46 +511,9 @@ fn ingestion_thread(
         }
         match listener.accept() {
             Ok((stream, _addr)) => {
-                let mut reader = BufReader::new(stream);
-                let mut raw_line = Vec::new();
-                loop {
-                    raw_line.clear();
-                    let Ok(nread) = reader.read_until(b'\n', &mut raw_line) else {
-                        break;
-                    };
-                    if nread == 0 {
-                        break;
-                    }
-                    if raw_line.ends_with(b"\n") {
-                        raw_line.pop();
-                    }
-                    if raw_line.ends_with(b"\r") {
-                        raw_line.pop();
-                    }
-                    if raw_line.is_empty() {
-                        continue;
-                    }
-                    if raw_line.starts_with(b"L ") {
-                        let line = String::from_utf8_lossy(&raw_line[2..]).into_owned();
-                        {
-                            let mut store = store.lock().unwrap();
-                            if let Err(err) = store.ingest_lines(&[line]) {
-                                store.output.error(err.to_string());
-                            }
-                        }
-                    } else if raw_line.starts_with(b"F ") {
-                        let request_id_text = String::from_utf8_lossy(&raw_line[2..]);
-                        match request_id_text.parse::<i64>() {
-                            Ok(request_id) => {
-                                let store = store.lock().unwrap();
-                                store.output.complete(Some(request_id));
-                            }
-                            Err(err) => output.error(format!("invalid ingest flush frame: {err}")),
-                        }
-                    } else {
-                        output.error("unknown ingest frame");
-                    }
-                }
+                let store = Arc::clone(&store);
+                let output = output.clone();
+                thread::spawn(move || handle_ingest_stream(stream, store, output));
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(std::time::Duration::from_millis(10));
@@ -559,6 +525,47 @@ fn ingestion_thread(
         }
     }
     let _ = fs::remove_file(&socket_path);
+}
+
+fn handle_ingest_stream(stream: UnixStream, store: Arc<Mutex<Store>>, output: Output) {
+    let mut reader = BufReader::new(stream);
+    let mut raw_line = Vec::new();
+    loop {
+        raw_line.clear();
+        let Ok(nread) = reader.read_until(b'\n', &mut raw_line) else {
+            break;
+        };
+        if nread == 0 {
+            break;
+        }
+        if raw_line.ends_with(b"\n") {
+            raw_line.pop();
+        }
+        if raw_line.ends_with(b"\r") {
+            raw_line.pop();
+        }
+        if raw_line.is_empty() {
+            continue;
+        }
+        if raw_line.starts_with(b"L ") {
+            let line = String::from_utf8_lossy(&raw_line[2..]).into_owned();
+            let mut store = store.lock().unwrap();
+            if let Err(err) = store.ingest_lines(&[line]) {
+                store.output.error(err.to_string());
+            }
+        } else if raw_line.starts_with(b"F ") {
+            let request_id_text = String::from_utf8_lossy(&raw_line[2..]);
+            match request_id_text.parse::<i64>() {
+                Ok(request_id) => {
+                    let store = store.lock().unwrap();
+                    store.output.complete(Some(request_id));
+                }
+                Err(err) => output.error(format!("invalid ingest flush frame: {err}")),
+            }
+        } else {
+            output.error("unknown ingest frame");
+        }
+    }
 }
 
 fn main() {
@@ -606,7 +613,12 @@ fn main() {
     let ingest_output = output.clone();
     let socket_path_for_thread = socket_path.clone();
     thread::spawn(move || {
-        ingestion_thread(socket_path_for_thread, ingest_store, ingest_output, shutdown_rx);
+        ingestion_thread(
+            socket_path_for_thread,
+            ingest_store,
+            ingest_output,
+            shutdown_rx,
+        );
     });
     let command_store = Arc::clone(&store);
     let command_output = output.clone();
@@ -728,9 +740,15 @@ fn select_rerender_entries(
              ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, timestamp_epoch, id"
         };
         if let Some(needle) = narrow {
-            rows_to_entries(db.prepare(sql)?.query_map(params![needle, limit as i64], row_to_entry)?)
+            rows_to_entries(
+                db.prepare(sql)?
+                    .query_map(params![needle, limit as i64], row_to_entry)?,
+            )
         } else {
-            rows_to_entries(db.prepare(sql)?.query_map(params![limit as i64], row_to_entry)?)
+            rows_to_entries(
+                db.prepare(sql)?
+                    .query_map(params![limit as i64], row_to_entry)?,
+            )
         }
     } else {
         let sql = if narrow.is_some() {
@@ -783,7 +801,12 @@ fn select_entries_before(
         )?)?
     } else {
         rows_to_entries(db.prepare(sql)?.query_map(
-            params![timestamp, timestamp, boundary_id.unwrap_or(i64::MAX), limit as i64],
+            params![
+                timestamp,
+                timestamp,
+                boundary_id.unwrap_or(i64::MAX),
+                limit as i64
+            ],
             row_to_entry,
         )?)?
     };
@@ -812,7 +835,13 @@ fn select_entries_after(
     };
     if let Some(needle) = narrow {
         rows_to_entries(db.prepare(sql)?.query_map(
-            params![needle, timestamp, timestamp, boundary_id.unwrap_or(0), limit as i64],
+            params![
+                needle,
+                timestamp,
+                timestamp,
+                boundary_id.unwrap_or(0),
+                limit as i64
+            ],
             row_to_entry,
         )?)
     } else {
@@ -857,7 +886,11 @@ fn entry_fields(json_text: &str, config: &ViewerConfig) -> Vec<FieldRow> {
     json_object_rows(parsed.as_ref(), json_text, &config.json_paths)
 }
 
-fn json_object_rows(parsed: Option<&Value>, raw_line: &str, json_paths: &[String]) -> Vec<FieldRow> {
+fn json_object_rows(
+    parsed: Option<&Value>,
+    raw_line: &str,
+    json_paths: &[String],
+) -> Vec<FieldRow> {
     let json_path_set = json_paths.iter().cloned().collect::<HashSet<_>>();
     let rows = parsed
         .map(|value| flatten_node(value, &json_path_set, None))
@@ -873,7 +906,11 @@ fn json_object_rows(parsed: Option<&Value>, raw_line: &str, json_paths: &[String
     }
 }
 
-fn flatten_node(value: &Value, json_paths: &HashSet<String>, prefix: Option<String>) -> Vec<FieldRow> {
+fn flatten_node(
+    value: &Value,
+    json_paths: &HashSet<String>,
+    prefix: Option<String>,
+) -> Vec<FieldRow> {
     if let Some(prefix_text) = prefix.as_ref() {
         if json_paths.contains(prefix_text) {
             return vec![FieldRow {
@@ -889,11 +926,13 @@ fn flatten_node(value: &Value, json_paths: &HashSet<String>, prefix: Option<Stri
             keys.sort();
             if keys.is_empty() {
                 return prefix
-                    .map(|k| vec![FieldRow {
-                        k,
-                        v: String::new(),
-                        b: false,
-                    }])
+                    .map(|k| {
+                        vec![FieldRow {
+                            k,
+                            v: String::new(),
+                            b: false,
+                        }]
+                    })
                     .unwrap_or_default();
             }
             keys.into_iter()
@@ -915,7 +954,9 @@ fn flatten_node(value: &Value, json_paths: &HashSet<String>, prefix: Option<Stri
             items
                 .iter()
                 .enumerate()
-                .flat_map(|(idx, item)| flatten_node(item, json_paths, Some(format!("{base}[{idx}]"))))
+                .flat_map(|(idx, item)| {
+                    flatten_node(item, json_paths, Some(format!("{base}[{idx}]")))
+                })
                 .collect()
         }
         _ => vec![FieldRow {
@@ -927,7 +968,8 @@ fn flatten_node(value: &Value, json_paths: &HashSet<String>, prefix: Option<Stri
 }
 
 fn pretty_json_value(value: &Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| value_to_string(value).unwrap_or_default())
+    serde_json::to_string_pretty(value)
+        .unwrap_or_else(|_| value_to_string(value).unwrap_or_default())
 }
 
 fn resolve_path(parsed: Option<&Value>, path: Option<&str>) -> Option<String> {
@@ -946,7 +988,9 @@ fn resolve_path(parsed: Option<&Value>, path: Option<&str>) -> Option<String> {
     }) {
         return Some(value);
     }
-    json_get_path_value(parsed, path).as_ref().and_then(value_to_summary_string)
+    json_get_path_value(parsed, path)
+        .as_ref()
+        .and_then(value_to_summary_string)
 }
 
 fn flatten_path_values(value: &Value) -> Vec<(String, String)> {
@@ -1072,8 +1116,10 @@ fn parse_time(value: &str) -> Option<f64> {
         "%Y-%m-%dT%H:%M:%S%.f",
     ] {
         if let Ok(dt) = NaiveDateTime::parse_from_str(value, format) {
-            return Some(dt.and_utc().timestamp() as f64
-                + dt.and_utc().timestamp_subsec_nanos() as f64 / 1_000_000_000.0);
+            return Some(
+                dt.and_utc().timestamp() as f64
+                    + dt.and_utc().timestamp_subsec_nanos() as f64 / 1_000_000_000.0,
+            );
         }
     }
     None

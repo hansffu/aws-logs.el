@@ -104,6 +104,14 @@ target/debug, target/release, then `exec-path'."
   :type '(choice (const :tag "Auto-detect" nil) file)
   :group 'json-log-viewer)
 
+(defcustom json-log-viewer-ingest-wrapper-program nil
+  "Path to the json-log-viewer Rust ingestion wrapper executable.
+
+When nil, the viewer searches next to the source tree under
+target/debug, target/release, then `exec-path'."
+  :type '(choice (const :tag "Auto-detect" nil) file)
+  :group 'json-log-viewer)
+
 (defcustom json-log-viewer-pull-interval 1.0
   "Seconds between non-blocking pulls from the Rust worker.
 
@@ -310,17 +318,28 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
 
 (defun json-log-viewer--worker-program ()
   "Return an executable path for the Rust json-log-viewer worker."
+  (json-log-viewer--find-rust-program
+   "json-log-viewer-worker"
+   json-log-viewer-worker-program))
+
+(defun json-log-viewer--ingest-wrapper-program ()
+  "Return an executable path for the Rust ingestion wrapper."
+  (json-log-viewer--find-rust-program
+   "json-log-viewer-ingest-wrapper"
+   json-log-viewer-ingest-wrapper-program))
+
+(defun json-log-viewer--find-rust-program (program configured)
+  "Return executable PROGRAM, preferring CONFIGURED and local cargo builds."
   (let* ((source-root (and json-log-viewer--source-directory
                            (file-name-as-directory json-log-viewer--source-directory)))
          (debug-candidate (and source-root
                                (expand-file-name
-                                "target/debug/json-log-viewer-worker"
+                                (format "target/debug/%s" program)
                                 source-root)))
          (release-candidate (and source-root
                                  (expand-file-name
-                                  "target/release/json-log-viewer-worker"
+                                  (format "target/release/%s" program)
                                   source-root)))
-         (configured json-log-viewer-worker-program)
          (found (or (and configured
                          (file-executable-p configured)
                          configured)
@@ -330,9 +349,27 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
                     (and release-candidate
                          (file-executable-p release-candidate)
                          release-candidate)
-                    (executable-find "json-log-viewer-worker"))))
+                    (executable-find program))))
     (or found
-        (user-error "Cannot find json-log-viewer-worker executable; run `cargo build' or customize json-log-viewer-worker-program"))))
+        (user-error "Cannot find %s executable; run `cargo build' or customize its program path"
+                    program))))
+
+(defun json-log-viewer-ingest-wrapper-executable ()
+  "Return an executable path for the Rust ingestion wrapper."
+  (json-log-viewer--ingest-wrapper-program))
+
+(defun json-log-viewer-worker-socket-path (&optional buffer-or-name)
+  "Return the Rust worker ingestion socket path for BUFFER-OR-NAME.
+
+When BUFFER-OR-NAME is nil, use the current buffer."
+  (let ((buffer (if buffer-or-name
+                    (json-log-viewer-get-buffer buffer-or-name)
+                  (current-buffer))))
+    (with-current-buffer buffer
+      (unless (and json-log-viewer--async-queue
+                   (json-log-viewer--worker-ready-p json-log-viewer--async-queue))
+        (user-error "json-log-viewer worker is not ready"))
+      (json-log-viewer--worker-socket-path json-log-viewer--async-queue))))
 
 (defun json-log-viewer--async-worker-file ()
   "Return legacy worker file path for compatibility with old tests/helpers."

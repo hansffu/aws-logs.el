@@ -152,8 +152,10 @@ nix build .#json-log-viewer-worker
 
 By default the Elisp client looks for ~target/debug/json-log-viewer-worker~,
 ~target/release/json-log-viewer-worker~, then ~json-log-viewer-worker~ on
-~exec-path~. Set ~json-log-viewer-worker-program~ to an explicit executable path
-when installing the worker elsewhere.
+~exec-path~. It resolves ~json-log-viewer-ingest-wrapper~ the same way for
+high-throughput kube/kafka streams. Set ~json-log-viewer-worker-program~ or
+~json-log-viewer-ingest-wrapper-program~ to explicit executable paths when
+installing the binaries elsewhere.
 
 The control channel uses stdin/stdout. Emacs sends low-volume commands as JSON;
 the worker sends Lisp-readable result forms back so Emacs can use ~read~ instead
@@ -164,6 +166,11 @@ non-blocking ~pull~ command every ~json-log-viewer-pull-interval~ seconds, and
 the worker replies with the batch size before sending entries. Pending live
 entries are held in Rust, capped to the configured maximum buffer size, and
 discard older entries when throughput exceeds that cap.
+
+For kube/kafka streaming, Emacs launches the Rust ingestion wrapper instead of
+reading every log line itself. The wrapper runs ~kubectl~ or ~kcat~, normalizes
+stdout into viewer JSON, and writes directly to the worker's Unix socket:
+wrapper -> socket -> worker -> log buffer.
 
 ** Quick API
 

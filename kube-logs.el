@@ -17,6 +17,10 @@
 
 (require 'json-log-viewer)
 
+(declare-function json-log-viewer-ingest-wrapper-executable "json-log-viewer" ())
+(declare-function json-log-viewer-worker-socket-path "json-log-viewer"
+                  (&optional buffer-or-name))
+
 (define-derived-mode kube-logs-viewer-mode json-log-viewer-mode "Kube-Logs"
   "Major mode for Kubernetes log buffers rendered with `json-log-viewer`."
   :group 'kube-logs)
@@ -370,6 +374,18 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
              (full (format "%s | %s" kubectl-cmd grep-cmd)))
         (list shell-file-name shell-command-switch full)))))
 
+(defun kube-logs--wrapper-command (socket-path command)
+  "Return Rust ingestion wrapper command for SOCKET-PATH and source COMMAND."
+  (append
+   (list (json-log-viewer-ingest-wrapper-executable)
+         "--socket" socket-path
+         "kube"
+         "--namespace" (or kube-logs--viewer-namespace kube-logs-namespace "")
+         "--target" (or kube-logs--viewer-target kube-logs-target "")
+         "--kind" (or kube-logs--viewer-target-kind kube-logs-target-kind "")
+         "--")
+   command))
+
 (defun kube-logs--install-viewer-keymap ()
   "Install buffer-local keymap tweaks for kube logs viewer buffers."
   (let ((map (copy-keymap (current-local-map))))
@@ -591,6 +607,12 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
         ;; Keep process filter lightweight: queue output and render on timer ticks.
         (kube-logs--stream-enqueue-chunk output)))))
 
+(defun kube-logs--wrapper-process-filter (_process output)
+  "Report low-volume wrapper diagnostics from OUTPUT."
+  (let ((text (string-trim output)))
+    (unless (string-empty-p text)
+      (message "kube-logs wrapper: %s" text))))
+
 (defun kube-logs--stream-process-sentinel (process event)
   "Process sentinel for streaming kube logs PROCESS EVENT."
   (let ((buffer (process-buffer process)))
@@ -664,13 +686,16 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
     (setq buffer
           (kube-logs--make-viewer-buffer
            (lambda ()
-             (let ((process (make-process
-                             :name (kube-logs--process-name)
-                             :buffer buffer
-                             :command command
-                             :noquery t
-                             :connection-type 'pipe)))
-               (set-process-filter process #'kube-logs--stream-process-filter)
+             (let* ((socket-path (json-log-viewer-worker-socket-path buffer))
+                    (wrapper-command
+                     (kube-logs--wrapper-command socket-path command))
+                    (process (make-process
+                              :name (kube-logs--process-name)
+                              :buffer buffer
+                              :command wrapper-command
+                              :noquery t
+                              :connection-type 'pipe
+                              :filter #'kube-logs--wrapper-process-filter)))
                (set-process-sentinel process #'kube-logs--stream-process-sentinel)
                (set-process-query-on-exit-flag process nil)
                (with-current-buffer buffer

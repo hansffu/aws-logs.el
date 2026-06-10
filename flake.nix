@@ -58,6 +58,10 @@
           type = "app";
           program = "${self.packages.${pkgs.system}.json-log-viewer-worker}/bin/json-log-viewer-worker";
         };
+        json-log-viewer-ingest-wrapper = {
+          type = "app";
+          program = "${self.packages.${pkgs.system}.json-log-viewer-worker}/bin/json-log-viewer-ingest-wrapper";
+        };
         default = self.apps.${pkgs.system}.json-log-viewer-worker;
       });
 
