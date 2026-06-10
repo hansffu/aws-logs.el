@@ -214,6 +214,9 @@ visible frame.  Set to nil or 0 to disable periodic live pulls."
 (defvar-local json-log-viewer--entry-count 0
   "Cached count of rendered entry overlays.")
 
+(defvar-local json-log-viewer--total-entry-count nil
+  "Total entries known to the backing worker, or nil when unknown.")
+
 (defvar-local json-log-viewer--stream-assume-ordered nil
   "Non-nil means streaming entries are assumed to arrive in order.")
 
@@ -518,12 +521,17 @@ When BUFFER-OR-NAME is nil, use the current buffer."
        (when json-log-viewer--on-worker-ready
          (funcall json-log-viewer--on-worker-ready)
          (setq json-log-viewer--on-worker-ready nil))))
-    ('pull-begin
-     (let ((count (plist-get command :count)))
-       (when (and (integerp count) (> count 0))
+    ('status
+     (let ((pending-pull-count (or (plist-get command :pending-pull-count)
+                                   (plist-get command :count)))
+           (total-count (plist-get command :total-count)))
+       (when (integerp total-count)
+         (setq json-log-viewer--total-entry-count total-count)
+         (json-log-viewer--refresh-header))
+       (when (and (integerp pending-pull-count) (> pending-pull-count 0))
          (let ((max-messages (json-log-viewer--pull-max-messages)))
            (when max-messages
-             (let ((drop (max 0 (- (+ json-log-viewer--entry-count count)
+             (let ((drop (max 0 (- (+ json-log-viewer--entry-count pending-pull-count)
                                    max-messages))))
                (json-log-viewer--drop-oldest-rendered-entries drop)))))))
     ('pull-complete
@@ -1292,6 +1300,7 @@ Returns cons cell (ENTRIES . NEXT-ID)."
         :auto-follow json-log-viewer--auto-follow
         :filter json-log-viewer--filter-string
         :row-count json-log-viewer--entry-count
+        :total-row-count json-log-viewer--total-entry-count
         :visible-row-count (json-log-viewer--visible-entry-count)))
 
 (defun json-log-viewer--set-point-to-latest-entry ()
@@ -1685,6 +1694,13 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback is applied."
           (json-log-viewer--default-keybindings))
     (json-log-viewer--default-keybindings)))
 
+(defun json-log-viewer--messages-count-string (&optional row-count)
+  "Return rendered and total message counts using optional ROW-COUNT."
+  (let ((rendered (or row-count json-log-viewer--entry-count)))
+    (if (integerp json-log-viewer--total-entry-count)
+        (format "%d / %d" rendered json-log-viewer--total-entry-count)
+      (number-to-string rendered))))
+
 (defun json-log-viewer--info-lines (&optional row-count)
   "Return viewer info lines for popup display using ROW-COUNT."
   (let ((state (json-log-viewer--state)))
@@ -1694,9 +1710,7 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback is applied."
          nil)
      (list
      (cons "Messages"
-           (number-to-string
-            (or row-count
-                 json-log-viewer--entry-count)))
+           (json-log-viewer--messages-count-string row-count))
       (cons "Narrow filter"
             (json-log-viewer--filter-summary))))))
 
@@ -1749,7 +1763,7 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback is applied."
 
 (defun json-log-viewer--header-line-string ()
   "Return header-line text for current viewer buffer."
-  (let ((messages (format "Messages: %d" json-log-viewer--entry-count))
+  (let ((messages (format "Messages: %s" (json-log-viewer--messages-count-string)))
         (follow (format "Follow: %s" (if json-log-viewer--auto-follow "on" "off")))
         (needle (and json-log-viewer--filter-string
                      (string-trim json-log-viewer--filter-string))))
@@ -2383,6 +2397,7 @@ Returns the created buffer."
       (setq-local json-log-viewer--context nil)
       (setq-local json-log-viewer--metadata nil)
       (setq-local json-log-viewer--entry-count 0)
+      (setq-local json-log-viewer--total-entry-count nil)
       (setq-local json-log-viewer--stream-assume-ordered t)
       (setq-local json-log-viewer--stream-max-entries max-entries)
       (setq-local json-log-viewer--next-entry-id 0)

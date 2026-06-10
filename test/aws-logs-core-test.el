@@ -749,5 +749,30 @@
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
+(ert-deftest json-log-viewer-status-updates-total-count-test ()
+  (with-temp-buffer
+    (json-log-viewer-mode)
+    (setq-local json-log-viewer--entry-count 1455)
+    (setq-local json-log-viewer--total-entry-count nil)
+    (setq-local json-log-viewer--auto-follow nil)
+    (setq-local json-log-viewer--filter-string nil)
+    (json-log-viewer--async-apply-command
+     '(:cmd "status" :pending-pull-count 0 :total-count 33240))
+    (should (= json-log-viewer--total-entry-count 33240))
+    (should (string-match-p "Messages: 1455 / 33240"
+                            (json-log-viewer--header-line-string)))))
+
+(ert-deftest json-log-viewer-header-omits-total-when-unknown-test ()
+  (with-temp-buffer
+    (json-log-viewer-mode)
+    (setq-local json-log-viewer--entry-count 1455)
+    (setq-local json-log-viewer--total-entry-count nil)
+    (setq-local json-log-viewer--auto-follow nil)
+    (setq-local json-log-viewer--filter-string nil)
+    (should (string-match-p "Messages: 1455"
+                            (json-log-viewer--header-line-string)))
+    (should-not (string-match-p "1455 /"
+                                (json-log-viewer--header-line-string)))))
+
 (provide 'aws-logs-core-test)
 ;;; aws-logs-core-test.el ends here

@@ -174,6 +174,11 @@ impl Store {
         self.pending_entries.clear();
         let _ = self.db.execute("DELETE FROM log_entry", []);
         self.output.send(json!({"cmd": "clear"}));
+        self.output.send(json!({
+            "cmd": "status",
+            "pending-pull-count": 0,
+            "total-count": 0
+        }));
     }
 
     fn ingest_lines(&mut self, lines: &[String]) -> rusqlite::Result<()> {
@@ -233,7 +238,12 @@ impl Store {
         }
     }
 
-    fn pull(&mut self, max_messages: Option<usize>) {
+    fn total_count(&self) -> rusqlite::Result<i64> {
+        self.db
+            .query_row("SELECT COUNT(*) FROM log_entry", [], |row| row.get(0))
+    }
+
+    fn pull(&mut self, max_messages: Option<usize>) -> rusqlite::Result<()> {
         let max_messages = max_messages.or(self.config.max_entries);
         if let Some(max_messages) = max_messages {
             while self.pending_entries.len() > max_messages {
@@ -242,13 +252,17 @@ impl Store {
         }
 
         let entries: Vec<Entry> = self.pending_entries.drain(..).collect();
-        self.output
-            .send(json!({"cmd": "pull-begin", "count": entries.len()}));
+        self.output.send(json!({
+            "cmd": "status",
+            "pending-pull-count": entries.len(),
+            "total-count": self.total_count()?
+        }));
         for batch in entries.chunks(self.config.chunk_size.max(1)) {
             self.output
                 .send(json!({"cmd": "render-entries", "entries": batch}));
         }
         self.output.send(json!({"cmd": "pull-complete"}));
+        Ok(())
     }
 
     fn publish_rerender_chunks(&self) {
@@ -477,7 +491,9 @@ fn command_thread(store: Arc<Mutex<Store>>, output: Output, shutdown_tx: Sender<
             }
             Ok(Command::Pull { max_messages }) => {
                 let mut store = store.lock().unwrap();
-                store.pull(max_messages);
+                if let Err(err) = store.pull(max_messages) {
+                    store.output.error(err.to_string());
+                }
             }
             Ok(Command::Stop) => {
                 let _ = shutdown_tx.send(());
