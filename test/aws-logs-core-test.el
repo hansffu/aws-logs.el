@@ -711,5 +711,43 @@
       (when (buffer-live-p (get-buffer help-buffer-name))
         (kill-buffer help-buffer-name)))))
 
+(ert-deftest json-log-viewer-buffer-visible-p-checks-frame-visibility-test ()
+  (let ((buf (generate-new-buffer "*json-log-viewer-visible-test*")))
+    (unwind-protect
+        (progn
+          (should-not (json-log-viewer--buffer-visible-p buf))
+          (cl-letf (((symbol-function 'get-buffer-window-list)
+                     (lambda (&rest _args) (list (selected-window))))
+                    ((symbol-function 'frame-visible-p)
+                     (lambda (_frame) t)))
+            (should (json-log-viewer--buffer-visible-p buf)))
+          (cl-letf (((symbol-function 'get-buffer-window-list)
+                     (lambda (&rest _args) (list (selected-window))))
+                    ((symbol-function 'frame-visible-p)
+                     (lambda (_frame) 'icon)))
+            (should-not (json-log-viewer--buffer-visible-p buf))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest json-log-viewer-background-refresh-controls-hidden-pull-test ()
+  (let ((buf (generate-new-buffer "*json-log-viewer-hidden-pull-test*"))
+        sent)
+    (unwind-protect
+        (with-current-buffer buf
+          (setq-local json-log-viewer--async-queue
+                      (json-log-viewer--worker-create :ready-p t))
+          (setq-local json-log-viewer-background-refresh nil)
+          (cl-letf (((symbol-function 'json-log-viewer--buffer-visible-p)
+                     (lambda (&optional _buffer) nil))
+                    ((symbol-function 'json-log-viewer--send-worker-command)
+                     (lambda (command) (setq sent command))))
+            (json-log-viewer--pull-worker)
+            (should-not sent)
+            (setq-local json-log-viewer-background-refresh t)
+            (json-log-viewer--pull-worker)
+            (should (equal (plist-get sent :cmd) "pull"))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
 (provide 'aws-logs-core-test)
 ;;; aws-logs-core-test.el ends here

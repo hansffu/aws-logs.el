@@ -115,8 +115,14 @@ target/debug, target/release, then `exec-path'."
 (defcustom json-log-viewer-pull-interval 1.0
   "Seconds between non-blocking pulls from the Rust worker.
 
-Set to nil or 0 to disable periodic live pulls."
+Periodic live pulls only run while the viewer buffer is displayed in a
+visible frame.  Set to nil or 0 to disable periodic live pulls."
   :type '(choice (const :tag "Disabled" nil) number)
+  :group 'json-log-viewer)
+
+(defcustom json-log-viewer-background-refresh nil
+  "When non-nil, pull live messages even while the viewer buffer is hidden."
+  :type 'boolean
   :group 'json-log-viewer)
 
 (cl-defstruct (json-log-viewer--worker
@@ -633,10 +639,23 @@ When BUFFER-OR-NAME is nil, use the current buffer."
       (error "json-log-viewer worker process is not running"))
     (process-send-string proc (json-log-viewer--json-line command))))
 
+(defun json-log-viewer--buffer-visible-p (&optional buffer)
+  "Return non-nil when BUFFER is displayed in a visible frame."
+  (let ((buffer (or buffer (current-buffer))))
+    (cl-some (lambda (window)
+               (and (window-live-p window)
+                    (eq (frame-visible-p (window-frame window)) t)))
+             (get-buffer-window-list buffer nil t))))
+
 (defun json-log-viewer--pull-worker ()
-  "Request pending live messages from the Rust worker without blocking."
+  "Request pending live messages from the Rust worker without blocking.
+
+Unless `json-log-viewer-background-refresh' is non-nil, skip pulls for
+buffers that are not displayed in a visible frame."
   (when-let ((worker json-log-viewer--async-queue))
-    (when (and (json-log-viewer--worker-ready-p worker)
+    (when (and (or json-log-viewer-background-refresh
+                   (json-log-viewer--buffer-visible-p))
+               (json-log-viewer--worker-ready-p worker)
                (not (json-log-viewer--worker-pull-in-flight-p worker)))
       (setf (json-log-viewer--worker-pull-in-flight-p worker) t)
       (condition-case err
@@ -665,7 +684,8 @@ When BUFFER-OR-NAME is nil, use the current buffer."
         (worker (or json-log-viewer--async-queue
                     (error "json-log-viewer worker is not running"))))
     (json-log-viewer--await-pull-idle worker deadline)
-    (json-log-viewer--pull-worker)
+    (let ((json-log-viewer-background-refresh t))
+      (json-log-viewer--pull-worker))
     (while (and (or (json-log-viewer--worker-pull-in-flight-p worker)
                     json-log-viewer--pending-render-queue
                     json-log-viewer--render-drain-timer)
