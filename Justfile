@@ -21,13 +21,15 @@ compile:
         kube-logs.el kafka-logs.el
 
 worker-build:
-    cargo build
+    nix develop -c cargo build
 
 worker-build-nix:
     nix build .#json-log-viewer-worker
 
 clean:
     rm -f {{dir}}/*.elc
+    cargo clean
+    rm -f {{dir}}/result
 
 run-Q:
     emacs -Q -L {{dir}} \
