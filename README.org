@@ -6,6 +6,7 @@ This repository contains five related Emacs Lisp packages:
 - ~kube-logs~: transient-driven Kubernetes logs tooling (pods/deployments via ~kubectl~).
 - ~kafka-logs~: transient-driven Kafka message viewer (via ~kcat~).
 - ~json-log-viewer~: generic foldable JSON log viewer used by ~aws-logs~ and usable standalone.
+- ~composite-log-viewer~: shared multi-source log buffers for kube/kafka streams.
 
 * Package: aws-logs
 
@@ -287,6 +288,64 @@ When Evil is installed and ~json-log-viewer-enable-evil-bindings~ is non-nil
 
 When Evil integration is active, these bindings replace the default list shown
 in the ~?~ info popup.
+
+* Package: composite-log-viewer
+
+~composite-log-viewer~ creates one shared log viewer buffer and streams multiple
+kube/kafka sources into it.  It is intended for dashboards or project-specific
+entry points where the source set is known ahead of time.
+
+Composite sources always stream from now:
+
+- Kafka starts at the topic end.
+- Kubernetes follows with ~--tail=0~ and no ~--since~.
+- AWS logs are intentionally not supported by this API.
+
+** File
+
+- ~composite-log-viewer.el~
+
+** Installation
+
+Put ~composite-log-viewer.el~, ~json-log-viewer.el~, ~kube-logs.el~, and
+~kafka-logs.el~ on your ~load-path~.
+
+** use-package example
+
+#+begin_src emacs-lisp
+(use-package composite-log-viewer
+  :load-path "~/dev/emacs/aws-logs.el"
+  :commands (composite-log-viewer composite-log-viewer-create)
+  :after (kube-logs kafka-logs)
+  :config
+  (defun my/prod-logs ()
+    (interactive)
+    (composite-log-viewer-create
+     '(:name "*prod logs*"
+       :sources
+       ((:type kafka
+         :connection "prod"
+         :topic "payments.events"
+         :value-format auto
+         :payload-format json
+         :message-path "payload.message"
+         :extra-paths ("topic" "key" "partition")
+         :json-paths ("payload"))
+        (:type kube
+         :context "prod-cluster"
+         :namespace "payments"
+         :namespace-enabled t
+         :target-kind deployment
+         :target "payment-service"
+         :filter "ERROR|WARN"
+         :message-path "payload.message"
+         :level-path "payload.level"
+         :extra-paths ("namespace" "target")))))))
+#+end_src
+
+The source options mirror the streaming subset of the kube/kafka transients.
+Use ~kafka-logs-make-connection~ in your ~kafka-logs~ setup before starting a
+composite source that references a named Kafka connection.
 
 * Package: kube-logs
 

@@ -223,6 +223,12 @@ Each element has the form (NAME . PLIST).")
 (defvar-local kafka-logs--process nil
   "Process associated with current kafka-logs viewer buffer.")
 
+(defvar-local kafka-logs--processes nil
+  "Processes associated with current kafka-logs viewer buffer.")
+
+(defvar-local kafka-logs--initialized-p nil
+  "Non-nil when kafka-logs local lifecycle state is installed.")
+
 (defvar-local kafka-logs--pending-fragment ""
   "Trailing incomplete process output fragment for streaming buffers.")
 
@@ -954,12 +960,17 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
   "Stop process and cleanup state associated with BUFFER, if any."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (let ((proc (or kafka-logs--process
-                      (and (derived-mode-p 'kafka-logs-viewer-mode)
-                           (get-buffer-process buffer)))))
-        (when (process-live-p proc)
-          (delete-process proc))
+      (let ((processes (delete-dups
+                        (delq nil
+                              (append kafka-logs--processes
+                                      (list kafka-logs--process
+                                            (and (derived-mode-p 'kafka-logs-viewer-mode)
+                                                 (get-buffer-process buffer))))))))
+        (dolist (proc processes)
+          (when (process-live-p proc)
+            (delete-process proc)))
         (setq kafka-logs--process nil))
+      (setq kafka-logs--processes nil)
       (when (timerp kafka-logs--stream-drain-timer)
         (cancel-timer kafka-logs--stream-drain-timer))
       (setq kafka-logs--stream-drain-timer nil)
@@ -970,6 +981,21 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
       (when (buffer-live-p kafka-logs--once-output-buffer)
         (kill-buffer kafka-logs--once-output-buffer))
       (setq kafka-logs--once-output-buffer nil))))
+
+(defun kafka-logs--add-buffer-process (buffer process)
+  "Track PROCESS as an active Kafka source for BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq-local kafka-logs--process process)
+      (cl-pushnew process kafka-logs--processes :test #'eq))))
+
+(defun kafka-logs--remove-buffer-process (buffer process)
+  "Stop tracking PROCESS for BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq kafka-logs--processes (delq process kafka-logs--processes))
+      (when (eq kafka-logs--process process)
+        (setq kafka-logs--process (car kafka-logs--processes))))))
 
 (defun kafka-logs-quit-process-and-window ()
   "Stop Kafka process for current buffer and close the window."
@@ -1012,6 +1038,8 @@ MESSAGE-PATH and JSON-PATHS are the normalized rendering paths for the current
 session.  When INSTALL-KEYMAP is non-nil, install kafka-logs key bindings."
   (with-current-buffer buffer
     (setq-local kafka-logs--process nil)
+    (setq-local kafka-logs--processes nil)
+    (setq-local kafka-logs--initialized-p t)
     (setq-local kafka-logs--pending-fragment "")
     (setq-local kafka-logs--once-output-buffer nil)
     (setq-local kafka-logs--stream-chunks-in nil)
@@ -1035,6 +1063,149 @@ session.  When INSTALL-KEYMAP is non-nil, install kafka-logs key bindings."
               nil t)
     (when install-keymap
       (kafka-logs--install-viewer-keymap))))
+
+(defun kafka-logs--append-to-viewer-buffer (buffer message-path json-paths)
+  "Prepare BUFFER for an additional Kafka source.
+
+MESSAGE-PATH and JSON-PATHS are the normalized rendering paths for the current
+source."
+  (with-current-buffer buffer
+    (unless kafka-logs--initialized-p
+      (setq-local kafka-logs--initialized-p t)
+      (add-hook 'kill-buffer-hook
+                (lambda ()
+                  (kafka-logs--kill-buffer-process (current-buffer)))
+                nil t))
+    (setq-local kafka-logs--viewer-connection kafka-logs-connection)
+    (setq-local kafka-logs--viewer-topic kafka-logs-topic)
+    (setq-local kafka-logs--viewer-stream kafka-logs-stream)
+    (setq-local kafka-logs--viewer-time-range kafka-logs-time-range)
+    (setq-local kafka-logs--viewer-filter kafka-logs-filter)
+    (setq-local kafka-logs--viewer-payload-format kafka-logs-payload-format)
+    (setq-local kafka-logs--viewer-value-format kafka-logs-value-format)
+    (setq-local kafka-logs--viewer-detected-value-format
+                kafka-logs--detected-value-format)
+    (setq-local kafka-logs--viewer-message-path message-path)
+    (setq-local kafka-logs--viewer-json-paths json-paths)))
+
+(defun kafka-logs--plist-value (plist key default)
+  "Return PLIST KEY value, or DEFAULT when KEY is absent."
+  (if (plist-member plist key)
+      (plist-get plist key)
+    default))
+
+(defun kafka-logs-stream-to-buffer (buffer source)
+  "Start a Kafka stream SOURCE into composite log viewer BUFFER.
+
+SOURCE is a plist.  Supported keys are:
+
+- `:connection': configured Kafka connection name.
+- `:topic': topic name.
+- `:filter': optional grep regex.
+- `:value-format': one of `auto', `json', `avro', or `string'.
+- `:payload-format': `json' to parse payloads as JSON, or nil for raw.
+- `:message-path': summary message path.
+- `:json-paths': detail JSON paths rendered as JSON blocks.
+- `:extra-paths': summary extra paths.
+
+The stream always starts at the topic end and ignores time range, since, and
+maximum message options."
+  (let* ((viewer (json-log-viewer-get-buffer buffer))
+         (connection (kafka-logs--plist-value
+                      source :connection kafka-logs-default-connection))
+         (topic (kafka-logs--plist-value source :topic kafka-logs-default-topic))
+         (filter (kafka-logs--plist-value source :filter kafka-logs-default-filter))
+         (value-format (kafka-logs--plist-value
+                        source :value-format kafka-logs-default-value-format))
+         (payload-format (kafka-logs--plist-value
+                          source :payload-format kafka-logs-default-payload-format))
+         (json-paths (kafka-logs--plist-value
+                      source :json-paths kafka-logs-default-json-paths))
+         (extra-paths (kafka-logs--plist-value
+                       source :extra-paths kafka-logs-default-extra-paths))
+         (message-path (kafka-logs--plist-value
+                        source :message-path kafka-logs-default-message-path))
+         (kafka-logs-viewer-buffer (buffer-name viewer))
+         (kafka-logs-connection connection)
+         (kafka-logs-topic topic)
+         (kafka-logs-stream t)
+         (kafka-logs-since nil)
+         (kafka-logs-time-range nil)
+         (kafka-logs-filter filter)
+         (kafka-logs-max-messages nil)
+         (kafka-logs-value-format value-format)
+         (kafka-logs--detected-value-format nil)
+         (kafka-logs-payload-format payload-format)
+         (kafka-logs-json-paths json-paths)
+         (kafka-logs-extra-paths extra-paths)
+         (kafka-logs-message-path message-path))
+    (unless (json-log-viewer-composite-buffer-p viewer)
+      (user-error "Kafka composite source requires a composite log viewer buffer"))
+    (unless (and kafka-logs-connection
+                 (assoc kafka-logs-connection kafka-logs-connections))
+      (user-error "Select a configured Kafka connection first"))
+    (unless (and kafka-logs-topic (not (string-empty-p kafka-logs-topic)))
+      (user-error "Select a Kafka topic first"))
+    (if (eq (kafka-logs--normalize-value-format kafka-logs-value-format) 'auto)
+        (kafka-logs--apply-topic-selection kafka-logs-topic)
+      (setq kafka-logs-topic (string-trim kafka-logs-topic)))
+    (let* ((normalized-extra-paths
+            (kafka-logs--normalize-extra-paths
+             kafka-logs-extra-paths "kafka-logs-extra-paths"))
+           (normalized-json-paths
+            (kafka-logs--normalize-json-paths
+             kafka-logs-json-paths "kafka-logs-json-paths"))
+           (normalized-message-path
+            (kafka-logs--normalize-message-path
+             kafka-logs-message-path "kafka-logs-message-path"))
+           (args (kafka-logs--consume-args))
+           (command (kafka-logs--command-with-filter args t))
+           (label (format "%s/%s" kafka-logs-connection kafka-logs-topic))
+           (captured-connection kafka-logs-connection)
+           (captured-topic kafka-logs-topic)
+           (captured-filter kafka-logs-filter)
+           (captured-value-format kafka-logs-value-format)
+           (captured-detected-value-format kafka-logs--detected-value-format)
+           (captured-payload-format kafka-logs-payload-format)
+           (captured-extra-paths normalized-extra-paths)
+           (captured-json-paths normalized-json-paths)
+           (captured-message-path normalized-message-path))
+      (setq kafka-logs-extra-paths normalized-extra-paths)
+      (setq kafka-logs-json-paths normalized-json-paths)
+      (setq kafka-logs-message-path normalized-message-path)
+      (kafka-logs--append-to-viewer-buffer
+       viewer normalized-message-path normalized-json-paths)
+      (kafka-logs--register-composite-source-config viewer)
+      (json-log-viewer-run-when-ready
+       viewer
+       (lambda ()
+         (let ((kafka-logs-connection captured-connection)
+               (kafka-logs-topic captured-topic)
+               (kafka-logs-stream t)
+               (kafka-logs-time-range nil)
+               (kafka-logs-filter captured-filter)
+               (kafka-logs-max-messages nil)
+               (kafka-logs-value-format captured-value-format)
+               (kafka-logs--detected-value-format captured-detected-value-format)
+               (kafka-logs-payload-format captured-payload-format)
+               (kafka-logs-extra-paths captured-extra-paths)
+               (kafka-logs-json-paths captured-json-paths)
+               (kafka-logs-message-path captured-message-path))
+           (let* ((viewer-buffer (current-buffer))
+                  (socket-path (json-log-viewer-worker-socket-path viewer-buffer))
+                  (wrapper-command (kafka-logs--wrapper-command socket-path command))
+                  (process (make-process
+                            :name (kafka-logs--process-name)
+                            :buffer viewer-buffer
+                            :command wrapper-command
+                            :noquery t
+                            :connection-type 'pipe
+                            :filter #'kafka-logs--wrapper-process-filter)))
+             (set-process-sentinel process #'kafka-logs--stream-process-sentinel)
+             (set-process-query-on-exit-flag process nil)
+             (kafka-logs--add-buffer-process viewer-buffer process)
+             (message "Started Kafka stream for %s" label)))))
+      viewer)))
 
 (defun kafka-logs--value->string (value)
   "Convert VALUE into a display string."
@@ -1182,6 +1353,7 @@ ON-READY is called once the async worker is ready to receive jobs."
         (if (json-log-viewer-composite-buffer-p selected)
             (progn
               (setq buffer selected)
+              (kafka-logs--append-to-viewer-buffer buffer message-path json-paths)
               (when on-ready
                 (json-log-viewer-run-when-ready buffer on-ready)))
           (kafka-logs--kill-buffer-process selected)
@@ -1326,7 +1498,7 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
         (kafka-logs--stream-drain t)
         (kafka-logs--flush-pending-fragment)
         (kafka-logs--stream-cancel-drain-timer)
-        (setq kafka-logs--process nil)))
+        (kafka-logs--remove-buffer-process buffer process)))
     (when (and (memq (process-status process) '(exit signal))
                (not (zerop (process-exit-status process)))
                (not (and kafka-logs-filter
@@ -1413,8 +1585,7 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
                               :filter #'kafka-logs--wrapper-process-filter)))
                (set-process-sentinel process #'kafka-logs--stream-process-sentinel)
                (set-process-query-on-exit-flag process nil)
-               (with-current-buffer viewer-buffer
-                 (setq-local kafka-logs--process process))
+               (kafka-logs--add-buffer-process viewer-buffer process)
                (message "Started Kafka stream for %s" label)))))
     (display-buffer buffer)))
 

@@ -59,6 +59,41 @@
                        "-J"
                        "-o" "end"))))))
 
+(ert-deftest kafka-logs-stream-to-buffer-starts-at-topic-end-test ()
+  (let ((buffer (generate-new-buffer "*kafka-composite-stream-test*"))
+        (kafka-logs-connections '(("prod" . (:brokers "localhost:9092"))))
+        captured-command)
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (composite-log-viewer-mode)
+            (setq-local json-log-viewer--async-queue nil))
+          (cl-letf (((symbol-function 'json-log-viewer-run-when-ready)
+                     (lambda (target function)
+                       (with-current-buffer target
+                         (funcall function))))
+                    ((symbol-function 'json-log-viewer-worker-socket-path)
+                     (lambda (&optional _buffer) "/tmp/socket"))
+                    ((symbol-function 'json-log-viewer-ingest-wrapper-executable)
+                     (lambda () "/tmp/ingest-wrapper"))
+                    ((symbol-function 'make-process)
+                     (lambda (&rest args)
+                       (setq captured-command (plist-get args :command))
+                       'kafka-process))
+                    ((symbol-function 'set-process-sentinel)
+                     (lambda (&rest _args) nil))
+                    ((symbol-function 'set-process-query-on-exit-flag)
+                     (lambda (&rest _args) nil)))
+            (kafka-logs-stream-to-buffer
+             buffer
+             '(:connection "prod" :topic "orders" :value-format json)))
+          (should (equal (member "--" captured-command)
+                         '("--" "kcat" "-b" "localhost:9092"
+                           "-C" "-u" "-q" "-t" "orders"
+                           "-J" "-o" "end"))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
 (ert-deftest kafka-logs-consume-args-time-span-test ()
   (let ((kafka-logs-topic "orders")
         (kafka-logs-stream nil)

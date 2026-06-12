@@ -65,6 +65,45 @@
                      "--prefix"
                      "--timestamps")))))
 
+(ert-deftest kube-logs-stream-to-buffer-starts-at-tail-zero-test ()
+  (let ((buffer (generate-new-buffer "*kube-composite-stream-test*"))
+        captured-command)
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (composite-log-viewer-mode)
+            (setq-local json-log-viewer--async-queue nil))
+          (cl-letf (((symbol-function 'json-log-viewer-run-when-ready)
+                     (lambda (target function)
+                       (with-current-buffer target
+                         (funcall function))))
+                    ((symbol-function 'json-log-viewer-worker-socket-path)
+                     (lambda (&optional _buffer) "/tmp/socket"))
+                    ((symbol-function 'json-log-viewer-ingest-wrapper-executable)
+                     (lambda () "/tmp/ingest-wrapper"))
+                    ((symbol-function 'make-process)
+                     (lambda (&rest args)
+                       (setq captured-command (plist-get args :command))
+                       'kube-process))
+                    ((symbol-function 'set-process-sentinel)
+                     (lambda (&rest _args) nil))
+                    ((symbol-function 'set-process-query-on-exit-flag)
+                     (lambda (&rest _args) nil)))
+            (kube-logs-stream-to-buffer
+             buffer
+             '(:context "prod-cluster"
+               :namespace "payments"
+               :target-kind deployment
+               :target "payments-api"
+               :stream-backend kubectl)))
+          (should (member "--tail=0" captured-command))
+          (should (member "--follow" captured-command))
+          (should-not (cl-some (lambda (arg)
+                                 (string-prefix-p "--since" arg))
+                               captured-command)))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
 (ert-deftest kube-logs-supervisor-command-test ()
   (let ((kube-logs-context "prod-cluster")
         (kube-logs-namespace "payments")

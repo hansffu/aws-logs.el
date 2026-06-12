@@ -600,6 +600,19 @@ When INSTALL-KEYMAP is non-nil, install kube-logs key bindings."
      :message-path kube-logs-message-path
      :extra-paths kube-logs-extra-paths)))
 
+(defun kube-logs--plist-value (plist key default)
+  "Return PLIST KEY value, or DEFAULT when KEY is absent."
+  (if (plist-member plist key)
+      (plist-get plist key)
+    default))
+
+(defun kube-logs--normalize-source-target-kind (value)
+  "Normalize source target kind VALUE to a kube-logs target kind string."
+  (cond
+   ((symbolp value) (symbol-name value))
+   ((stringp value) value)
+   (t value)))
+
 (defun kube-logs--initialize-viewer-buffer (buffer &optional install-keymap)
   "Initialize kube-logs state in BUFFER.
 
@@ -655,6 +668,162 @@ ON-READY is called once the async worker is ready to receive jobs."
       (when on-ready
         (json-log-viewer-run-when-ready buffer on-ready))
       buffer)))
+
+(defun kube-logs-stream-to-buffer (buffer source)
+  "Start a Kubernetes log stream SOURCE into composite log viewer BUFFER.
+
+SOURCE is a plist.  Supported keys are:
+
+- `:context': kubectl context, or nil for the kubectl default.
+- `:namespace': namespace string.
+- `:namespace-enabled': non-nil to pass `--namespace'.
+- `:target-kind': `pod', `deployment', \"pod\", or \"deployment\".
+- `:target': pod or deployment name.
+- `:filter': optional grep regex.
+- `:stream-backend': `rust' or `kubectl'.
+- `:debug-process-buffer': non-nil to keep Rust supervisor diagnostics.
+- `:timestamp-path', `:level-path', `:message-path', `:extra-paths':
+  summary formatting paths.
+
+The stream always follows from now with `--tail=0' and no `--since'."
+  (let* ((viewer (json-log-viewer-get-buffer buffer))
+         (context (kube-logs--plist-value
+                   source :context kube-logs-default-context))
+         (namespace (kube-logs--plist-value
+                     source :namespace kube-logs-default-namespace))
+         (namespace-enabled (kube-logs--plist-value
+                             source :namespace-enabled
+                             kube-logs-default-namespace-enabled))
+         (target-kind (kube-logs--normalize-source-target-kind
+                       (kube-logs--plist-value
+                        source :target-kind kube-logs-default-target-kind)))
+         (target (kube-logs--plist-value
+                  source :target kube-logs-default-target))
+         (filter (kube-logs--plist-value
+                  source :filter kube-logs-default-filter))
+         (stream-backend (kube-logs--plist-value
+                          source :stream-backend kube-logs-stream-backend))
+         (debug-process-buffer
+          (kube-logs--plist-value
+           source :debug-process-buffer kube-logs-debug-process-buffer))
+         (timestamp-path (kube-logs--plist-value
+                          source :timestamp-path kube-logs-timestamp-path))
+         (level-path (kube-logs--plist-value
+                      source :level-path kube-logs-level-path))
+         (message-path (kube-logs--plist-value
+                        source :message-path kube-logs-message-path))
+         (extra-paths (kube-logs--plist-value
+                       source :extra-paths kube-logs-extra-paths))
+         (kube-logs-viewer-buffer (buffer-name viewer))
+         (kube-logs-context context)
+         (kube-logs-namespace namespace)
+         (kube-logs-namespace-enabled namespace-enabled)
+         (kube-logs-target-kind target-kind)
+         (kube-logs-target target)
+         (kube-logs-follow t)
+         (kube-logs-tail-lines 0)
+         (kube-logs-since nil)
+         (kube-logs-filter filter)
+         (kube-logs-stream-backend stream-backend)
+         (kube-logs-debug-process-buffer debug-process-buffer)
+         (kube-logs-timestamp-path timestamp-path)
+         (kube-logs-level-path level-path)
+         (kube-logs-message-path message-path)
+         (kube-logs-extra-paths extra-paths))
+    (unless (json-log-viewer-composite-buffer-p viewer)
+      (user-error "Kube composite source requires a composite log viewer buffer"))
+    (when (and kube-logs-namespace-enabled
+               (or (null kube-logs-namespace)
+                   (string-empty-p kube-logs-namespace)))
+      (user-error "Set a namespace first or disable namespace override with :namespace-enabled nil"))
+    (unless (and kube-logs-target-kind (member kube-logs-target-kind kube-logs--target-kinds))
+      (user-error "Select a target kind first"))
+    (unless (and kube-logs-target (not (string-empty-p kube-logs-target)))
+      (user-error "Select a target first"))
+    (unless (memq kube-logs-stream-backend '(rust kubectl))
+      (user-error ":stream-backend must be rust or kubectl, got: %S"
+                  kube-logs-stream-backend))
+    (let ((captured-context kube-logs-context)
+          (captured-namespace kube-logs-namespace)
+          (captured-namespace-enabled kube-logs-namespace-enabled)
+          (captured-target-kind kube-logs-target-kind)
+          (captured-target kube-logs-target)
+          (captured-filter kube-logs-filter)
+          (captured-stream-backend kube-logs-stream-backend)
+          (captured-debug-process-buffer kube-logs-debug-process-buffer)
+          (captured-timestamp-path kube-logs-timestamp-path)
+          (captured-level-path kube-logs-level-path)
+          (captured-message-path kube-logs-message-path)
+          (captured-extra-paths kube-logs-extra-paths)
+          (description (kube-logs--target-description)))
+      (kube-logs--append-to-viewer-buffer viewer)
+      (kube-logs--register-composite-source-config viewer)
+      (json-log-viewer-run-when-ready
+       viewer
+       (lambda ()
+         (let ((kube-logs-context captured-context)
+               (kube-logs-namespace captured-namespace)
+               (kube-logs-namespace-enabled captured-namespace-enabled)
+               (kube-logs-target-kind captured-target-kind)
+               (kube-logs-target captured-target)
+               (kube-logs-follow t)
+               (kube-logs-tail-lines 0)
+               (kube-logs-since nil)
+               (kube-logs-filter captured-filter)
+               (kube-logs-stream-backend captured-stream-backend)
+               (kube-logs-debug-process-buffer captured-debug-process-buffer)
+               (kube-logs-timestamp-path captured-timestamp-path)
+               (kube-logs-level-path captured-level-path)
+               (kube-logs-message-path captured-message-path)
+               (kube-logs-extra-paths captured-extra-paths))
+           (let ((viewer-buffer (current-buffer)))
+             (pcase kube-logs-stream-backend
+               ('rust
+                (let* ((socket-path (json-log-viewer-worker-socket-path viewer-buffer))
+                       (command (kube-logs--supervisor-command socket-path))
+                       (log-buffer (kube-logs--make-process-log-buffer))
+                       (process
+                        (make-process
+                         :name (kube-logs--process-name)
+                         :buffer log-buffer
+                         :command command
+                         :noquery t
+                         :connection-type 'pipe
+                         :filter
+                         (lambda (proc output)
+                           (kube-logs--supervisor-process-filter
+                            viewer-buffer proc output))
+                         :sentinel
+                         (lambda (proc event)
+                           (kube-logs--supervisor-sentinel
+                            viewer-buffer proc event)))))
+                  (set-process-query-on-exit-flag process nil)
+                  (kube-logs--add-buffer-process viewer-buffer process)
+                  (with-current-buffer viewer-buffer
+                    (setq-local kube-logs--process-log-buffer log-buffer))
+                  (message "Started kube log supervisor for %s" description)))
+               ('kubectl
+                (let* ((args (kube-logs--logs-args))
+                       (command (kube-logs--command-with-filter args t))
+                       (socket-path (json-log-viewer-worker-socket-path viewer-buffer))
+                       (wrapper-command
+                        (let ((kube-logs--viewer-namespace captured-namespace)
+                              (kube-logs--viewer-target captured-target)
+                              (kube-logs--viewer-target-kind captured-target-kind))
+                          (kube-logs--wrapper-command socket-path command)))
+                       (process
+                        (make-process
+                         :name (kube-logs--process-name)
+                         :buffer viewer-buffer
+                         :command wrapper-command
+                         :noquery t
+                         :connection-type 'pipe
+                         :filter #'kube-logs--wrapper-process-filter)))
+                  (set-process-sentinel process #'kube-logs--stream-process-sentinel)
+                  (set-process-query-on-exit-flag process nil)
+                  (kube-logs--add-buffer-process viewer-buffer process)
+                  (message "Started kube logs stream for %s" description))))))))
+      viewer)))
 
 (defun kube-logs--parse-json-maybe (value)
   "Parse VALUE as JSON object/list when possible."
