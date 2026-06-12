@@ -162,6 +162,8 @@
                      parsed (plist-get config :timestamp-path) flattened))
          (timestamp-epoch (json-log-viewer-async-worker--parse-time timestamp))
          (sort-key (or timestamp-epoch (+ 1000000000000.0 id)))
+         (source (json-log-viewer-shared--value->string
+                  (json-log-viewer-shared--resolve-path parsed "source" flattened)))
          (level (or (json-log-viewer-shared--resolve-path
                      parsed (plist-get config :level-path) flattened)
                     "-"))
@@ -181,6 +183,7 @@
     (cons
      (list :id id
            :sort-key sort-key
+           :source source
            :timestamp (or timestamp "-")
            :level level
            :message message
@@ -218,6 +221,8 @@
                      parsed (plist-get config :timestamp-path) flattened))
          (timestamp-epoch (json-log-viewer-async-worker--parse-time timestamp))
          (sort-key (or timestamp-epoch nil))
+         (source (json-log-viewer-shared--value->string
+                  (json-log-viewer-shared--resolve-path parsed "source" flattened)))
          (level (or (json-log-viewer-shared--resolve-path
                      parsed (plist-get config :level-path) flattened)
                     "-"))
@@ -231,6 +236,7 @@
         (push value extra-fields)))
     (list :parsed parsed
           :sort-key sort-key
+          :source source
           :timestamp (or timestamp "-")
           :timestamp-epoch timestamp-epoch
           :level level
@@ -262,6 +268,7 @@
   (let* ((summary (json-log-viewer-async-worker--line->summary line config))
          (parsed (plist-get summary :parsed))
          (timestamp-text (plist-get summary :timestamp))
+         (source (plist-get summary :source))
          (level-path (plist-get summary :level))
          (message-path (plist-get summary :message))
          (extra-paths (json-log-viewer-async-worker--extra-fields->csv
@@ -272,6 +279,7 @@
                db
                timestamp-epoch
                timestamp-text
+               source
                level-path
                message-path
                extra-paths
@@ -287,9 +295,11 @@
         (timestamp-text (plist-get row :timestamp))
         (level-path (plist-get row :level-path))
         (message-path (plist-get row :message-path))
+        (source (plist-get row :source))
         (extra-paths (plist-get row :extra-paths)))
     (list :id id
           :sort-key (or sort-key (+ 1000000000000.0 (or id 0)))
+          :source source
           :timestamp (or timestamp-text "-")
           :level (or level-path "-")
           :message (or message-path "-")

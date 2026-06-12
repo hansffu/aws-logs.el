@@ -25,6 +25,8 @@
 (defvar aws-logs-follow)
 (defvar aws-logs-ecs)
 (defvar aws-logs-filter)
+(defvar aws-logs-viewer-buffer nil
+  "Selected json-log-viewer buffer for AWS tail ingestion, or nil.")
 (defvar aws-logs-time-range)
 (defvar aws-logs-custom-time-range)
 (defvar aws-logs-tail-ecs-batch-flush-interval)
@@ -37,6 +39,12 @@
 (defvar aws-logs-mode-hook)
 
 (declare-function aws-logs--list-log-groups "aws-logs" ())
+(declare-function json-log-viewer-run-when-ready "json-log-viewer"
+                  (buffer-or-name function))
+(declare-function json-log-viewer-composite-buffer-p "json-log-viewer"
+                  (&optional buffer-or-name))
+(declare-function json-log-viewer-register-source-config "json-log-viewer"
+                  (buffer-or-name source &rest args))
 
 (defvar-local aws-logs--tail-process nil
   "Tail process associated with current log buffer.")
@@ -209,6 +217,26 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
       (alist-get '@message parsed)
       (alist-get 'log parsed)))
 
+(defun aws-logs--tail-object-with-source (value)
+  "Return VALUE as a JSON object with AWS source metadata."
+  (cond
+   ((hash-table-p value)
+    (puthash "source" "aws" value)
+    value)
+   ((and (listp value)
+         (cl-every #'consp value))
+    (if (assoc 'source value)
+        value
+      (cons (cons 'source "aws") value)))
+   (t
+    (let ((obj (make-hash-table :test 'equal))
+          (message (or (and (stringp value) value)
+                       (format "%s" value))))
+      (puthash "source" "aws" obj)
+      (puthash "raw" message obj)
+      (puthash "message" message obj)
+      obj))))
+
 (defun aws-logs--tail-strip-aws-prefix (line)
   "Strip AWS tail prefix (timestamp + log-group) from LINE when present."
   (if (and (stringp line)
@@ -234,8 +262,8 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
                         (aws-logs--tail-parse-json-from-mixed log-field)))
          (payload (or message-json log-json outer)))
     (if payload
-        (json-serialize payload)
-      line)))
+        (json-serialize (aws-logs--tail-object-with-source payload))
+      (json-serialize (aws-logs--tail-object-with-source line)))))
 
 (defun aws-logs--tail-find-json-start (line)
   "Return index of first JSON opener in LINE, or nil."
@@ -275,7 +303,7 @@ Returns (NORMALIZED-LINES . NEW-PENDING)."
            (t
             (let ((json-pos (aws-logs--tail-find-json-start trimmed)))
               (if (null json-pos)
-                  (push trimmed normalized)
+                  (push (aws-logs--tail-maybe-unwrap-ecs-message trimmed) normalized)
                 (let ((candidate (substring trimmed json-pos)))
                   (if (aws-logs--tail-json-line-p candidate)
                       (push (aws-logs--tail-maybe-unwrap-ecs-message candidate) normalized)
@@ -305,7 +333,8 @@ Returns (NORMALIZED-LINES . NEW-PENDING)."
       (aws-logs--tail-ecs-cancel-flush-timer)
       (aws-logs--tail-ecs-cancel-chunk-timer)
       (let ((proc (or aws-logs--tail-process
-                      (get-buffer-process buffer))))
+                      (and (derived-mode-p 'aws-logs-tail-viewer-mode)
+                           (get-buffer-process buffer)))))
         (when (process-live-p proc)
           (delete-process proc))
         (setq aws-logs--tail-process nil)
@@ -323,40 +352,88 @@ Returns (NORMALIZED-LINES . NEW-PENDING)."
           (kill-buffer aws-logs--tail-once-output-buffer))
         (setq aws-logs--tail-once-output-buffer nil)))))
 
+(defun aws-logs--tail-selected-viewer-buffer-p ()
+  "Return non-nil when AWS tail should use a selected viewer buffer."
+  (and (boundp 'aws-logs-viewer-buffer)
+       aws-logs-viewer-buffer
+       (not (string-empty-p aws-logs-viewer-buffer))))
+
+(defun aws-logs--tail-selected-viewer-buffer ()
+  "Return selected AWS tail viewer buffer, or nil when unset."
+  (when (aws-logs--tail-selected-viewer-buffer-p)
+    (json-log-viewer-get-buffer aws-logs-viewer-buffer)))
+
+(defun aws-logs--tail-selected-composite-viewer-buffer-p ()
+  "Return non-nil when the selected viewer is a composite log viewer."
+  (and (aws-logs--tail-selected-viewer-buffer-p)
+       (json-log-viewer-composite-buffer-p aws-logs-viewer-buffer)))
+
+(defun aws-logs--tail-register-composite-source-config (buffer)
+  "Register AWS tail formatting for composite BUFFER."
+  (when (json-log-viewer-composite-buffer-p buffer)
+    (json-log-viewer-register-source-config
+     buffer
+     "aws"
+     :timestamp-path "@timestamp"
+     :level-path "log.level"
+     :message-path "message")))
+
+(defun aws-logs--tail-initialize-ecs-buffer (buffer &optional install-keymap)
+  "Initialize AWS ECS tail state in BUFFER.
+
+When INSTALL-KEYMAP is non-nil, install AWS tail key bindings."
+  (with-current-buffer buffer
+    (setq-local aws-logs--tail-process nil)
+    (setq-local aws-logs--tail-pending-fragment "")
+    (setq-local aws-logs--tail-pending-json-lines nil)
+    (setq-local aws-logs--tail-pending-viewer-lines nil)
+    (setq-local aws-logs--tail-pending-viewer-count 0)
+    (setq-local aws-logs--tail-flush-timer nil)
+    (setq-local aws-logs--tail-chunk-timer nil)
+    (setq-local aws-logs--tail-normalize-timer nil)
+    (setq-local aws-logs--tail-pending-output-chunks nil)
+    (setq-local aws-logs--tail-pending-output-chunk-count 0)
+    (setq-local aws-logs--tail-pending-raw-lines nil)
+    (setq-local aws-logs--tail-pending-raw-count 0)
+    (setq-local aws-logs--tail-backpressure-paused nil)
+    (setq-local aws-logs--tail-once-output-buffer nil)
+    (add-hook 'kill-buffer-hook
+              (lambda ()
+                (aws-logs--tail-kill-buffer-process (current-buffer)))
+              nil t)
+    (when install-keymap
+      (aws-logs--tail-install-viewer-keymap))))
+
 (defun aws-logs--tail-make-ecs-buffer (&optional on-ready)
   "Create ECS viewer buffer.
 ON-READY is called once the async worker is ready to receive jobs."
-  (let* ((buffer-name (aws-logs--tail-viewer-buffer-name))
-         (existing (get-buffer buffer-name))
-         (buffer nil))
-    (when existing
-      (aws-logs--tail-kill-buffer-process existing))
-    (setq buffer
-          (json-log-viewer-make-buffer
-           buffer-name
-           :timestamp-path "@timestamp"
-           :level-path "log.level"
-           :message-path "message"
-           :mode #'aws-logs-tail-viewer-mode
-           :header-lines-function #'aws-logs--tail-header-lines
-           :on-ready on-ready))
-    (with-current-buffer buffer
-      (setq-local aws-logs--tail-process nil)
-      (setq-local aws-logs--tail-pending-fragment "")
-      (setq-local aws-logs--tail-pending-json-lines nil)
-      (setq-local aws-logs--tail-pending-viewer-lines nil)
-      (setq-local aws-logs--tail-pending-viewer-count 0)
-      (setq-local aws-logs--tail-flush-timer nil)
-      (setq-local aws-logs--tail-chunk-timer nil)
-      (setq-local aws-logs--tail-normalize-timer nil)
-      (setq-local aws-logs--tail-pending-output-chunks nil)
-      (setq-local aws-logs--tail-pending-output-chunk-count 0)
-      (setq-local aws-logs--tail-pending-raw-lines nil)
-      (setq-local aws-logs--tail-pending-raw-count 0)
-      (setq-local aws-logs--tail-backpressure-paused nil)
-      (setq-local aws-logs--tail-once-output-buffer nil)
-      (aws-logs--tail-install-viewer-keymap))
-    buffer))
+  (if-let ((selected (aws-logs--tail-selected-viewer-buffer)))
+      (if (json-log-viewer-composite-buffer-p selected)
+          (progn
+            (when on-ready
+              (json-log-viewer-run-when-ready selected on-ready))
+            selected)
+        (aws-logs--tail-kill-buffer-process selected)
+        (aws-logs--tail-initialize-ecs-buffer selected)
+        (when on-ready
+          (json-log-viewer-run-when-ready selected on-ready))
+        selected)
+    (let* ((buffer-name (aws-logs--tail-viewer-buffer-name))
+           (existing (get-buffer buffer-name))
+           (buffer nil))
+      (when existing
+        (aws-logs--tail-kill-buffer-process existing))
+      (setq buffer
+            (json-log-viewer-make-buffer
+             buffer-name
+             :timestamp-path "@timestamp"
+             :level-path "log.level"
+             :message-path "message"
+             :mode #'aws-logs-tail-viewer-mode
+             :header-lines-function #'aws-logs--tail-header-lines
+             :on-ready on-ready))
+      (aws-logs--tail-initialize-ecs-buffer buffer t)
+      buffer)))
 
 (defun aws-logs--tail-consume-chunk-lines (chunk)
   "Consume process CHUNK in current ECS buffer and return complete lines."
@@ -618,7 +695,9 @@ When FLUSH-NOW is non-nil, flush immediately."
 
 (defun aws-logs--tail-run-ecs-once ()
   "Run ECS tail once asynchronously and render in json-log-viewer."
-  (let* ((buffer (aws-logs--tail-make-ecs-buffer))
+  (let* ((append-to-existing (aws-logs--tail-selected-composite-viewer-buffer-p))
+         (buffer (aws-logs--tail-make-ecs-buffer))
+         (_ (aws-logs--tail-register-composite-source-config buffer))
          (args (append (aws-logs--tail-global-args) (aws-logs--tail-args)))
          (command (aws-logs--tail-command-with-filter args nil))
          (output-buffer (generate-new-buffer " *aws-logs-tail-once*"))
@@ -655,7 +734,9 @@ When FLUSH-NOW is non-nil, flush immediately."
                                 (when-let ((pending (cdr normalized+pending))
                                            (joined (and pending (string-join pending "\n"))))
                                   (setq lines (append lines (list joined))))
-                                (json-log-viewer-replace-log-lines buffer lines nil)
+                                (if append-to-existing
+                                    (json-log-viewer-push buffer lines)
+                                  (json-log-viewer-replace-log-lines buffer lines nil))
                                 (message "Fetched logs tail for %s" log-group))
                             (message "AWS logs tail failed (%s): %s"
                                      exit-code
@@ -676,16 +757,18 @@ When FLUSH-NOW is non-nil, flush immediately."
     (setq buffer
           (aws-logs--tail-make-ecs-buffer
            (lambda ()
-             (let ((process (make-process
-                             :name (aws-logs--tail-process-name)
-                             :buffer buffer
-                             :command command
-                             :noquery t
-                             :connection-type 'pipe
-                             :filter #'aws-logs--tail-ecs-process-filter
-                             :sentinel #'aws-logs--tail-ecs-process-sentinel)))
+             (let* ((viewer-buffer (current-buffer))
+                    (_ (aws-logs--tail-register-composite-source-config viewer-buffer))
+                    (process (make-process
+                              :name (aws-logs--tail-process-name)
+                              :buffer viewer-buffer
+                              :command command
+                              :noquery t
+                              :connection-type 'pipe
+                              :filter #'aws-logs--tail-ecs-process-filter
+                              :sentinel #'aws-logs--tail-ecs-process-sentinel)))
                (set-process-query-on-exit-flag process nil)
-               (with-current-buffer buffer
+               (with-current-buffer viewer-buffer
                  (setq-local aws-logs--tail-process process))
                (message "Started ECS logs tail for %s" log-group)))))
     (display-buffer buffer)))

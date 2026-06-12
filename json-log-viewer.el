@@ -46,6 +46,26 @@
   "Face for timestamp segments in summary lines."
   :group 'json-log-viewer)
 
+(defface json-log-viewer-source-face
+  '((t :inherit font-lock-constant-face :weight bold))
+  "Default face for source segments in summary lines."
+  :group 'json-log-viewer)
+
+(defface json-log-viewer-source-aws-face
+  '((t :inherit json-log-viewer-source-face :foreground "DarkOrange2"))
+  "Face for AWS source segments in summary lines."
+  :group 'json-log-viewer)
+
+(defface json-log-viewer-source-kube-face
+  '((t :inherit json-log-viewer-source-face :foreground "DeepSkyBlue3"))
+  "Face for Kubernetes source segments in summary lines."
+  :group 'json-log-viewer)
+
+(defface json-log-viewer-source-kafka-face
+  '((t :inherit json-log-viewer-source-face :foreground "medium purple"))
+  "Face for Kafka source segments in summary lines."
+  :group 'json-log-viewer)
+
 (defface json-log-viewer-level-face
   '((t :inherit font-lock-constant-face))
   "Face for level segments in summary lines."
@@ -136,6 +156,14 @@ visible frame.  Set to nil or 0 to disable periodic live pulls."
 (defcustom json-log-viewer-background-refresh nil
   "When non-nil, pull live messages even while the viewer buffer is hidden."
   :type 'boolean
+  :group 'json-log-viewer)
+
+(defcustom json-log-viewer-source-faces
+  '(("aws" . json-log-viewer-source-aws-face)
+    ("kube" . json-log-viewer-source-kube-face)
+    ("kafka" . json-log-viewer-source-kafka-face))
+  "Alist mapping log source names to faces for collapsed summary lines."
+  :type '(alist :key-type string :value-type face)
   :group 'json-log-viewer)
 
 (cl-defstruct (json-log-viewer--worker
@@ -246,6 +274,9 @@ visible frame.  Set to nil or 0 to disable periodic live pulls."
 (defvar-local json-log-viewer--json-paths nil
   "List of JSON paths rendered as pretty JSON detail blocks.")
 
+(defvar-local json-log-viewer--source-configs nil
+  "Hash table mapping source names to per-source render config plists.")
+
 (defconst json-log-viewer--source-directory
   (let ((source-file (or load-file-name
                          (and (boundp 'byte-compile-current-file)
@@ -283,6 +314,36 @@ BUFFER-NAME can be a live buffer object or a buffer name string."
       (unless (derived-mode-p 'json-log-viewer-mode)
         (user-error "Not a json-log-viewer buffer: %s" (buffer-name buffer))))
     buffer))
+
+(defun json-log-viewer-buffer-names ()
+  "Return names of live `json-log-viewer-mode' buffers."
+  (let (names)
+    (dolist (buffer (buffer-list))
+      (with-current-buffer buffer
+        (when (derived-mode-p 'json-log-viewer-mode)
+          (push (buffer-name buffer) names))))
+    (nreverse names)))
+
+(defun json-log-viewer-run-when-ready (buffer-or-name function)
+  "Run FUNCTION in BUFFER-OR-NAME when its worker is ready.
+
+If the worker is already ready, FUNCTION is called immediately with
+BUFFER-OR-NAME as the current buffer.  Otherwise it is chained onto the
+buffer's worker-ready callback."
+  (unless (functionp function)
+    (user-error "json-log-viewer-run-when-ready requires a function"))
+  (let ((target (json-log-viewer-get-buffer buffer-or-name)))
+    (with-current-buffer target
+      (json-log-viewer--ensure-async-queue-running)
+      (if (and json-log-viewer--async-queue
+               (json-log-viewer--worker-ready-p json-log-viewer--async-queue))
+          (funcall function)
+        (let ((previous json-log-viewer--on-worker-ready))
+          (setq-local json-log-viewer--on-worker-ready
+                      (lambda ()
+                        (when previous
+                          (funcall previous))
+                        (funcall function))))))))
 
 (defun json-log-viewer--normalize-fields (fields)
   "Normalize FIELDS into an alist of (string . string)."
@@ -434,6 +495,7 @@ When BUFFER-OR-NAME is nil, use the current buffer."
 (defun json-log-viewer--worker-entry->entry (worker-entry)
   "Normalize WORKER-ENTRY into a renderable entry plist."
   (let* ((id (plist-get worker-entry :id))
+         (source (plist-get worker-entry :source))
          (timestamp (or (plist-get worker-entry :timestamp) "-"))
          (level (or (plist-get worker-entry :level) "-"))
          (message (or (plist-get worker-entry :message) "-"))
@@ -445,6 +507,7 @@ When BUFFER-OR-NAME is nil, use the current buffer."
                        (+ 1000000000000.0 (or id 0)))))
     (list :id id
           :sort-key sort-key
+          :source source
           :timestamp timestamp
           :level level
           :message message
@@ -669,6 +732,45 @@ When BUFFER-OR-NAME is nil, use the current buffer."
         :extra-paths (vconcat (or json-log-viewer--extra-paths nil))
         :json-paths (vconcat (or json-log-viewer--json-paths nil))))
 
+(defun json-log-viewer--source-configs-json ()
+  "Return source configs as a JSON-serializable object."
+  (when (hash-table-p json-log-viewer--source-configs)
+    (let ((configs (make-hash-table :test 'equal)))
+      (maphash (lambda (source config)
+                 (puthash source config configs))
+               json-log-viewer--source-configs)
+      configs)))
+
+(defun json-log-viewer--render-config-plist
+    (timestamp-path level-path message-path extra-paths json-paths)
+  "Return a render config plist for path settings."
+  (list :timestamp-path timestamp-path
+        :level-path level-path
+        :message-path message-path
+        :extra-paths (vconcat (or extra-paths nil))
+        :json-paths (vconcat (or json-paths nil))))
+
+(cl-defun json-log-viewer-register-source-config
+    (buffer-or-name source &key timestamp-path level-path message-path extra-paths json-paths)
+  "Register SOURCE render config on composite BUFFER-OR-NAME.
+
+The worker acknowledges the config before this function returns."
+  (unless (and (stringp source) (not (string-empty-p source)))
+    (user-error "Source must be a non-empty string"))
+  (let ((target (json-log-viewer-get-buffer buffer-or-name))
+        (config (json-log-viewer--render-config-plist
+                 timestamp-path level-path message-path extra-paths json-paths)))
+    (with-current-buffer target
+      (unless (hash-table-p json-log-viewer--source-configs)
+        (setq-local json-log-viewer--source-configs (make-hash-table :test 'equal)))
+      (puthash source config json-log-viewer--source-configs)
+      (when json-log-viewer--async-queue
+        (json-log-viewer--async-submit
+         (list :op 'configure-source
+               :source source
+               :config config)
+         t)))))
+
 (defun json-log-viewer--pull-max-messages ()
   "Return the current maximum number of live messages to pull."
   (or (and (integerp json-log-viewer--stream-max-entries)
@@ -850,6 +952,11 @@ When WAIT-FOR-CALLBACK is non-nil, wait for a socket barrier response."
     (pcase op
       ('reset
        (list :cmd "reset" :request-id request-id))
+      ('configure-source
+       (list :cmd "configure-source"
+             :source (plist-get job :source)
+             :config (plist-get job :config)
+             :request-id request-id))
       ('narrow
        (list :cmd "narrow"
              :needle (or (plist-get job :narrow-string) "")
@@ -926,14 +1033,17 @@ When WAIT-FOR-CALLBACK is non-nil, wait for a socket barrier response."
        (lambda (_proc event)
          (json-log-viewer--worker-handle-exit buffer worker event)))
       (json-log-viewer--send-worker-command
-       (list :cmd "start"
-             :socket-path socket-path
-             :auto-delete-worker-files
-             (if json-log-viewer-auto-delete-worker-files t :false)
-             :max-entries max-entries
-             :chunk-size chunk-size
-             :rebuild-chunk-size rebuild-chunk-size
-             :config (json-log-viewer--worker-config))))))
+       (append
+        (list :cmd "start"
+              :socket-path socket-path
+              :auto-delete-worker-files
+              (if json-log-viewer-auto-delete-worker-files t :false)
+              :max-entries max-entries
+              :chunk-size chunk-size
+              :rebuild-chunk-size rebuild-chunk-size
+              :config (json-log-viewer--worker-config))
+        (when-let ((source-configs (json-log-viewer--source-configs-json)))
+          (list :source-configs source-configs)))))))
 
 (defun json-log-viewer--normalize-narrow-string (&optional needle)
   "Normalize NEEDLE into a downcased substring filter, or nil when empty."
@@ -1147,6 +1257,17 @@ JSON-PATHS is a list of paths to render as JSON blocks instead of flattening."
      ((string-match-p "\\`\\(debug\\|trace\\)" normalized) 'font-lock-doc-face)
      (t 'json-log-viewer-level-face))))
 
+(defun json-log-viewer--source-face (source)
+  "Return face symbol suitable for SOURCE."
+  (or (cdr (assoc-string (or source "") json-log-viewer-source-faces t))
+      'json-log-viewer-source-face))
+
+(defun json-log-viewer--source-render-config (source)
+  "Return render config plist for SOURCE, or nil."
+  (and source
+       (hash-table-p json-log-viewer--source-configs)
+       (gethash source json-log-viewer--source-configs)))
+
 (defun json-log-viewer--truncate (value limit)
   "Truncate VALUE to LIMIT characters."
   (if (> (length value) limit)
@@ -1238,28 +1359,47 @@ Returns cons cell (ENTRIES . NEXT-ID)."
   (let* ((parsed (plist-get entry :parsed))
          (raw (or (plist-get entry :raw) ""))
          (flattened-fields (and parsed (json-log-viewer-shared--flatten-path-values parsed)))
+         (source (json-log-viewer-shared--value->string
+                  (or (plist-get entry :source)
+                      (json-log-viewer-shared--resolve-path
+                       parsed "source" flattened-fields))))
+         (source-config (json-log-viewer--source-render-config source))
+         (timestamp-path (or (plist-get source-config :timestamp-path)
+                             json-log-viewer--timestamp-path))
+         (level-path (or (plist-get source-config :level-path)
+                         json-log-viewer--level-path))
+         (message-path (or (plist-get source-config :message-path)
+                           json-log-viewer--message-path))
+         (extra-paths (or (and source-config
+                               (append (plist-get source-config :extra-paths) nil))
+                          json-log-viewer--extra-paths))
          (timestamp (or (plist-get entry :timestamp)
                         (json-log-viewer-shared--resolve-path
-                         parsed json-log-viewer--timestamp-path flattened-fields)
+                         parsed timestamp-path flattened-fields)
                         "-"))
          (level (or (plist-get entry :level)
                     (json-log-viewer-shared--resolve-path
-                     parsed json-log-viewer--level-path flattened-fields)
+                     parsed level-path flattened-fields)
                     "-"))
          (message (or (plist-get entry :message)
                       (json-log-viewer-shared--resolve-path
-                       parsed json-log-viewer--message-path flattened-fields)
+                       parsed message-path flattened-fields)
                       raw
                       "-"))
          (extras (or (plist-get entry :extra-fields)
                      (plist-get entry :extras)
                      nil)))
     (unless (or extras (not parsed))
-      (dolist (path json-log-viewer--extra-paths)
+      (dolist (path extra-paths)
         (when-let ((value (json-log-viewer-shared--resolve-path parsed path flattened-fields)))
           (push value extras)))
       (setq extras (nreverse extras)))
     (concat
+     (if (and source (not (string-empty-p source)))
+         (concat (propertize (format "[%s]" source)
+                             'face (json-log-viewer--source-face source))
+                 " ")
+       "")
      (propertize timestamp 'face 'json-log-viewer-timestamp-face)
      " "
      (propertize (upcase level) 'face (json-log-viewer--level-face level))
@@ -2344,6 +2484,39 @@ New entries are always appended to the bottom."
   (add-hook 'post-command-hook #'json-log-viewer--maybe-disable-auto-follow-after-command nil t)
   (add-hook 'post-command-hook #'json-log-viewer--highlight-current-line t t))
 
+(define-derived-mode composite-log-viewer-mode json-log-viewer-mode "CompositeLogs"
+  "Major mode for a shared JSON log viewer with multiple sources."
+  :group 'json-log-viewer)
+
+(defun json-log-viewer-composite-buffer-p (&optional buffer-or-name)
+  "Return non-nil when BUFFER-OR-NAME is a composite log viewer buffer.
+
+When BUFFER-OR-NAME is nil, inspect the current buffer."
+  (let ((buffer (cond
+                 ((null buffer-or-name) (current-buffer))
+                 ((bufferp buffer-or-name) buffer-or-name)
+                 ((stringp buffer-or-name) (get-buffer buffer-or-name))
+                 (t nil))))
+    (and (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (derived-mode-p 'composite-log-viewer-mode)))))
+
+(defun composite-log-viewer (&optional buffer-name)
+  "Create or reset a composite log viewer buffer.
+
+With prefix argument, prompt for BUFFER-NAME."
+  (interactive
+   (list (when current-prefix-arg
+           (read-string "Composite log viewer buffer: " "*Composite logs*"))))
+  (let ((buffer (json-log-viewer-make-buffer
+                 (or buffer-name "*Composite logs*")
+                 :timestamp-path "timestamp"
+                 :level-path "level"
+                 :message-path "message"
+                 :mode #'composite-log-viewer-mode)))
+    (display-buffer buffer)
+    buffer))
+
 (defun json-log-viewer--maybe-load-evil-bindings ()
   "Conditionally load and initialize optional Evil bindings."
   (when (and json-log-viewer-enable-evil-bindings
@@ -2430,6 +2603,7 @@ Returns the created buffer."
       (setq-local json-log-viewer--message-path message-path)
       (setq-local json-log-viewer--extra-paths normalized-extra-paths)
       (setq-local json-log-viewer--json-paths normalized-json-paths)
+      (setq-local json-log-viewer--source-configs nil)
       (setq-local json-log-viewer--json-header-lines-function header-lines-function)
       (setq-local json-log-viewer--seen-signatures (make-hash-table :test 'equal))
       (setq-local json-log-viewer--on-worker-ready on-ready)

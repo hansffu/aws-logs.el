@@ -21,6 +21,15 @@
 (declare-function json-log-viewer-kube-log-supervisor-executable "json-log-viewer" ())
 (declare-function json-log-viewer-worker-socket-path "json-log-viewer"
                   (&optional buffer-or-name))
+(declare-function json-log-viewer-run-when-ready "json-log-viewer"
+                  (buffer-or-name function))
+(declare-function json-log-viewer-buffer-names "json-log-viewer" ())
+(declare-function json-log-viewer-composite-buffer-p "json-log-viewer"
+                  (&optional buffer-or-name))
+(declare-function json-log-viewer-replace-log-lines "json-log-viewer"
+                  (buffer-or-name log-lines &optional preserve-filter))
+(declare-function json-log-viewer-register-source-config "json-log-viewer"
+                  (buffer-or-name source &rest args))
 
 (define-derived-mode kube-logs-viewer-mode json-log-viewer-mode "Kube-Logs"
   "Major mode for Kubernetes log buffers rendered with `json-log-viewer`."
@@ -167,6 +176,11 @@ Set this to match your log format, e.g. \"@timestamp\"."
 (defvar kube-logs-filter kube-logs-default-filter
   "Regex filter for kubectl logs output in this Emacs session, or nil.")
 
+(defvar kube-logs-viewer-buffer nil
+  "Selected json-log-viewer buffer for Kubernetes ingestion, or nil.
+
+When nil, kube-logs creates its normal dedicated viewer buffer.")
+
 (defvar kube-logs-presets nil
   "Alist of named kube-logs presets.
 
@@ -174,6 +188,12 @@ Each element has the form (NAME . PLIST).")
 
 (defvar-local kube-logs--process nil
   "Process associated with the current kube-logs viewer buffer.")
+
+(defvar-local kube-logs--processes nil
+  "Processes associated with the current kube-logs viewer buffer.")
+
+(defvar-local kube-logs--initialized-p nil
+  "Non-nil when kube-logs local lifecycle state is installed.")
 
 (defvar-local kube-logs--pending-fragment ""
   "Trailing incomplete process output fragment for streaming buffers.")
@@ -474,11 +494,17 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
   "Stop process and cleanup state associated with BUFFER, if any."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (let ((proc (or kube-logs--process
-                      (get-buffer-process buffer))))
-        (when (process-live-p proc)
-          (delete-process proc))
-        (setq kube-logs--process nil))
+      (let ((processes (delete-dups
+                        (delq nil
+                              (append kube-logs--processes
+                                      (list kube-logs--process
+                                            (and (derived-mode-p 'kube-logs-viewer-mode)
+                                                 (get-buffer-process buffer))))))))
+        (dolist (proc processes)
+          (when (process-live-p proc)
+            (delete-process proc)))
+        (setq kube-logs--process nil)
+        (setq kube-logs--processes nil))
       (setq kube-logs--pending-fragment "")
       (when (timerp kube-logs--stream-drain-timer)
         (cancel-timer kube-logs--stream-drain-timer))
@@ -492,51 +518,143 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
       (setq kube-logs--process-log-buffer nil)
       (setq kube-logs--process-log-pending-fragment ""))))
 
+(defun kube-logs--add-buffer-process (buffer process)
+  "Track PROCESS as an active kube source for BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq-local kube-logs--process process)
+      (cl-pushnew process kube-logs--processes :test #'eq))))
+
+(defun kube-logs--remove-buffer-process (buffer process)
+  "Stop tracking PROCESS for BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq kube-logs--processes (delq process kube-logs--processes))
+      (when (eq kube-logs--process process)
+        (setq kube-logs--process (car kube-logs--processes))))))
+
+(defun kube-logs--reset-buffer-state (buffer &optional install-keymap)
+  "Reset kube-logs local state in BUFFER.
+
+When INSTALL-KEYMAP is non-nil, install kube-logs key bindings."
+  (with-current-buffer buffer
+    (setq-local kube-logs--process nil)
+    (setq-local kube-logs--processes nil)
+    (setq-local kube-logs--initialized-p t)
+    (setq-local kube-logs--pending-fragment "")
+    (setq-local kube-logs--stream-chunks-in nil)
+    (setq-local kube-logs--stream-chunks-out nil)
+    (setq-local kube-logs--stream-pending-lines nil)
+    (setq-local kube-logs--stream-drain-timer nil)
+    (setq-local kube-logs--once-output-buffer nil)
+    (setq-local kube-logs--process-log-buffer nil)
+    (setq-local kube-logs--process-log-pending-fragment "")
+    (add-hook 'kill-buffer-hook
+              (lambda ()
+                (kube-logs--kill-buffer-process (current-buffer)))
+              nil t)
+    (when install-keymap
+      (kube-logs--install-viewer-keymap))))
+
+(defun kube-logs--set-viewer-state (buffer)
+  "Set current session metadata on BUFFER."
+  (with-current-buffer buffer
+    (setq-local kube-logs--viewer-context kube-logs-context)
+    (setq-local kube-logs--viewer-namespace kube-logs-namespace)
+    (setq-local kube-logs--viewer-namespace-enabled kube-logs-namespace-enabled)
+    (setq-local kube-logs--viewer-target-kind kube-logs-target-kind)
+    (setq-local kube-logs--viewer-target kube-logs-target)
+    (setq-local kube-logs--viewer-follow kube-logs-follow)
+    (setq-local kube-logs--viewer-tail kube-logs-tail-lines)
+    (setq-local kube-logs--viewer-since kube-logs-since)))
+
 (defun kube-logs-quit-process-and-window ()
   "Stop log process for current buffer and close the window."
   (interactive)
   (kube-logs--kill-buffer-process (current-buffer))
   (quit-window t))
 
+(defun kube-logs--selected-viewer-buffer-p ()
+  "Return non-nil when kube-logs should use a selected viewer buffer."
+  (and kube-logs-viewer-buffer
+       (not (string-empty-p kube-logs-viewer-buffer))))
+
+(defun kube-logs--selected-viewer-buffer ()
+  "Return selected kube-logs viewer buffer, or nil when unset."
+  (when (kube-logs--selected-viewer-buffer-p)
+    (json-log-viewer-get-buffer kube-logs-viewer-buffer)))
+
+(defun kube-logs--selected-composite-viewer-buffer-p ()
+  "Return non-nil when the selected viewer is a composite log viewer."
+  (and (kube-logs--selected-viewer-buffer-p)
+       (json-log-viewer-composite-buffer-p kube-logs-viewer-buffer)))
+
+(defun kube-logs--register-composite-source-config (buffer)
+  "Register current kube formatting for composite BUFFER."
+  (when (json-log-viewer-composite-buffer-p buffer)
+    (json-log-viewer-register-source-config
+     buffer
+     "kube"
+     :timestamp-path kube-logs-timestamp-path
+     :level-path kube-logs-level-path
+     :message-path kube-logs-message-path
+     :extra-paths kube-logs-extra-paths)))
+
+(defun kube-logs--initialize-viewer-buffer (buffer &optional install-keymap)
+  "Initialize kube-logs state in BUFFER.
+
+When INSTALL-KEYMAP is non-nil, install kube-logs key bindings."
+  (kube-logs--reset-buffer-state buffer install-keymap)
+  (kube-logs--set-viewer-state buffer))
+
+(defun kube-logs--append-to-viewer-buffer (buffer)
+  "Prepare BUFFER for an additional kube source without stopping existing ones."
+  (with-current-buffer buffer
+    (unless kube-logs--initialized-p
+      (setq-local kube-logs--initialized-p t)
+      (add-hook 'kill-buffer-hook
+                (lambda ()
+                  (kube-logs--kill-buffer-process (current-buffer)))
+                nil t)))
+  (kube-logs--set-viewer-state buffer))
+
 (defun kube-logs--make-viewer-buffer (&optional on-ready)
   "Create kube logs viewer buffer.
 ON-READY is called once the async worker is ready to receive jobs."
-  (let* ((buffer-name (kube-logs--viewer-buffer-name))
-         (existing (get-buffer buffer-name))
-         buffer)
-    (when existing
-      (kube-logs--kill-buffer-process existing))
-    (setq buffer
-          (json-log-viewer-make-buffer
-           buffer-name
-           :timestamp-path kube-logs-timestamp-path
-           :level-path kube-logs-level-path
-           :message-path kube-logs-message-path
-           :extra-paths kube-logs-extra-paths
-           :mode #'kube-logs-viewer-mode
-           :header-lines-function #'kube-logs--viewer-header-lines
-           :on-ready on-ready))
-    (with-current-buffer buffer
-      (setq-local kube-logs--process nil)
-      (setq-local kube-logs--pending-fragment "")
-      (setq-local kube-logs--stream-chunks-in nil)
-      (setq-local kube-logs--stream-chunks-out nil)
-      (setq-local kube-logs--stream-pending-lines nil)
-      (setq-local kube-logs--stream-drain-timer nil)
-      (setq-local kube-logs--once-output-buffer nil)
-      (setq-local kube-logs--process-log-buffer nil)
-      (setq-local kube-logs--process-log-pending-fragment "")
-      (setq-local kube-logs--viewer-context kube-logs-context)
-      (setq-local kube-logs--viewer-namespace kube-logs-namespace)
-      (setq-local kube-logs--viewer-namespace-enabled kube-logs-namespace-enabled)
-      (setq-local kube-logs--viewer-target-kind kube-logs-target-kind)
-      (setq-local kube-logs--viewer-target kube-logs-target)
-      (setq-local kube-logs--viewer-follow kube-logs-follow)
-      (setq-local kube-logs--viewer-tail kube-logs-tail-lines)
-      (setq-local kube-logs--viewer-since kube-logs-since)
-      (add-hook 'kill-buffer-hook (lambda () (kube-logs--kill-buffer-process (current-buffer))) nil t)
-      (kube-logs--install-viewer-keymap))
-    buffer))
+  (if-let ((selected (kube-logs--selected-viewer-buffer)))
+      (if (json-log-viewer-composite-buffer-p selected)
+          (progn
+            (kube-logs--append-to-viewer-buffer selected)
+            (when on-ready
+              (json-log-viewer-run-when-ready selected on-ready))
+            selected)
+        (kube-logs--kill-buffer-process selected)
+        (kube-logs--initialize-viewer-buffer selected)
+        (when on-ready
+          (json-log-viewer-run-when-ready
+           selected
+           (lambda ()
+             (json-log-viewer-replace-log-lines selected nil nil)
+             (funcall on-ready))))
+        selected)
+    (let* ((buffer-name (kube-logs--viewer-buffer-name))
+           (existing (get-buffer buffer-name))
+           buffer)
+      (when existing
+        (kube-logs--kill-buffer-process existing))
+      (setq buffer
+            (json-log-viewer-make-buffer
+             buffer-name
+             :timestamp-path kube-logs-timestamp-path
+             :level-path kube-logs-level-path
+             :message-path kube-logs-message-path
+             :extra-paths kube-logs-extra-paths
+             :mode #'kube-logs-viewer-mode
+             :header-lines-function #'kube-logs--viewer-header-lines))
+      (kube-logs--initialize-viewer-buffer buffer t)
+      (when on-ready
+        (json-log-viewer-run-when-ready buffer on-ready))
+      buffer)))
 
 (defun kube-logs--parse-json-maybe (value)
   "Parse VALUE as JSON object/list when possible."
@@ -570,6 +688,7 @@ ON-READY is called once the async worker is ready to receive jobs."
              (obj (make-hash-table :test 'equal)))
         (when timestamp
           (puthash "timestamp" timestamp obj))
+        (puthash "source" "kube" obj)
         (puthash "raw" without-prefix obj)
         (puthash "namespace" (or kube-logs--viewer-namespace kube-logs-namespace "") obj)
         (puthash "target" (or kube-logs--viewer-target kube-logs-target "") obj)
@@ -703,7 +822,7 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
         (kube-logs--stream-drain t)
         (kube-logs--stream-cancel-drain-timer)
         (kube-logs--flush-pending-fragment)
-        (setq kube-logs--process nil)))
+        (kube-logs--remove-buffer-process buffer process)))
     (when (and (memq (process-status process) '(exit signal))
                (not (zerop (process-exit-status process)))
                (not (and kube-logs-filter
@@ -714,7 +833,9 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
 
 (defun kube-logs--run-once ()
   "Fetch logs once asynchronously and render in json-log-viewer."
-  (let* ((buffer (kube-logs--make-viewer-buffer))
+  (let* ((append-to-existing (kube-logs--selected-composite-viewer-buffer-p))
+         (buffer (kube-logs--make-viewer-buffer))
+         (_ (kube-logs--register-composite-source-config buffer))
          (args (kube-logs--logs-args))
          (command (kube-logs--command-with-filter args nil))
          (output-buffer (generate-new-buffer " *kube-logs-once*"))
@@ -735,15 +856,16 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
                  (unwind-protect
                      (when (buffer-live-p buffer)
                        (with-current-buffer buffer
-                         (when (eq kube-logs--process proc)
-                           (setq kube-logs--process nil))
+                         (kube-logs--remove-buffer-process buffer proc)
                          (when (eq kube-logs--once-output-buffer output-buffer)
                            (setq kube-logs--once-output-buffer nil))
                          (if (or (zerop exit-code)
                                  (and kube-logs-filter (= exit-code 1)))
                              (let* ((raw-lines (split-string output "\n" t))
                                     (json-lines (kube-logs--lines->json-lines raw-lines)))
-                               (json-log-viewer-replace-log-lines buffer json-lines nil)
+                               (if append-to-existing
+                                   (json-log-viewer-push buffer json-lines)
+                                 (json-log-viewer-replace-log-lines buffer json-lines nil))
                                (message "Fetched kube logs for %s" label))
                            (message "kubectl logs failed (%s): %s"
                                     exit-code
@@ -756,8 +878,7 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
     (display-buffer buffer)
     (message "Fetching kube logs for %s..." label)
     (set-process-query-on-exit-flag process nil)
-    (with-current-buffer buffer
-      (setq-local kube-logs--process process))))
+    (kube-logs--add-buffer-process buffer process)))
 
 (defun kube-logs--run-stream-kubectl ()
   "Start streaming logs through kubectl and render them in json-log-viewer."
@@ -768,20 +889,21 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
     (setq buffer
           (kube-logs--make-viewer-buffer
            (lambda ()
-             (let* ((socket-path (json-log-viewer-worker-socket-path buffer))
+             (let* ((viewer-buffer (current-buffer))
+                    (_ (kube-logs--register-composite-source-config viewer-buffer))
+                    (socket-path (json-log-viewer-worker-socket-path viewer-buffer))
                     (wrapper-command
                      (kube-logs--wrapper-command socket-path command))
                     (process (make-process
                               :name (kube-logs--process-name)
-                              :buffer buffer
+                              :buffer viewer-buffer
                               :command wrapper-command
                               :noquery t
                               :connection-type 'pipe
                               :filter #'kube-logs--wrapper-process-filter)))
                (set-process-sentinel process #'kube-logs--stream-process-sentinel)
                (set-process-query-on-exit-flag process nil)
-               (with-current-buffer buffer
-                 (setq-local kube-logs--process process))
+               (kube-logs--add-buffer-process viewer-buffer process)
                (message "Started kube logs stream for %s" description)))))
     (display-buffer buffer)))
 
@@ -789,9 +911,7 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
   "Handle kube supervisor PROC lifecycle EVENT for VIEWER-BUFFER."
   (when (memq (process-status proc) '(exit signal))
     (when (buffer-live-p viewer-buffer)
-      (with-current-buffer viewer-buffer
-        (when (eq kube-logs--process proc)
-          (setq kube-logs--process nil))))
+      (kube-logs--remove-buffer-process viewer-buffer proc))
     (when (not (zerop (process-exit-status proc)))
       (message "kube log supervisor exited (%s): %s"
                (process-exit-status proc)
@@ -805,7 +925,9 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
      buffer
      (kube-logs--make-viewer-buffer
       (lambda ()
-        (let* ((socket-path (json-log-viewer-worker-socket-path buffer))
+        (let* ((viewer-buffer (current-buffer))
+               (_ (kube-logs--register-composite-source-config viewer-buffer))
+               (socket-path (json-log-viewer-worker-socket-path viewer-buffer))
                (command (kube-logs--supervisor-command socket-path))
                (log-buffer (kube-logs--make-process-log-buffer))
                (process
@@ -817,13 +939,13 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
                  :connection-type 'pipe
                  :filter
                  (lambda (proc output)
-                   (kube-logs--supervisor-process-filter buffer proc output))
+                   (kube-logs--supervisor-process-filter viewer-buffer proc output))
                  :sentinel
                  (lambda (proc event)
-                   (kube-logs--supervisor-sentinel buffer proc event)))))
+                   (kube-logs--supervisor-sentinel viewer-buffer proc event)))))
           (set-process-query-on-exit-flag process nil)
-          (with-current-buffer buffer
-            (setq-local kube-logs--process process)
+          (kube-logs--add-buffer-process viewer-buffer process)
+          (with-current-buffer viewer-buffer
             (setq-local kube-logs--process-log-buffer log-buffer))
           (if log-buffer
               (message "Started kube log supervisor for %s; debug buffer %s"
@@ -934,6 +1056,20 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
   (interactive)
   (setq kube-logs-debug-process-buffer (not kube-logs-debug-process-buffer))
   (kube-logs--transient-reprompt))
+
+(transient-define-suffix kube-logs-select-viewer-buffer ()
+  "Select an existing json-log-viewer buffer for Kubernetes ingestion."
+  :description (lambda ()
+                 (format "Viewer buffer: %s"
+                         (or kube-logs-viewer-buffer "new")))
+  :transient t
+  (interactive)
+  (let* ((choices (json-log-viewer-buffer-names))
+         (input (completing-read "Viewer buffer (empty=new): "
+                                 choices nil nil nil nil kube-logs-viewer-buffer)))
+    (setq kube-logs-viewer-buffer
+          (unless (string-empty-p input) input))
+    (kube-logs--transient-reprompt)))
 
 (transient-define-suffix kube-logs-select-context ()
   "Set Kubernetes context."
@@ -1207,7 +1343,8 @@ This stores one active target; choosing pod/deployment replaces the other."
     ("-F" "Filter" kube-logs-infix-filter)
     ("-f" kube-logs-toggle-follow)
     ("-b" kube-logs-toggle-stream-backend)
-    ("-D" kube-logs-toggle-debug-process-buffer)]
+    ("-D" kube-logs-toggle-debug-process-buffer)
+    ("-B" kube-logs-select-viewer-buffer)]
    ["Target"
     ("c" kube-logs-select-context)
     ("n" kube-logs-set-namespace)

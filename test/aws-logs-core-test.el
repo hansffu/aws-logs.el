@@ -58,7 +58,57 @@
     (should (= (length normalized) 1))
     (should (equal (alist-get 'message parsed) "hello"))
     (should (equal (alist-get 'level parsed) "info"))
+    (should (equal (alist-get 'source parsed) "aws"))
     (should-not (cdr second))))
+
+(ert-deftest aws-logs-tail-ecs-normalize-plain-line-adds-source-test ()
+  (let* ((result (aws-logs--tail-ecs-normalize-lines-with-pending
+                  '("plain message")
+                  nil))
+         (parsed (json-parse-string (caar result) :object-type 'alist)))
+    (should (equal (alist-get 'source parsed) "aws"))
+    (should (equal (alist-get 'message parsed) "plain message"))))
+
+(ert-deftest aws-logs-tail-make-ecs-buffer-uses-selected-viewer-test ()
+  (let* ((viewer (generate-new-buffer "*aws-logs-shared-viewer-test*"))
+         (aws-logs-viewer-buffer (buffer-name viewer))
+         ready-buffer)
+    (unwind-protect
+        (progn
+          (with-current-buffer viewer
+            (json-log-viewer-mode))
+          (cl-letf (((symbol-function 'json-log-viewer-make-buffer)
+                     (lambda (&rest _args)
+                       (error "should not create a dedicated viewer")))
+                    ((symbol-function 'json-log-viewer-run-when-ready)
+                     (lambda (buffer function)
+                       (setq ready-buffer buffer)
+                       (with-current-buffer buffer
+                         (funcall function)))))
+            (let ((buffer (aws-logs--tail-make-ecs-buffer
+                           (lambda ()
+                             (setq-local aws-logs--tail-process 'ready)))))
+              (should (eq buffer viewer))
+              (should (eq ready-buffer viewer))
+              (with-current-buffer viewer
+                (should (eq aws-logs--tail-process 'ready))))))
+      (when (buffer-live-p viewer)
+        (kill-buffer viewer)))))
+
+(ert-deftest json-log-viewer-json-summary-renders-source-before-timestamp-test ()
+  (with-temp-buffer
+    (json-log-viewer-mode)
+    (setq-local json-log-viewer--timestamp-path "timestamp")
+    (setq-local json-log-viewer--level-path "level")
+    (setq-local json-log-viewer--message-path "message")
+    (let* ((entry (json-log-viewer--json-line->entry-with-config
+                   "{\"source\":\"aws\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"level\":\"info\",\"message\":\"ok\"}"
+                   1
+                   "timestamp"))
+           (summary (json-log-viewer--json-summary entry nil)))
+      (should (string-prefix-p "[aws] 2026-01-01T00:00:00Z" summary))
+      (should (eq (get-text-property 0 'face summary)
+                  'json-log-viewer-source-aws-face)))))
 
 (ert-deftest json-log-viewer-normalize-direction-test ()
   (should (eq (json-log-viewer--normalize-direction 'newest-first) 'newest-first))
@@ -795,6 +845,33 @@
                             (json-log-viewer--header-line-string)))
     (should-not (string-match-p "1455 /"
                                 (json-log-viewer--header-line-string)))))
+
+(ert-deftest composite-log-viewer-summary-uses-source-specific-paths-test ()
+  (with-temp-buffer
+    (composite-log-viewer-mode)
+    (setq-local json-log-viewer--source-configs (make-hash-table :test 'equal))
+    (puthash "aws"
+             (json-log-viewer--render-config-plist
+              "@timestamp" "log.level" "message" '("service.name") nil)
+             json-log-viewer--source-configs)
+    (puthash "kube"
+             (json-log-viewer--render-config-plist
+              "timestamp" "payload.level" "payload.message" '("namespace") nil)
+             json-log-viewer--source-configs)
+    (let* ((aws-entry
+            (json-log-viewer--json-line->entry-with-config
+             "{\"source\":\"aws\",\"@timestamp\":\"2026-01-01T00:00:00Z\",\"log\":{\"level\":\"warn\"},\"message\":\"aws msg\",\"service\":{\"name\":\"billing\"}}"
+             0 nil))
+           (kube-entry
+            (json-log-viewer--json-line->entry-with-config
+             "{\"source\":\"kube\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"payload\":{\"level\":\"info\",\"message\":\"kube msg\"},\"namespace\":\"payments\"}"
+             1 nil))
+           (aws-summary (substring-no-properties
+                         (json-log-viewer--json-summary aws-entry nil)))
+           (kube-summary (substring-no-properties
+                          (json-log-viewer--json-summary kube-entry nil))))
+      (should (string-match-p "\\[aws\\].*WARN.*\\[billing\\].*aws msg" aws-summary))
+      (should (string-match-p "\\[kube\\].*INFO.*\\[payments\\].*kube msg" kube-summary)))))
 
 (provide 'aws-logs-core-test)
 ;;; aws-logs-core-test.el ends here

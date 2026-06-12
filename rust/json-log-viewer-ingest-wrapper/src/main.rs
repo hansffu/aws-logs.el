@@ -243,6 +243,7 @@ fn normalize_kube_line(line: &str, namespace: &str, target: &str, kind: &str) ->
             Value::String(timestamp.to_string()),
         );
     }
+    obj.insert("source".to_string(), Value::String("kube".to_string()));
     obj.insert("raw".to_string(), Value::String(without_prefix));
     obj.insert(
         "namespace".to_string(),
@@ -331,6 +332,7 @@ fn normalize_kafka_line(
     if let Some(level) = level {
         obj.insert("level".to_string(), Value::String(level));
     }
+    obj.insert("source".to_string(), Value::String("kafka".to_string()));
     obj.insert("raw".to_string(), Value::String(clean.to_string()));
     obj.insert(
         "connection".to_string(),

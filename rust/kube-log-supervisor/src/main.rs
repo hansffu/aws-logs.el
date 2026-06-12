@@ -357,6 +357,7 @@ fn normalize_kube_line(
             Value::String(timestamp.to_string()),
         );
     }
+    obj.insert("source".to_string(), Value::String("kube".to_string()));
     obj.insert("raw".to_string(), Value::String(clean.to_string()));
     obj.insert(
         "namespace".to_string(),

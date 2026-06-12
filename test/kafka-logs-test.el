@@ -108,6 +108,7 @@
            (json-line (kafka-logs--line->json-line line))
            (parsed (json-parse-string json-line :object-type 'alist)))
       (should (equal (alist-get 'connection parsed) "prod"))
+      (should (equal (alist-get 'source parsed) "kafka"))
       (should (equal (alist-get 'topic parsed) "orders"))
       (should (equal (alist-get 'partition parsed) 2))
       (should (equal (alist-get 'offset parsed) 9))
@@ -395,6 +396,47 @@
                              '("payload" "payload.log")))))
         (when (buffer-live-p viewer-buffer)
           (kill-buffer viewer-buffer))))))
+
+(ert-deftest kafka-logs-make-viewer-buffer-uses-selected-viewer-test ()
+  (let* ((viewer (generate-new-buffer "*kafka-logs-shared-viewer-test*"))
+         (kafka-logs-viewer-buffer (buffer-name viewer))
+         (kafka-logs-connection "prod")
+         (kafka-logs-topic "orders")
+         (kafka-logs-stream t)
+         (kafka-logs-time-range nil)
+         (kafka-logs-filter nil)
+         (kafka-logs-payload-format 'json)
+         (kafka-logs-value-format 'json)
+         (kafka-logs--detected-value-format nil)
+         (kafka-logs-json-paths '("payload"))
+         (kafka-logs-extra-paths '("topic"))
+         (kafka-logs-message-path "payload.message")
+         ready-buffer)
+    (unwind-protect
+        (progn
+          (with-current-buffer viewer
+            (json-log-viewer-mode))
+          (cl-letf (((symbol-function 'json-log-viewer-make-buffer)
+                     (lambda (&rest _args)
+                       (error "should not create a dedicated viewer")))
+                    ((symbol-function 'json-log-viewer-run-when-ready)
+                     (lambda (buffer function)
+                       (setq ready-buffer buffer)
+                       (with-current-buffer buffer
+                         (funcall function)))))
+            (let ((buffer (kafka-logs--make-viewer-buffer
+                           (lambda ()
+                             (setq-local kafka-logs--process 'ready)))))
+              (should (eq buffer viewer))
+              (should (eq ready-buffer viewer))
+              (with-current-buffer viewer
+                (should (eq kafka-logs--process 'ready))
+                (should (equal kafka-logs--viewer-connection "prod"))
+                (should (equal kafka-logs--viewer-topic "orders"))
+                (should (equal kafka-logs--viewer-message-path
+                               "payload.message"))))))
+      (when (buffer-live-p viewer)
+        (kill-buffer viewer)))))
 
 (ert-deftest kafka-logs-stream-drain-batches-output-test ()
   (let ((kafka-logs-stream-max-lines-per-batch 2)

@@ -208,6 +208,11 @@ or nil when disabled.")
 (defvar aws-logs-filter aws-logs-default-filter
   "Regex filter for tail output in this Emacs session, or nil.")
 
+(defvar aws-logs-viewer-buffer nil
+  "Selected json-log-viewer buffer for AWS tail ingestion, or nil.
+
+When nil, AWS tail creates its normal dedicated viewer buffer.")
+
 (defvar aws-logs-time-range aws-logs-default-since
   "Selected time range (e.g. 10m) for this Emacs session.
 Used as --since for `aws logs tail`.")
@@ -238,6 +243,7 @@ a property list as accepted by `aws-logs-make-preset`.")
 (declare-function aws-logs-insights-query-mode "aws-logs-query")
 (declare-function aws-logs-insights-query-fontify-string "aws-logs-query" (query))
 (declare-function aws-logs-tail-run "aws-logs-tail" ())
+(declare-function json-log-viewer-buffer-names "json-log-viewer" ())
 (declare-function org-read-date "org"
                   (&optional with-time to-time from-string prompt default-time default-input))
 
@@ -591,6 +597,20 @@ Also persists the toggle by updating `aws-logs-default-ecs`."
               (error-message-string err))))
   (aws-logs--transient-reprompt))
 
+(transient-define-suffix aws-logs-select-viewer-buffer ()
+  "Select an existing json-log-viewer buffer for AWS tail ingestion."
+  :description (lambda ()
+                 (format "Viewer buffer: %s"
+                         (or aws-logs-viewer-buffer "new")))
+  :transient t
+  (interactive)
+  (let* ((choices (json-log-viewer-buffer-names))
+         (input (completing-read "Viewer buffer (empty=new): "
+                                 choices nil nil nil nil aws-logs-viewer-buffer)))
+    (setq aws-logs-viewer-buffer
+          (unless (string-empty-p input) input))
+    (aws-logs--transient-reprompt)))
+
 (transient-define-infix aws-logs-infix-profile ()
   :description "Profile"
   :class 'transient-option
@@ -867,6 +887,7 @@ Use the Tail action to stream logs with current selections."
     ("-t" "Time Range" aws-logs-infix-custom-time-range)
     ("-f" aws-logs-toggle-follow)
     ("-e" aws-logs-toggle-ecs)
+    ("-B" aws-logs-select-viewer-buffer)
     ("-p" "Profile" aws-logs-infix-profile)]
 
    [4 :description (lambda () (format "Query: %s" (aws-logs--query)))

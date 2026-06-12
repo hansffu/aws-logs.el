@@ -2,7 +2,7 @@ use chrono::{DateTime, NaiveDateTime};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -27,6 +27,7 @@ struct ViewerConfig {
 #[derive(Clone, Debug, Default)]
 struct RuntimeConfig {
     viewer: ViewerConfig,
+    source_configs: HashMap<String, ViewerConfig>,
     max_entries: Option<usize>,
     chunk_size: usize,
     rebuild_chunk_size: usize,
@@ -47,6 +48,15 @@ enum Command {
         #[serde(rename = "auto-delete-worker-files", default = "default_true")]
         auto_delete_worker_files: bool,
         config: ViewerConfig,
+        #[serde(rename = "source-configs", default)]
+        source_configs: HashMap<String, ViewerConfig>,
+    },
+    #[serde(rename = "configure-source")]
+    ConfigureSource {
+        source: String,
+        config: ViewerConfig,
+        #[serde(rename = "request-id")]
+        request_id: Option<i64>,
     },
     Reset {
         #[serde(rename = "request-id")]
@@ -113,6 +123,7 @@ struct Entry {
     id: i64,
     #[serde(rename = "sort-key")]
     sort_key: f64,
+    source: Option<String>,
     timestamp: String,
     level: String,
     message: String,
@@ -214,13 +225,20 @@ impl Store {
             None
         };
         let viewer_config = self.config.viewer.clone();
+        let source_configs = self.config.source_configs.clone();
         let publish_live = self.publish_mode == PublishMode::Live;
         let tx = self.db.transaction()?;
         let mut entries = Vec::new();
         let mut inserted_count = 0;
         for line in lines {
             if let Some(entry) =
-                insert_log_entry(&tx, line, &viewer_config, active_narrow.as_deref())?
+                insert_log_entry(
+                    &tx,
+                    line,
+                    &viewer_config,
+                    &source_configs,
+                    active_narrow.as_deref(),
+                )?
             {
                 entries.push(entry);
             }
@@ -360,17 +378,24 @@ impl Store {
     }
 
     fn entry_details(&self, entry_id: i64, request_id: Option<i64>) -> rusqlite::Result<()> {
-        let json_text: Option<String> = self
+        let row: Option<(String, Option<String>)> = self
             .db
             .query_row(
-                "SELECT json FROM log_entry WHERE id = ?",
+                "SELECT json, source FROM log_entry WHERE id = ?",
                 params![entry_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let fields = json_text
-            .as_deref()
-            .map(|text| entry_fields(text, &self.config.viewer))
+        let fields = row
+            .as_ref()
+            .map(|(text, source)| {
+                let config = config_for_source(
+                    &self.config.viewer,
+                    &self.config.source_configs,
+                    source.as_deref(),
+                );
+                entry_fields(text, config)
+            })
             .unwrap_or_default();
         self.output.send(json!({
             "cmd": "expand-details",
@@ -392,6 +417,7 @@ fn setup_db(db: &Connection) -> rusqlite::Result<()> {
            id INTEGER PRIMARY KEY AUTOINCREMENT,
            timestamp_epoch REAL,
            timestamp TEXT,
+           source TEXT,
            level_path TEXT,
            message_path TEXT,
            extra_paths TEXT,
@@ -477,6 +503,14 @@ fn handle_process_command(store: &mut Store, command: Command) -> bool {
         }
         Command::Reset { request_id } => {
             store.reset();
+            store.output.complete(request_id);
+        }
+        Command::ConfigureSource {
+            source,
+            config,
+            request_id,
+        } => {
+            store.config.source_configs.insert(source, config);
             store.output.complete(request_id);
         }
         Command::Narrow { needle, request_id } => {
@@ -724,6 +758,7 @@ fn main() {
         rebuild_chunk_size,
         auto_delete_worker_files,
         config,
+        source_configs,
     } = first_command
     else {
         output.error("first worker command must be start");
@@ -732,6 +767,7 @@ fn main() {
 
     let runtime_config = RuntimeConfig {
         viewer: config.clone(),
+        source_configs,
         max_entries,
         chunk_size: chunk_size.unwrap_or(100).max(1),
         rebuild_chunk_size: rebuild_chunk_size.or(chunk_size).unwrap_or(500).max(1),
@@ -804,12 +840,15 @@ fn normalize_needle(needle: Option<&str>) -> Option<String> {
 fn insert_log_entry(
     db: &Connection,
     line: &str,
-    config: &ViewerConfig,
+    default_config: &ViewerConfig,
+    source_configs: &HashMap<String, ViewerConfig>,
     narrow: Option<&str>,
 ) -> rusqlite::Result<Option<Entry>> {
     let parsed = serde_json::from_str::<Value>(line).ok();
     let normalized = normalize_storage_json(line, parsed.as_ref());
     let json_text = serde_json::to_string(&normalized).unwrap_or_else(|_| line.to_string());
+    let source = resolve_path(parsed.as_ref(), Some("source"));
+    let config = config_for_source(default_config, source_configs, source.as_deref());
     let timestamp = resolve_path(parsed.as_ref(), config.timestamp_path.as_deref())
         .unwrap_or_else(|| "-".to_string());
     let timestamp_epoch = parse_time(&timestamp);
@@ -824,15 +863,16 @@ fn insert_log_entry(
         .collect::<Vec<_>>();
     let extra_csv = extra_fields.join(",");
     db.execute(
-        "INSERT INTO log_entry(timestamp_epoch, timestamp, level_path, message_path, extra_paths, json)
-         VALUES (?, ?, ?, ?, ?, ?)",
-        params![timestamp_epoch, timestamp, level, message, extra_csv, json_text],
+        "INSERT INTO log_entry(timestamp_epoch, timestamp, source, level_path, message_path, extra_paths, json)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        params![timestamp_epoch, timestamp, source, level, message, extra_csv, json_text],
     )?;
     let id = db.last_insert_rowid();
     if narrow_matches(&normalized, narrow) {
         Ok(Some(Entry {
             id,
             sort_key: timestamp_epoch.unwrap_or(1_000_000_000_000.0 + id as f64),
+            source,
             timestamp,
             level,
             message,
@@ -841,6 +881,16 @@ fn insert_log_entry(
     } else {
         Ok(None)
     }
+}
+
+fn config_for_source<'a>(
+    default_config: &'a ViewerConfig,
+    source_configs: &'a HashMap<String, ViewerConfig>,
+    source: Option<&str>,
+) -> &'a ViewerConfig {
+    source
+        .and_then(|source| source_configs.get(source))
+        .unwrap_or(default_config)
 }
 
 fn normalize_storage_json(line: &str, parsed: Option<&Value>) -> Value {
@@ -868,9 +918,9 @@ fn select_rerender_entries(
 ) -> rusqlite::Result<Vec<Entry>> {
     if let Some(limit) = max_entries {
         let sql = if narrow.is_some() {
-            "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths
+            "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
              FROM (
-               SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths
+               SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
                FROM log_entry
                WHERE instr(lower(json), ?) > 0
                ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 0 ELSE 1 END,
@@ -878,9 +928,9 @@ fn select_rerender_entries(
              )
              ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, timestamp_epoch, id"
         } else {
-            "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths
+            "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
              FROM (
-               SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths
+               SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
                FROM log_entry
                ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 0 ELSE 1 END,
                         timestamp_epoch DESC, id DESC LIMIT ?
@@ -900,12 +950,12 @@ fn select_rerender_entries(
         }
     } else {
         let sql = if narrow.is_some() {
-            "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths
+            "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
              FROM log_entry
              WHERE instr(lower(json), ?) > 0
              ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, timestamp_epoch, id"
         } else {
-            "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths
+            "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
              FROM log_entry
              ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, timestamp_epoch, id"
         };
@@ -925,13 +975,13 @@ fn select_entries_before(
     boundary_id: Option<i64>,
 ) -> rusqlite::Result<Vec<Entry>> {
     let sql = if narrow.is_some() {
-        "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths
+        "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
          FROM log_entry
          WHERE instr(lower(json), ?) > 0
            AND (timestamp_epoch < ? OR (timestamp_epoch = ? AND id < ?))
          ORDER BY timestamp_epoch DESC, id DESC LIMIT ?"
     } else {
-        "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths
+        "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
          FROM log_entry
          WHERE timestamp_epoch < ? OR (timestamp_epoch = ? AND id < ?)
          ORDER BY timestamp_epoch DESC, id DESC LIMIT ?"
@@ -970,13 +1020,13 @@ fn select_entries_after(
     boundary_id: Option<i64>,
 ) -> rusqlite::Result<Vec<Entry>> {
     let sql = if narrow.is_some() {
-        "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths
+        "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
          FROM log_entry
          WHERE instr(lower(json), ?) > 0
            AND (timestamp_epoch > ? OR (timestamp_epoch = ? AND id > ?))
          ORDER BY timestamp_epoch ASC, id ASC LIMIT ?"
     } else {
-        "SELECT id, timestamp_epoch, timestamp, level_path, message_path, extra_paths
+        "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
          FROM log_entry
          WHERE timestamp_epoch > ? OR (timestamp_epoch = ? AND id > ?)
          ORDER BY timestamp_epoch ASC, id ASC LIMIT ?"
@@ -1004,12 +1054,14 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
     let id: i64 = row.get(0)?;
     let sort_key: Option<f64> = row.get(1)?;
     let timestamp: Option<String> = row.get(2)?;
-    let level: Option<String> = row.get(3)?;
-    let message: Option<String> = row.get(4)?;
-    let extras: Option<String> = row.get(5)?;
+    let source: Option<String> = row.get(3)?;
+    let level: Option<String> = row.get(4)?;
+    let message: Option<String> = row.get(5)?;
+    let extras: Option<String> = row.get(6)?;
     Ok(Entry {
         id,
         sort_key: sort_key.unwrap_or(1_000_000_000_000.0 + id as f64),
+        source,
         timestamp: timestamp.unwrap_or_else(|| "-".to_string()),
         level: level.unwrap_or_else(|| "-".to_string()),
         message: message.unwrap_or_else(|| "-".to_string()),
