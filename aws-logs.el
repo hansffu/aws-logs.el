@@ -22,6 +22,7 @@
 (require 'transient)
 (require 'json)
 
+(require 'composite-log-viewer)
 (require 'aws-logs-query)
 (require 'aws-logs-insights)
 (require 'aws-logs-tail)
@@ -243,7 +244,8 @@ a property list as accepted by `aws-logs-make-preset`.")
 (declare-function aws-logs-insights-query-mode "aws-logs-query")
 (declare-function aws-logs-insights-query-fontify-string "aws-logs-query" (query))
 (declare-function aws-logs-tail-run "aws-logs-tail" ())
-(declare-function json-log-viewer-buffer-names "json-log-viewer" ())
+(declare-function json-log-viewer-composite-buffer-p "composite-log-viewer"
+                  (&optional buffer-or-name))
 (declare-function org-read-date "org"
                   (&optional with-time to-time from-string prompt default-time default-input))
 
@@ -597,20 +599,6 @@ Also persists the toggle by updating `aws-logs-default-ecs`."
               (error-message-string err))))
   (aws-logs--transient-reprompt))
 
-(transient-define-suffix aws-logs-select-viewer-buffer ()
-  "Select an existing json-log-viewer buffer for AWS tail ingestion."
-  :description (lambda ()
-                 (format "Viewer buffer: %s"
-                         (or aws-logs-viewer-buffer "new")))
-  :transient t
-  (interactive)
-  (let* ((choices (json-log-viewer-buffer-names))
-         (input (completing-read "Viewer buffer (empty=new): "
-                                 choices nil nil nil nil aws-logs-viewer-buffer)))
-    (setq aws-logs-viewer-buffer
-          (unless (string-empty-p input) input))
-    (aws-logs--transient-reprompt)))
-
 (transient-define-infix aws-logs-infix-profile ()
   :description "Profile"
   :class 'transient-option
@@ -872,6 +860,11 @@ Returns a cons cell (FROM . TO), where both values are ISO-like strings."
 
 (defvar aws-logs--transient-history nil)
 
+(defun aws-logs--set-viewer-buffer-from-current-buffer ()
+  "Use current composite log viewer as selected viewer, or clear selection."
+  (setq aws-logs-viewer-buffer
+        (when (json-log-viewer-composite-buffer-p (current-buffer))
+          (buffer-name (current-buffer)))))
 
 ;; Main transient prefix
 (transient-define-prefix aws-logs-transient ()
@@ -887,7 +880,6 @@ Use the Tail action to stream logs with current selections."
     ("-t" "Time Range" aws-logs-infix-custom-time-range)
     ("-f" aws-logs-toggle-follow)
     ("-e" aws-logs-toggle-ecs)
-    ("-B" aws-logs-select-viewer-buffer)
     ("-p" "Profile" aws-logs-infix-profile)]
 
    [4 :description (lambda () (format "Query: %s" (aws-logs--query)))
@@ -900,6 +892,7 @@ Use the Tail action to stream logs with current selections."
     ("t" "Tail" aws-logs-tail)
     ("l" "Logs Insights" aws-logs-insights)]]
   (interactive)
+  (aws-logs--set-viewer-buffer-from-current-buffer)
   (transient-setup 'aws-logs-transient))
 
 (defun aws-logs ()

@@ -2484,39 +2484,6 @@ New entries are always appended to the bottom."
   (add-hook 'post-command-hook #'json-log-viewer--maybe-disable-auto-follow-after-command nil t)
   (add-hook 'post-command-hook #'json-log-viewer--highlight-current-line t t))
 
-(define-derived-mode composite-log-viewer-mode json-log-viewer-mode "CompositeLogs"
-  "Major mode for a shared JSON log viewer with multiple sources."
-  :group 'json-log-viewer)
-
-(defun json-log-viewer-composite-buffer-p (&optional buffer-or-name)
-  "Return non-nil when BUFFER-OR-NAME is a composite log viewer buffer.
-
-When BUFFER-OR-NAME is nil, inspect the current buffer."
-  (let ((buffer (cond
-                 ((null buffer-or-name) (current-buffer))
-                 ((bufferp buffer-or-name) buffer-or-name)
-                 ((stringp buffer-or-name) (get-buffer buffer-or-name))
-                 (t nil))))
-    (and (buffer-live-p buffer)
-         (with-current-buffer buffer
-           (derived-mode-p 'composite-log-viewer-mode)))))
-
-(defun composite-log-viewer (&optional buffer-name)
-  "Create or reset a composite log viewer buffer.
-
-With prefix argument, prompt for BUFFER-NAME."
-  (interactive
-   (list (when current-prefix-arg
-           (read-string "Composite log viewer buffer: " "*Composite logs*"))))
-  (let ((buffer (json-log-viewer-make-buffer
-                 (or buffer-name "*Composite logs*")
-                 :timestamp-path "timestamp"
-                 :level-path "level"
-                 :message-path "message"
-                 :mode #'composite-log-viewer-mode)))
-    (display-buffer buffer)
-    buffer))
-
 (defun json-log-viewer--maybe-load-evil-bindings ()
   "Conditionally load and initialize optional Evil bindings."
   (when (and json-log-viewer-enable-evil-bindings

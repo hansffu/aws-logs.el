@@ -7,6 +7,7 @@
 (require 'json-log-viewer-async-worker)
 (require 'aws-logs-insights)
 (require 'aws-logs-tail)
+(require 'aws-logs)
 
 (defvar aws-logs-custom-time-range)
 (defvar aws-logs-time-range)
@@ -92,6 +93,22 @@
               (should (eq ready-buffer viewer))
               (with-current-buffer viewer
                 (should (eq aws-logs--tail-process 'ready))))))
+      (when (buffer-live-p viewer)
+        (kill-buffer viewer)))))
+
+(ert-deftest aws-logs-transient-viewer-buffer-follows-current-composite-test ()
+  (let ((viewer (generate-new-buffer "*aws-logs-composite-current-test*"))
+        (aws-logs-viewer-buffer "stale"))
+    (unwind-protect
+        (progn
+          (with-current-buffer viewer
+            (composite-log-viewer-mode)
+            (aws-logs--set-viewer-buffer-from-current-buffer))
+          (should (equal aws-logs-viewer-buffer (buffer-name viewer)))
+          (with-temp-buffer
+            (json-log-viewer-mode)
+            (aws-logs--set-viewer-buffer-from-current-buffer))
+          (should-not aws-logs-viewer-buffer))
       (when (buffer-live-p viewer)
         (kill-buffer viewer)))))
 

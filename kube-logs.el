@@ -15,6 +15,7 @@
 (require 'subr-x)
 (require 'transient)
 
+(require 'composite-log-viewer)
 (require 'json-log-viewer)
 
 (declare-function json-log-viewer-ingest-wrapper-executable "json-log-viewer" ())
@@ -23,8 +24,7 @@
                   (&optional buffer-or-name))
 (declare-function json-log-viewer-run-when-ready "json-log-viewer"
                   (buffer-or-name function))
-(declare-function json-log-viewer-buffer-names "json-log-viewer" ())
-(declare-function json-log-viewer-composite-buffer-p "json-log-viewer"
+(declare-function json-log-viewer-composite-buffer-p "composite-log-viewer"
                   (&optional buffer-or-name))
 (declare-function json-log-viewer-replace-log-lines "json-log-viewer"
                   (buffer-or-name log-lines &optional preserve-filter))
@@ -1057,20 +1057,6 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
   (setq kube-logs-debug-process-buffer (not kube-logs-debug-process-buffer))
   (kube-logs--transient-reprompt))
 
-(transient-define-suffix kube-logs-select-viewer-buffer ()
-  "Select an existing json-log-viewer buffer for Kubernetes ingestion."
-  :description (lambda ()
-                 (format "Viewer buffer: %s"
-                         (or kube-logs-viewer-buffer "new")))
-  :transient t
-  (interactive)
-  (let* ((choices (json-log-viewer-buffer-names))
-         (input (completing-read "Viewer buffer (empty=new): "
-                                 choices nil nil nil nil kube-logs-viewer-buffer)))
-    (setq kube-logs-viewer-buffer
-          (unless (string-empty-p input) input))
-    (kube-logs--transient-reprompt)))
-
 (transient-define-suffix kube-logs-select-context ()
   "Set Kubernetes context."
   :description (lambda ()
@@ -1333,6 +1319,12 @@ This stores one active target; choosing pod/deployment replaces the other."
       (setq kube-logs-filter
             (unless (or (null filter) (string-empty-p filter)) filter)))))
 
+(defun kube-logs--set-viewer-buffer-from-current-buffer ()
+  "Use current composite log viewer as selected viewer, or clear selection."
+  (setq kube-logs-viewer-buffer
+        (when (json-log-viewer-composite-buffer-p (current-buffer))
+          (buffer-name (current-buffer)))))
+
 (transient-define-prefix kube-logs-transient ()
   "Transient menu for selecting and running Kubernetes logs."
   :remember-value 'exit
@@ -1343,8 +1335,7 @@ This stores one active target; choosing pod/deployment replaces the other."
     ("-F" "Filter" kube-logs-infix-filter)
     ("-f" kube-logs-toggle-follow)
     ("-b" kube-logs-toggle-stream-backend)
-    ("-D" kube-logs-toggle-debug-process-buffer)
-    ("-B" kube-logs-select-viewer-buffer)]
+    ("-D" kube-logs-toggle-debug-process-buffer)]
    ["Target"
     ("c" kube-logs-select-context)
     ("n" kube-logs-set-namespace)
@@ -1355,6 +1346,7 @@ This stores one active target; choosing pod/deployment replaces the other."
     ("RET" "Run logs" kube-logs-action-run)
     ("f" "Formatting…" kube-logs-open-formatting)]]
   (interactive)
+  (kube-logs--set-viewer-buffer-from-current-buffer)
   (transient-setup 'kube-logs-transient))
 
 (defun kube-logs ()

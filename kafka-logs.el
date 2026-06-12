@@ -24,6 +24,7 @@
 (require 'url-parse)
 (require 'url-util)
 
+(require 'composite-log-viewer)
 (require 'json-log-viewer)
 
 (declare-function json-log-viewer-make-buffer "json-log-viewer"
@@ -33,8 +34,7 @@
                   (&optional buffer-or-name))
 (declare-function json-log-viewer-run-when-ready "json-log-viewer"
                   (buffer-or-name function))
-(declare-function json-log-viewer-buffer-names "json-log-viewer" ())
-(declare-function json-log-viewer-composite-buffer-p "json-log-viewer"
+(declare-function json-log-viewer-composite-buffer-p "composite-log-viewer"
                   (&optional buffer-or-name))
 (declare-function json-log-viewer-register-source-config "json-log-viewer"
                   (buffer-or-name source &rest args))
@@ -1477,20 +1477,6 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
   (setq kafka-logs-stream (not kafka-logs-stream))
   (kafka-logs--transient-reprompt))
 
-(transient-define-suffix kafka-logs-select-viewer-buffer ()
-  "Select an existing json-log-viewer buffer for Kafka ingestion."
-  :description (lambda ()
-                 (format "Viewer buffer: %s"
-                         (or kafka-logs-viewer-buffer "new")))
-  :transient t
-  (interactive)
-  (let* ((choices (json-log-viewer-buffer-names))
-         (input (completing-read "Viewer buffer (empty=new): "
-                                 choices nil nil nil nil kafka-logs-viewer-buffer)))
-    (setq kafka-logs-viewer-buffer
-          (unless (string-empty-p input) input))
-    (kafka-logs--transient-reprompt)))
-
 (defun kafka-logs--set-time-range (from to)
   "Set session range to FROM and TO, preserving nil semantics."
   (setq kafka-logs-time-range
@@ -1651,6 +1637,12 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
          (kafka-logs--apply-topic-selection kafka-logs-topic))))
     (kafka-logs--transient-reprompt)))
 
+(defun kafka-logs--set-viewer-buffer-from-current-buffer ()
+  "Use current composite log viewer as selected viewer, or clear selection."
+  (setq kafka-logs-viewer-buffer
+        (when (json-log-viewer-composite-buffer-p (current-buffer))
+          (buffer-name (current-buffer)))))
+
 (transient-define-suffix kafka-logs-action-run ()
   "Run Kafka logs viewer with current selections."
   :transient nil
@@ -1669,7 +1661,6 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
     ("-M" kafka-logs-set-message-path)
     ("-j" kafka-logs-set-json-paths)
     ("-p" kafka-logs-toggle-payload-format)
-    ("-B" kafka-logs-select-viewer-buffer)
     ("-m" kafka-logs-set-max-messages)]
    ["Range (time-span mode)"
     ("a" kafka-logs-set-range-from)
@@ -1681,6 +1672,7 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
   [["Actions"
     ("RET" "Run logs" kafka-logs-action-run)]]
   (interactive)
+  (kafka-logs--set-viewer-buffer-from-current-buffer)
   (transient-setup 'kafka-logs-transient))
 
 (defun kafka-logs ()

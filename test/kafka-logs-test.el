@@ -438,6 +438,22 @@
       (when (buffer-live-p viewer)
         (kill-buffer viewer)))))
 
+(ert-deftest kafka-logs-transient-viewer-buffer-follows-current-composite-test ()
+  (let ((viewer (generate-new-buffer "*kafka-logs-composite-current-test*"))
+        (kafka-logs-viewer-buffer "stale"))
+    (unwind-protect
+        (progn
+          (with-current-buffer viewer
+            (composite-log-viewer-mode)
+            (kafka-logs--set-viewer-buffer-from-current-buffer))
+          (should (equal kafka-logs-viewer-buffer (buffer-name viewer)))
+          (with-temp-buffer
+            (json-log-viewer-mode)
+            (kafka-logs--set-viewer-buffer-from-current-buffer))
+          (should-not kafka-logs-viewer-buffer))
+      (when (buffer-live-p viewer)
+        (kill-buffer viewer)))))
+
 (ert-deftest kafka-logs-stream-drain-batches-output-test ()
   (let ((kafka-logs-stream-max-lines-per-batch 2)
         (captured nil)

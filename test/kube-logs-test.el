@@ -303,6 +303,22 @@
       (when (buffer-live-p viewer)
         (kill-buffer viewer)))))
 
+(ert-deftest kube-logs-transient-viewer-buffer-follows-current-composite-test ()
+  (let ((viewer (generate-new-buffer "*kube-logs-composite-current-test*"))
+        (kube-logs-viewer-buffer "stale"))
+    (unwind-protect
+        (progn
+          (with-current-buffer viewer
+            (composite-log-viewer-mode)
+            (kube-logs--set-viewer-buffer-from-current-buffer))
+          (should (equal kube-logs-viewer-buffer (buffer-name viewer)))
+          (with-temp-buffer
+            (json-log-viewer-mode)
+            (kube-logs--set-viewer-buffer-from-current-buffer))
+          (should-not kube-logs-viewer-buffer))
+      (when (buffer-live-p viewer)
+        (kill-buffer viewer)))))
+
 (ert-deftest kube-logs-make-viewer-buffer-replaces-selected-non-composite-test ()
   (let* ((viewer (generate-new-buffer "*kube-logs-replace-viewer-test*"))
          (kube-logs-viewer-buffer (buffer-name viewer))

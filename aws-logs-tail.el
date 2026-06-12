@@ -13,6 +13,7 @@
 (require 'cl-lib)
 (require 'comint)
 (require 'json)
+(require 'composite-log-viewer)
 (require 'json-log-viewer)
 (require 'subr-x)
 
@@ -41,7 +42,7 @@
 (declare-function aws-logs--list-log-groups "aws-logs" ())
 (declare-function json-log-viewer-run-when-ready "json-log-viewer"
                   (buffer-or-name function))
-(declare-function json-log-viewer-composite-buffer-p "json-log-viewer"
+(declare-function json-log-viewer-composite-buffer-p "composite-log-viewer"
                   (&optional buffer-or-name))
 (declare-function json-log-viewer-register-source-config "json-log-viewer"
                   (buffer-or-name source &rest args))
