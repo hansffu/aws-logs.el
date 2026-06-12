@@ -112,7 +112,7 @@
       (when (buffer-live-p viewer)
         (kill-buffer viewer)))))
 
-(ert-deftest json-log-viewer-json-summary-renders-source-before-timestamp-test ()
+(ert-deftest json-log-viewer-json-summary-hides-source-outside-composite-test ()
   (with-temp-buffer
     (json-log-viewer-mode)
     (setq-local json-log-viewer--timestamp-path "timestamp")
@@ -123,9 +123,10 @@
                    1
                    "timestamp"))
            (summary (json-log-viewer--json-summary entry nil)))
-      (should (string-prefix-p "[aws] 2026-01-01T00:00:00Z" summary))
+      (should (string-prefix-p "2026-01-01T00:00:00Z" summary))
+      (should-not (string-match-p "aws" (substring-no-properties summary)))
       (should (eq (get-text-property 0 'face summary)
-                  'json-log-viewer-source-aws-face)))))
+                  'json-log-viewer-timestamp-face)))))
 
 (ert-deftest json-log-viewer-normalize-direction-test ()
   (should (eq (json-log-viewer--normalize-direction 'newest-first) 'newest-first))
@@ -875,6 +876,10 @@
              (json-log-viewer--render-config-plist
               "timestamp" "payload.level" "payload.message" '("namespace") nil)
              json-log-viewer--source-configs)
+    (puthash "kafka"
+             (json-log-viewer--render-config-plist
+              "ts" "severity" "payload.message" '("topic") nil)
+             json-log-viewer--source-configs)
     (let* ((aws-entry
             (json-log-viewer--json-line->entry-with-config
              "{\"source\":\"aws\",\"@timestamp\":\"2026-01-01T00:00:00Z\",\"log\":{\"level\":\"warn\"},\"message\":\"aws msg\",\"service\":{\"name\":\"billing\"}}"
@@ -883,12 +888,29 @@
             (json-log-viewer--json-line->entry-with-config
              "{\"source\":\"kube\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"payload\":{\"level\":\"info\",\"message\":\"kube msg\"},\"namespace\":\"payments\"}"
              1 nil))
+           (kafka-entry
+            (json-log-viewer--json-line->entry-with-config
+             "{\"source\":\"kafka\",\"ts\":\"2026-01-01T00:00:02Z\",\"severity\":\"debug\",\"payload\":{\"message\":\"kafka msg\"},\"topic\":\"orders\"}"
+             2 nil))
+           (kube-propertized-summary (json-log-viewer--json-summary kube-entry nil))
            (aws-summary (substring-no-properties
                          (json-log-viewer--json-summary aws-entry nil)))
            (kube-summary (substring-no-properties
-                          (json-log-viewer--json-summary kube-entry nil))))
-      (should (string-match-p "\\[aws\\].*WARN.*\\[billing\\].*aws msg" aws-summary))
-      (should (string-match-p "\\[kube\\].*INFO.*\\[payments\\].*kube msg" kube-summary)))))
+                          kube-propertized-summary))
+           (kafka-summary (substring-no-properties
+                           (json-log-viewer--json-summary kafka-entry nil))))
+      (should (string-match-p "\\`  aws  .*WARN.*\\[billing\\].*aws msg" aws-summary))
+      (should (string-match-p "\\` kube  .*INFO.*\\[payments\\].*kube msg" kube-summary))
+      (should (string-match-p "\\` kafka .*DEBUG.*\\[orders\\].*kafka msg" kafka-summary))
+      (should (= (string-match-p "2026-01-01T00:00:01Z" kube-summary)
+                 (string-match-p "2026-01-01T00:00:02Z" kafka-summary)))
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert kube-propertized-summary))
+      (should (= (json-log-viewer--skip-source-prefix (point-min) (point-max))
+                 (1+ (string-match-p "2026-01-01T00:00:01Z" kube-summary))))
+      (should (eq (get-text-property 0 'face kube-propertized-summary)
+                  'json-log-viewer-source-kube-face)))))
 
 (provide 'aws-logs-core-test)
 ;;; aws-logs-core-test.el ends here

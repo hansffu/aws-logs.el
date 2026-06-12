@@ -47,22 +47,36 @@
   :group 'json-log-viewer)
 
 (defface json-log-viewer-source-face
-  '((t :inherit font-lock-constant-face :weight bold))
+  '((t :inherit default
+       :height 1.0
+       :width condensed
+       :weight regular
+       :underline nil
+       :box (:line-width (-1 . -2))))
   "Default face for source segments in summary lines."
   :group 'json-log-viewer)
 
 (defface json-log-viewer-source-aws-face
-  '((t :inherit json-log-viewer-source-face :foreground "DarkOrange2"))
+  '((t :inherit json-log-viewer-source-face
+       :foreground "white"
+       :background "DarkOrange2"
+       :box (:line-width (-1 . -2) :color "DarkOrange2")))
   "Face for AWS source segments in summary lines."
   :group 'json-log-viewer)
 
 (defface json-log-viewer-source-kube-face
-  '((t :inherit json-log-viewer-source-face :foreground "DeepSkyBlue3"))
+  '((t :inherit json-log-viewer-source-face
+       :foreground "white"
+       :background "DeepSkyBlue3"
+       :box (:line-width (-1 . -2) :color "DeepSkyBlue3")))
   "Face for Kubernetes source segments in summary lines."
   :group 'json-log-viewer)
 
 (defface json-log-viewer-source-kafka-face
-  '((t :inherit json-log-viewer-source-face :foreground "medium purple"))
+  '((t :inherit json-log-viewer-source-face
+       :foreground "white"
+       :background "medium purple"
+       :box (:line-width (-1 . -2) :color "medium purple")))
   "Face for Kafka source segments in summary lines."
   :group 'json-log-viewer)
 
@@ -164,6 +178,11 @@ visible frame.  Set to nil or 0 to disable periodic live pulls."
     ("kafka" . json-log-viewer-source-kafka-face))
   "Alist mapping log source names to faces for collapsed summary lines."
   :type '(alist :key-type string :value-type face)
+  :group 'json-log-viewer)
+
+(defcustom json-log-viewer-composite-source-tag-width 5
+  "Minimum inner width for source tags in composite summary lines."
+  :type 'integer
   :group 'json-log-viewer)
 
 (cl-defstruct (json-log-viewer--worker
@@ -1262,6 +1281,59 @@ JSON-PATHS is a list of paths to render as JSON blocks instead of flattening."
   (or (cdr (assoc-string (or source "") json-log-viewer-source-faces t))
       'json-log-viewer-source-face))
 
+(defun json-log-viewer--composite-buffer-p ()
+  "Return non-nil when the current buffer is a composite log viewer."
+  (derived-mode-p 'composite-log-viewer-mode))
+
+(defun json-log-viewer--source-tag-label-width (source)
+  "Return shared source label width for SOURCE in the current buffer."
+  (let ((width (max json-log-viewer-composite-source-tag-width
+                    (length (or source "")))))
+    (when (hash-table-p json-log-viewer--source-configs)
+      (maphash (lambda (configured-source _config)
+                 (setq width (max width (length configured-source))))
+               json-log-viewer--source-configs))
+    width))
+
+(defun json-log-viewer--center-string (value width)
+  "Return VALUE centered in a field WIDTH characters wide."
+  (let* ((text (or value ""))
+         (padding (max 0 (- width (length text))))
+         (left (/ padding 2))
+         (right (- padding left)))
+    (concat (make-string left ?\s)
+            text
+            (make-string right ?\s))))
+
+(defun json-log-viewer--source-summary-prefix (source)
+  "Return formatted composite source prefix for SOURCE, or an empty string."
+  (if (and (json-log-viewer--composite-buffer-p)
+           source
+           (not (string-empty-p source)))
+      (let* ((tag (propertize
+                   (concat " "
+                           (json-log-viewer--center-string
+                            source
+                            (json-log-viewer--source-tag-label-width source))
+                           " ")
+                   'face (json-log-viewer--source-face source)))
+             (prefix (concat tag " ")))
+        (add-text-properties
+         0 (length prefix)
+         '(json-log-viewer-source-prefix t rear-nonsticky t)
+         prefix)
+        prefix)
+    ""))
+
+(defun json-log-viewer--skip-source-prefix (position limit)
+  "Return first position after a source prefix at POSITION, bounded by LIMIT."
+  (if (get-text-property position 'json-log-viewer-source-prefix)
+      (min limit
+           (or (next-single-property-change
+                position 'json-log-viewer-source-prefix nil limit)
+               limit))
+    position))
+
 (defun json-log-viewer--source-render-config (source)
   "Return render config plist for SOURCE, or nil."
   (and source
@@ -1395,11 +1467,7 @@ Returns cons cell (ENTRIES . NEXT-ID)."
           (push value extras)))
       (setq extras (nreverse extras)))
     (concat
-     (if (and source (not (string-empty-p source)))
-         (concat (propertize (format "[%s]" source)
-                             'face (json-log-viewer--source-face source))
-                 " ")
-       "")
+     (json-log-viewer--source-summary-prefix source)
      (propertize timestamp 'face 'json-log-viewer-timestamp-face)
      " "
      (propertize (upcase level) 'face (json-log-viewer--level-face level))
@@ -1712,8 +1780,10 @@ When VISIBLE-ONLY is non-nil, return only currently visible entries."
                (highlight-end (if expanded
                                   entry-end
                                 (max entries-start
-                                     (json-log-viewer--entry-summary-end entry-ov)))))
-          (if (<= highlight-end entry-start)
+                                     (json-log-viewer--entry-summary-end entry-ov))))
+               (highlight-start (json-log-viewer--skip-source-prefix
+                                 entry-start highlight-end)))
+          (if (<= highlight-end highlight-start)
               (when json-log-viewer--current-line-overlay
                 (delete-overlay json-log-viewer--current-line-overlay)
                 (setq json-log-viewer--current-line-overlay nil))
@@ -1723,7 +1793,7 @@ When VISIBLE-ONLY is non-nil, return only currently visible entries."
               (overlay-put json-log-viewer--current-line-overlay 'face 'hl-line)
               (overlay-put json-log-viewer--current-line-overlay 'priority 1000))
             (move-overlay json-log-viewer--current-line-overlay
-                          entry-start highlight-end)))))))
+                          highlight-start highlight-end)))))))
 
 (defun json-log-viewer--entry-filter-text (fields)
   "Build searchable text blob from FIELDS."
