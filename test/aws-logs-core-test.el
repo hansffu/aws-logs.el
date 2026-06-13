@@ -995,6 +995,45 @@
       (when (buffer-live-p (get-buffer help-buffer-name))
         (kill-buffer help-buffer-name)))))
 
+(ert-deftest json-log-viewer-narrow-level-completes-from-statistics-test ()
+  (with-temp-buffer
+    (json-log-viewer-mode)
+    (setq-local json-log-viewer--level-counts '(("error" . 2)
+                                                ("info" . 1)))
+    (let (collection require-match initial-input state-description level-description)
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (_prompt coll _predicate req _initial _hist default
+                                  &rest _args)
+                   (setq collection coll)
+                   (setq require-match req)
+                   (setq initial-input default)
+                   "WARN")))
+        (call-interactively #'json-log-viewer-narrow-menu-set-level))
+      (should (equal (mapcar #'substring-no-properties collection)
+                     '("ERROR" "INFO")))
+      (should (eq (get-text-property 0 'face (car collection)) 'error))
+      (should (eq (get-text-property 0 'face (cadr collection))
+                  'json-log-viewer-level-face))
+      (should-not require-match)
+      (should (equal initial-input ""))
+      (should (equal json-log-viewer--filter-level "warn"))
+      (setq state-description
+            (json-log-viewer--narrow-menu-state-description))
+      (setq level-description
+            (json-log-viewer--narrow-menu-level-description))
+      (should (string-match-p "level:WARN" state-description))
+      (should (string-match-p "Level: WARN" level-description))
+      (should (eq (get-text-property
+                   (string-match "WARN" state-description)
+                   'face
+                   state-description)
+                  'warning))
+      (should (eq (get-text-property
+                   (string-match "WARN" level-description)
+                   'face
+                   level-description)
+                  'warning)))))
+
 (ert-deftest json-log-viewer-info-popup-hides-operational-filter-rows-test ()
   (let ((help-buffer-name (help-buffer))
         help-text)

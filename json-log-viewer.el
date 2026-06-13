@@ -2274,6 +2274,26 @@ When LEVEL is non-nil, render KEY as an uppercased log level using
   "Return editable multi-narrow level for the current viewer buffer."
   (json-log-viewer--normalize-narrow-level json-log-viewer--filter-level))
 
+(defun json-log-viewer--narrow-menu-level-display (level)
+  "Return LEVEL uppercased and colorized for transient display."
+  (propertize (upcase level) 'face (json-log-viewer--level-face level)))
+
+(defun json-log-viewer--narrow-menu-level-candidates ()
+  "Return level completion candidates from latest worker statistics."
+  (mapcar (lambda (pair)
+            (let ((level (car pair)))
+              (json-log-viewer--narrow-menu-level-display level)))
+          json-log-viewer--level-counts))
+
+(defun json-log-viewer--narrow-menu-level-description ()
+  "Return transient description for the current level filter."
+  (let ((level (json-log-viewer--narrow-menu-level)))
+    (concat
+     "Level: "
+     (if level
+         (json-log-viewer--narrow-menu-level-display level)
+       "(none)"))))
+
 (defun json-log-viewer--narrow-menu-state-description ()
   "Return transient description for current multi-narrow state."
   (format "Filter: %s"
@@ -2293,7 +2313,10 @@ When LEVEL is non-nil, render KEY as an uppercased log level using
                                    terms
                                    ", ")))
                         (when level
-                          (format "level:%s" level))))
+                          (concat
+                           "level:"
+                           (json-log-viewer--narrow-menu-level-display
+                            level)))))
                  " ")
               "(none)"))))
 
@@ -2339,14 +2362,19 @@ When LEVEL is non-nil, render KEY as an uppercased log level using
 
 (transient-define-suffix json-log-viewer-narrow-menu-set-level ()
   "Set or clear the exact level filter."
-  :description (lambda ()
-                 (format "Level: %s"
-                         (or (json-log-viewer--narrow-menu-level) "(none)")))
+  :description #'json-log-viewer--narrow-menu-level-description
   :transient t
   (interactive)
-  (let ((level (string-trim
-                (read-string "Level filter (empty clears): "
-                             (or (json-log-viewer--narrow-menu-level) "")))))
+  (let* ((initial (or (json-log-viewer--narrow-menu-level) ""))
+         (level (string-trim
+                 (completing-read
+                  "Level filter (empty clears): "
+                  (json-log-viewer--narrow-menu-level-candidates)
+                  nil
+                  nil
+                  nil
+                  nil
+                  (upcase initial)))))
     (setq json-log-viewer--filter-string nil)
     (setq json-log-viewer--filter-level
           (json-log-viewer--normalize-narrow-level level))))
