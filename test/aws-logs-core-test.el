@@ -839,7 +839,9 @@
           (json-log-viewer-show-info)
           (with-current-buffer help-buffer-name
             (setq help-text (buffer-substring-no-properties (point-min) (point-max))))
-          (should (string-match-p "Bindings[[:space:]]+|[[:space:]]+Info" help-text))
+          (should (string-match-p
+                   "Bindings[[:space:]]+|[[:space:]]+Info[[:space:]]+|[[:space:]]+Statistics"
+                   help-text))
           (should (string-match-p "Mode:[[:space:]]+streaming" help-text))
           (should (string-match-p "Log group:[[:space:]]+/aws/demo" help-text))
           (should (string-match-p "Messages:[[:space:]]+1" help-text))
@@ -944,6 +946,82 @@
     (should (= json-log-viewer--total-entry-count 33240))
     (should (string-match-p "Messages: 1455 / 33240"
                             (json-log-viewer--header-line-string)))))
+
+(ert-deftest json-log-viewer-status-level-counts-show-in-info-test ()
+  (let ((help-buffer-name (help-buffer))
+        help-text)
+    (unwind-protect
+        (with-temp-buffer
+          (json-log-viewer-mode)
+          (setq-local json-log-viewer--entry-count 4)
+          (setq-local json-log-viewer--auto-follow nil)
+          (json-log-viewer--async-apply-command
+           '(:cmd "status"
+             :pending-pull-count 0
+             :total-count 4
+             :level-counts ((:level "error" :count 2)
+                            (:level "info" :count 1)
+                            (:level "warn" :count 1))))
+          (json-log-viewer-show-info)
+          (with-current-buffer help-buffer-name
+            (setq help-text (buffer-substring-no-properties (point-min) (point-max))))
+          (should (string-match-p "Statistics" help-text))
+          (should (string-match-p "Messages:[[:space:]]+4" help-text))
+          (should (string-match-p "ERROR:[[:space:]]+2" help-text))
+          (should (string-match-p "INFO:[[:space:]]+1" help-text))
+          (should (string-match-p "WARN:[[:space:]]+1" help-text))
+          (should-not (string-match-p "Levels:" help-text)))
+      (when (buffer-live-p (get-buffer help-buffer-name))
+        (kill-buffer help-buffer-name)))))
+
+(ert-deftest json-log-viewer-status-level-counts-are-colorized-test ()
+  (let ((help-buffer-name (help-buffer))
+        error-face)
+    (unwind-protect
+        (with-temp-buffer
+          (json-log-viewer-mode)
+          (setq-local json-log-viewer--entry-count 2)
+          (json-log-viewer--async-apply-command
+           '(:cmd "status"
+             :pending-pull-count 0
+             :total-count 2
+             :level-counts ((:level "error" :count 2))))
+          (json-log-viewer-show-info)
+          (with-current-buffer help-buffer-name
+            (goto-char (point-min))
+            (search-forward "ERROR")
+            (setq error-face (get-text-property (match-beginning 0) 'face)))
+          (should (eq error-face 'error)))
+      (when (buffer-live-p (get-buffer help-buffer-name))
+        (kill-buffer help-buffer-name)))))
+
+(ert-deftest json-log-viewer-info-popup-hides-operational-filter-rows-test ()
+  (let ((help-buffer-name (help-buffer))
+        help-text)
+    (unwind-protect
+        (with-temp-buffer
+          (json-log-viewer-mode)
+          (setq-local json-log-viewer--header-function
+                      (lambda (_state)
+                        (list (cons "Follow" "yes")
+                              (cons "Filter" "ERROR")
+                              (cons "Tail" "100")
+                              (cons "Since" "5m")
+                              (cons "Log group" "/aws/demo"))))
+          (setq-local json-log-viewer--entry-count 12)
+          (setq-local json-log-viewer--filter-string "needle")
+          (json-log-viewer-show-info)
+          (with-current-buffer help-buffer-name
+            (setq help-text (buffer-substring-no-properties (point-min) (point-max))))
+          (should (string-match-p "Log group:[[:space:]]+/aws/demo" help-text))
+          (should (string-match-p "Messages:[[:space:]]+12" help-text))
+          (should-not (string-match-p "Filter:" help-text))
+          (should-not (string-match-p "Follow:" help-text))
+          (should-not (string-match-p "Tail:" help-text))
+          (should-not (string-match-p "Since:" help-text))
+          (should-not (string-match-p "Narrow filter:" help-text)))
+      (when (buffer-live-p (get-buffer help-buffer-name))
+        (kill-buffer help-buffer-name)))))
 
 (ert-deftest json-log-viewer-header-omits-total-when-unknown-test ()
   (with-temp-buffer

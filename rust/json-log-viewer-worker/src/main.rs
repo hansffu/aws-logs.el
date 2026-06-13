@@ -198,6 +198,7 @@ struct Store {
     publish_mode: PublishMode,
     pending_entries: VecDeque<Entry>,
     total_count: i64,
+    level_counts: HashMap<String, i64>,
     output: Output,
 }
 
@@ -221,6 +222,7 @@ impl Store {
             publish_mode: PublishMode::Live,
             pending_entries: VecDeque::new(),
             total_count: 0,
+            level_counts: HashMap::new(),
             output,
         })
     }
@@ -231,13 +233,10 @@ impl Store {
         self.render_narrow = None;
         self.pending_entries.clear();
         self.total_count = 0;
+        self.level_counts.clear();
         let _ = self.db.execute("DELETE FROM log_entry", []);
         self.output.send(json!({"cmd": "clear"}));
-        self.output.send(json!({
-            "cmd": "status",
-            "pending-pull-count": 0,
-            "total-count": 0
-        }));
+        self.output.send(self.status_payload(0));
     }
 
     fn ingest_lines(&mut self, lines: &[String]) -> rusqlite::Result<()> {
@@ -253,13 +252,18 @@ impl Store {
         let mut entries = Vec::new();
         let mut inserted_count = 0;
         for line in lines {
-            if let Some(entry) = insert_log_entry(
+            let (entry, level) = insert_log_entry(
                 &tx,
                 line,
                 &viewer_config,
                 &source_configs,
                 active_narrow.as_ref(),
-            )? {
+            )?;
+            *self
+                .level_counts
+                .entry(normalize_count_level(&level))
+                .or_insert(0) += 1;
+            if let Some(entry) = entry {
                 entries.push(entry);
             }
             inserted_count += 1;
@@ -316,16 +320,21 @@ impl Store {
         }
 
         let entries: Vec<Entry> = self.pending_entries.drain(..).collect();
-        self.output.send(json!({
-            "cmd": "status",
-            "pending-pull-count": entries.len(),
-            "total-count": self.total_count
-        }));
+        self.output.send(self.status_payload(entries.len()));
         for batch in entries.chunks(self.config.chunk_size.max(1)) {
             self.output
                 .send(json!({"cmd": "render-entries", "entries": batch}));
         }
         self.output.send(json!({"cmd": "pull-complete"}));
+    }
+
+    fn status_payload(&self, pending_pull_count: usize) -> Value {
+        json!({
+            "cmd": "status",
+            "pending-pull-count": pending_pull_count,
+            "total-count": self.total_count,
+            "level-counts": level_counts_payload(&self.level_counts)
+        })
     }
 
     fn publish_rerender_chunks(&self) {
@@ -924,7 +933,7 @@ fn insert_log_entry(
     default_config: &ViewerConfig,
     source_configs: &HashMap<String, ViewerConfig>,
     narrow: Option<&NarrowFilter>,
-) -> rusqlite::Result<Option<Entry>> {
+) -> rusqlite::Result<(Option<Entry>, String)> {
     let parsed = serde_json::from_str::<Value>(line).ok();
     let normalized = normalize_storage_json(line, parsed.as_ref());
     let json_text = serde_json::to_string(&normalized).unwrap_or_else(|_| line.to_string());
@@ -949,19 +958,20 @@ fn insert_log_entry(
         params![timestamp_epoch, timestamp, source, level, message, extra_csv, json_text],
     )?;
     let id = db.last_insert_rowid();
-    if narrow_matches(&normalized, &level, narrow) {
-        Ok(Some(Entry {
+    let entry = if narrow_matches(&normalized, &level, narrow) {
+        Some(Entry {
             id,
             sort_key: timestamp_epoch.unwrap_or(1_000_000_000_000.0 + id as f64),
             source,
-            timestamp,
-            level,
+            timestamp: timestamp.clone(),
+            level: level.clone(),
             message,
             extra_fields,
-        }))
+        })
     } else {
-        Ok(None)
-    }
+        None
+    };
+    Ok((entry, level))
 }
 
 fn config_for_source<'a>(
@@ -1167,6 +1177,32 @@ fn select_entries_after(
         db.prepare(&sql)?
             .query_map(params_from_iter(values), row_to_entry)?,
     )
+}
+
+fn normalize_count_level(level: &str) -> String {
+    let level = level.trim().to_ascii_lowercase();
+    if level.is_empty() {
+        "-".to_string()
+    } else {
+        level
+    }
+}
+
+fn level_counts_payload(level_counts: &HashMap<String, i64>) -> Vec<Value> {
+    let mut counts = level_counts
+        .iter()
+        .map(|(level, count)| (level.clone(), *count))
+        .collect::<Vec<_>>();
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    counts
+        .into_iter()
+        .map(|(level, count)| {
+            json!({
+                "level": level,
+                "count": count
+            })
+        })
+        .collect()
 }
 
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {

@@ -279,6 +279,9 @@ visible frame.  Set to nil or 0 to disable periodic live pulls."
 (defvar-local json-log-viewer--total-entry-count nil
   "Total entries known to the backing worker, or nil when unknown.")
 
+(defvar-local json-log-viewer--level-counts nil
+  "Latest level count rows reported by the backing worker.")
+
 (defvar-local json-log-viewer--stream-assume-ordered nil
   "Non-nil means streaming entries are assumed to arrive in order.")
 
@@ -621,10 +624,14 @@ When BUFFER-OR-NAME is nil, use the current buffer."
     ('status
      (let ((pending-pull-count (or (plist-get command :pending-pull-count)
                                    (plist-get command :count)))
-           (total-count (plist-get command :total-count)))
+           (total-count (plist-get command :total-count))
+           (level-counts (plist-get command :level-counts)))
        (when (integerp total-count)
          (setq json-log-viewer--total-entry-count total-count)
          (json-log-viewer--refresh-header))
+       (when (listp level-counts)
+         (setq json-log-viewer--level-counts
+               (json-log-viewer--normalize-level-counts level-counts)))
        (when (and (integerp pending-pull-count) (> pending-pull-count 0))
          (let ((max-messages (json-log-viewer--pull-max-messages)))
            (when max-messages
@@ -1623,6 +1630,7 @@ Returns cons cell (ENTRIES . NEXT-ID)."
         :filter-level json-log-viewer--filter-level
         :row-count json-log-viewer--entry-count
         :total-row-count json-log-viewer--total-entry-count
+        :level-counts json-log-viewer--level-counts
         :visible-row-count (json-log-viewer--visible-entry-count)))
 
 (defun json-log-viewer--set-point-to-latest-entry ()
@@ -2056,61 +2064,147 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback is applied."
         (format "%d / %d" rendered json-log-viewer--total-entry-count)
       (number-to-string rendered))))
 
-(defun json-log-viewer--info-lines (&optional row-count)
-  "Return viewer info lines for popup display using ROW-COUNT."
+(defun json-log-viewer--normalize-level-counts (rows)
+  "Normalize status ROWS into alist of (LEVEL . COUNT)."
+  (let (counts)
+    (dolist (row rows)
+      (let ((level (or (plist-get row :level) "-"))
+            (count (plist-get row :count)))
+        (when (integerp count)
+          (push (cons (json-log-viewer-shared--value->string level) count)
+                counts))))
+    (nreverse counts)))
+
+(defun json-log-viewer--hidden-info-key-p (key)
+  "Return non-nil when KEY should be omitted from the info popup column."
+  (member (downcase (or key ""))
+          '("auto follow" "filter" "follow" "narrow filter" "since" "tail")))
+
+(defun json-log-viewer--popup-lines (lines)
+  "Return formatted popup LINES."
+  (delq nil
+        (mapcar
+         (lambda (line)
+           (let ((key (json-log-viewer-shared--value->string (car line)))
+                 (value (json-log-viewer-shared--value->string (cdr line))))
+             (when key
+               (json-log-viewer--info-line key (or value "")))))
+         lines)))
+
+(defun json-log-viewer--statistics-line (key value &optional level)
+  "Return formatted popup statistics line from KEY and VALUE.
+
+When LEVEL is non-nil, render KEY as an uppercased log level using
+`json-log-viewer--level-face'."
+  (let* ((key-text (if level (upcase key) key))
+         (key-face (if level
+                       (json-log-viewer--level-face key)
+                     'json-log-viewer-header-key-face)))
+    (concat
+     (propertize (format "%-12s" (concat key-text ":"))
+                 'face key-face)
+     " "
+     (propertize value 'face 'json-log-viewer-header-value-face))))
+
+(defun json-log-viewer--statistics-lines (&optional row-count)
+  "Return formatted statistics lines for the viewer info popup."
+  (cons
+   (json-log-viewer--statistics-line
+    "Messages"
+    (json-log-viewer--messages-count-string row-count))
+   (mapcar (lambda (pair)
+             (json-log-viewer--statistics-line
+              (car pair)
+              (number-to-string (cdr pair))
+              t))
+           json-log-viewer--level-counts)))
+
+(defun json-log-viewer--help-insert (text)
+  "Insert TEXT into the active help buffer, preserving text properties."
+  (if (bufferp standard-output)
+      (with-current-buffer standard-output
+        (insert text))
+    (princ text)))
+
+(defun json-log-viewer--info-lines ()
+  "Return viewer info lines for popup display."
   (let ((state (json-log-viewer--state)))
-    (append
-     (or (and json-log-viewer--header-function
-              (funcall json-log-viewer--header-function state))
-         nil)
-     (list
-     (cons "Messages"
-           (json-log-viewer--messages-count-string row-count))
-      (cons "Narrow filter"
-            (json-log-viewer--filter-summary))))))
+    (cl-remove-if
+     (lambda (line)
+       (json-log-viewer--hidden-info-key-p
+        (json-log-viewer-shared--value->string (car line))))
+     (append
+      (or (and json-log-viewer--header-function
+               (funcall json-log-viewer--header-function state))
+          nil)
+      (list
+       (cons "Narrow filter"
+             (json-log-viewer--filter-summary)))))))
 
 (defun json-log-viewer-show-info ()
   "Show current viewer context and keys in a popup."
   (interactive)
   (let ((source-buffer (current-buffer))
         (lines (json-log-viewer--info-lines))
-        (bindings (json-log-viewer--keybindings)))
+        (bindings (json-log-viewer--keybindings))
+        (statistics (json-log-viewer--statistics-lines)))
     (let* ((binding-lines (mapcar #'json-log-viewer--binding-line bindings))
-           (info-lines
-            (delq nil
-                  (mapcar
-                   (lambda (line)
-                     (let ((key (json-log-viewer-shared--value->string (car line)))
-                           (value (json-log-viewer-shared--value->string (cdr line))))
-                       (when key
-                         (json-log-viewer--info-line key (or value "")))))
-                   lines)))
+           (info-lines (json-log-viewer--popup-lines lines))
+           (statistic-lines statistics)
            (column-separator "  |  ")
            (bindings-title (propertize "Bindings" 'face 'json-log-viewer-header-key-face))
            (info-title (propertize "Info" 'face 'json-log-viewer-header-key-face))
+           (statistics-title (propertize "Statistics" 'face 'json-log-viewer-header-key-face))
            (bindings-width
             (max (string-width bindings-title)
                  (if binding-lines
                      (apply #'max (mapcar #'string-width binding-lines))
                    0)))
-           (row-count (max (length binding-lines) (length info-lines))))
+           (info-width
+            (max (string-width info-title)
+                 (if info-lines
+                     (apply #'max (mapcar #'string-width info-lines))
+                   0)))
+           (statistics-width
+            (max (string-width statistics-title)
+                 (if statistic-lines
+                     (apply #'max (mapcar #'string-width statistic-lines))
+                   0)))
+           (row-count (max (length binding-lines)
+                           (length info-lines)
+                           (length statistic-lines))))
       (with-help-window (help-buffer)
-        (princ (format "JSON Log Viewer: %s\n\n" (buffer-name source-buffer)))
-        (princ (json-log-viewer--pad-right bindings-title bindings-width))
-        (princ column-separator)
-        (princ info-title)
-        (princ "\n")
-        (princ (make-string bindings-width ?-))
-        (princ column-separator)
-        (princ "----")
-        (princ "\n")
+        (json-log-viewer--help-insert
+         (format "JSON Log Viewer: %s\n\n" (buffer-name source-buffer)))
+        (json-log-viewer--help-insert
+         (json-log-viewer--pad-right bindings-title bindings-width))
+        (json-log-viewer--help-insert column-separator)
+        (json-log-viewer--help-insert
+         (json-log-viewer--pad-right info-title info-width))
+        (json-log-viewer--help-insert column-separator)
+        (json-log-viewer--help-insert
+         (json-log-viewer--pad-right statistics-title statistics-width))
+        (json-log-viewer--help-insert "\n")
+        (json-log-viewer--help-insert (make-string bindings-width ?-))
+        (json-log-viewer--help-insert column-separator)
+        (json-log-viewer--help-insert
+         (json-log-viewer--pad-right (make-string (string-width info-title) ?-)
+                                     info-width))
+        (json-log-viewer--help-insert column-separator)
+        (json-log-viewer--help-insert (make-string statistics-width ?-))
+        (json-log-viewer--help-insert "\n")
         (dotimes (idx row-count)
           (let ((binding-line (or (nth idx binding-lines) ""))
-                (info-line (or (nth idx info-lines) "")))
-            (princ (json-log-viewer--pad-right binding-line bindings-width))
-            (princ column-separator)
-            (princ info-line)
-            (princ "\n")))))))
+                (info-line (or (nth idx info-lines) ""))
+                (statistic-line (or (nth idx statistic-lines) "")))
+            (json-log-viewer--help-insert
+             (json-log-viewer--pad-right binding-line bindings-width))
+            (json-log-viewer--help-insert column-separator)
+            (json-log-viewer--help-insert
+             (json-log-viewer--pad-right info-line info-width))
+            (json-log-viewer--help-insert column-separator)
+            (json-log-viewer--help-insert statistic-line)
+            (json-log-viewer--help-insert "\n")))))))
 
 (defun json-log-viewer--header-end-position ()
   "Return position where entries start (no header is rendered)."
