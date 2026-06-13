@@ -68,6 +68,7 @@ enum Command {
         #[serde(default)]
         needles: Vec<String>,
         operator: Option<String>,
+        level: Option<String>,
         #[serde(rename = "request-id")]
         request_id: Option<i64>,
     },
@@ -76,6 +77,7 @@ enum Command {
         #[serde(default)]
         needles: Vec<String>,
         operator: Option<String>,
+        level: Option<String>,
         #[serde(rename = "request-id")]
         request_id: Option<i64>,
     },
@@ -164,6 +166,7 @@ enum RenderMode {
 struct NarrowFilter {
     terms: Vec<String>,
     operator: NarrowOperator,
+    level: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -534,13 +537,19 @@ fn handle_process_command(store: &mut Store, command: Command) -> bool {
             needle,
             needles,
             operator,
+            level,
             request_id,
         } => {
-            match normalize_filter(needle.as_deref(), &needles, operator.as_deref()) {
+            match normalize_filter(
+                needle.as_deref(),
+                &needles,
+                operator.as_deref(),
+                level.as_deref(),
+            ) {
                 Some(filter) => store.narrow(filter),
                 None => store
                     .output
-                    .error("narrow command requires at least one needle"),
+                    .error("narrow command requires at least one needle or level"),
             }
             store.output.complete(request_id);
         }
@@ -548,12 +557,14 @@ fn handle_process_command(store: &mut Store, command: Command) -> bool {
             needle,
             needles,
             operator,
+            level,
             request_id,
         } => {
             store.rerender(normalize_filter(
                 needle.as_deref(),
                 &needles,
                 operator.as_deref(),
+                level.as_deref(),
             ));
             store.output.complete(request_id);
         }
@@ -884,6 +895,7 @@ fn normalize_filter(
     needle: Option<&str>,
     needles: &[String],
     operator: Option<&str>,
+    level: Option<&str>,
 ) -> Option<NarrowFilter> {
     let mut terms = Vec::new();
     if let Some(term) = normalize_needle(needle) {
@@ -894,12 +906,14 @@ fn normalize_filter(
             terms.push(term);
         }
     }
-    if terms.is_empty() {
+    let level = normalize_needle(level);
+    if terms.is_empty() && level.is_none() {
         None
     } else {
         Some(NarrowFilter {
             terms,
             operator: normalize_operator(operator),
+            level,
         })
     }
 }
@@ -935,7 +949,7 @@ fn insert_log_entry(
         params![timestamp_epoch, timestamp, source, level, message, extra_csv, json_text],
     )?;
     let id = db.last_insert_rowid();
-    if narrow_matches(&normalized, narrow) {
+    if narrow_matches(&normalized, &level, narrow) {
         Ok(Some(Entry {
             id,
             sort_key: timestamp_epoch.unwrap_or(1_000_000_000_000.0 + id as f64),
@@ -969,10 +983,18 @@ fn normalize_storage_json(line: &str, parsed: Option<&Value>) -> Value {
     }
 }
 
-fn narrow_matches(value: &Value, narrow: Option<&NarrowFilter>) -> bool {
+fn narrow_matches(value: &Value, level: &str, narrow: Option<&NarrowFilter>) -> bool {
     match narrow {
         None => true,
         Some(filter) => {
+            if let Some(filter_level) = &filter.level {
+                if filter_level != &level.trim().to_ascii_lowercase() {
+                    return false;
+                }
+            }
+            if filter.terms.is_empty() {
+                return true;
+            }
             let Ok(text) = serde_json::to_string(value) else {
                 return false;
             };
@@ -987,33 +1009,50 @@ fn narrow_matches(value: &Value, narrow: Option<&NarrowFilter>) -> bool {
 
 fn narrow_condition_sql(narrow: Option<&NarrowFilter>) -> Option<String> {
     let filter = narrow?;
-    if filter.terms.is_empty() {
+    if filter.terms.is_empty() && filter.level.is_none() {
         return None;
     }
-    let joiner = match filter.operator {
-        NarrowOperator::And => " AND ",
-        NarrowOperator::Or => " OR ",
+    let term_condition = if filter.terms.is_empty() {
+        None
+    } else {
+        let joiner = match filter.operator {
+            NarrowOperator::And => " AND ",
+            NarrowOperator::Or => " OR ",
+        };
+        Some(format!(
+            "({})",
+            filter
+                .terms
+                .iter()
+                .map(|_| "instr(lower(json), ?) > 0")
+                .collect::<Vec<_>>()
+                .join(joiner)
+        ))
     };
+    let level_condition = filter.level.as_ref().map(|_| "lower(level_path) = ?");
     Some(
-        filter
-            .terms
-            .iter()
-            .map(|_| "instr(lower(json), ?) > 0")
+        [term_condition.as_deref(), level_condition]
+            .into_iter()
+            .flatten()
             .collect::<Vec<_>>()
-            .join(joiner),
+            .join(" AND "),
     )
 }
 
 fn narrow_sql_params(narrow: Option<&NarrowFilter>) -> Vec<SqlValue> {
-    narrow
+    let mut values = narrow
         .map(|filter| {
             filter
                 .terms
                 .iter()
                 .map(|term| SqlValue::Text(term.clone()))
-                .collect()
+                .collect::<Vec<_>>()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if let Some(level) = narrow.and_then(|filter| filter.level.as_ref()) {
+        values.push(SqlValue::Text(level.clone()));
+    }
+    values
 }
 
 fn select_rerender_entries(

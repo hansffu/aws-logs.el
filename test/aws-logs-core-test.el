@@ -638,6 +638,49 @@
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
+(ert-deftest json-log-viewer-narrow-level-filter-replays-matches-test ()
+  (let* ((buf (aws-logs-core-test--make-viewer
+               "*json-log-viewer-level-narrow-test*"
+               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"level\":\"info\",\"msg\":\"alpha\"}"
+                 "{\"timestamp\":\"2026-01-01T00:00:01Z\",\"level\":\"error\",\"msg\":\"alpha\"}"
+                 "{\"timestamp\":\"2026-01-01T00:00:02Z\",\"level\":\"warn\",\"msg\":\"beta\"}"
+                 "{\"timestamp\":\"2026-01-01T00:00:03Z\",\"level\":\"error\",\"msg\":\"gamma\"}")
+               :timestamp-path "timestamp"
+               :level-path "level"
+               :message-path "msg")))
+    (unwind-protect
+        (with-current-buffer buf
+          (setq json-log-viewer--filter-string nil)
+          (setq json-log-viewer--filter-terms nil)
+          (setq json-log-viewer--filter-level "error")
+          (json-log-viewer--request-rerender 'narrow nil t)
+          (should (= json-log-viewer--entry-count 2))
+          (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+            (should (string-match-p "alpha" text))
+            (should (string-match-p "gamma" text))
+            (should-not (string-match-p "beta" text)))
+          (json-log-viewer-push
+           buf
+           '("{\"timestamp\":\"2026-01-01T00:00:04Z\",\"level\":\"error\",\"msg\":\"delta\"}"
+             "{\"timestamp\":\"2026-01-01T00:00:05Z\",\"level\":\"info\",\"msg\":\"epsilon\"}"))
+          (should (= json-log-viewer--entry-count 3))
+          (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+            (should (string-match-p "delta" text))
+            (should-not (string-match-p "epsilon" text)))
+          (setq json-log-viewer--filter-terms '("alpha"))
+          (setq json-log-viewer--filter-operator 'and)
+          (setq json-log-viewer--filter-level "error")
+          (json-log-viewer--request-rerender 'narrow nil t)
+          (should (= json-log-viewer--entry-count 1))
+          (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+            (should (string-match-p "alpha" text))
+            (should-not (string-match-p "gamma" text))
+            (should-not (string-match-p "delta" text)))
+          (should (string-match-p "level:error"
+                                  (json-log-viewer--header-line-string))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
 (ert-deftest json-log-viewer-widen-replays-all-stored-json-rows-test ()
   (let* ((buf (aws-logs-core-test--make-viewer
                "*json-log-viewer-widen-replay-test*"

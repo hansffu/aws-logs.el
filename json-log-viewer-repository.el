@@ -196,29 +196,46 @@ Returned rows are ascending plists of shape
     (when-let ((term (json-log-viewer-repository--normalize-narrow-string narrow)))
       (list :terms (list term) :operator 'and)))
    ((listp narrow)
-    (let (terms)
+    (let (terms
+          (level (json-log-viewer-repository--normalize-narrow-string
+                  (plist-get narrow :level))))
       (dolist (term (plist-get narrow :terms))
         (when-let ((normalized
                     (json-log-viewer-repository--normalize-narrow-string term)))
           (push normalized terms)))
-      (when terms
+      (when (or terms level)
         (list :terms (nreverse terms)
               :operator (json-log-viewer-repository--normalize-narrow-operator
-                         (plist-get narrow :operator))))))))
+                         (plist-get narrow :operator))
+              :level level))))))
 
 (defun json-log-viewer-repository--narrow-condition (narrow)
   "Return SQL condition for NARROW, without WHERE or AND."
   (when-let ((filter (json-log-viewer-repository--narrow-filter narrow)))
-    (let ((joiner (if (eq (plist-get filter :operator) 'or) " OR " " AND ")))
-      (mapconcat (lambda (_term) "instr(lower(json), ?) > 0")
-                 (plist-get filter :terms)
-                 joiner))))
+    (let* ((terms (plist-get filter :terms))
+           (joiner (if (eq (plist-get filter :operator) 'or) " OR " " AND "))
+           (term-condition (and terms
+                                (mapconcat
+                                 (lambda (_term) "instr(lower(json), ?) > 0")
+                                 terms
+                                 joiner)))
+           (level-condition (and (plist-get filter :level)
+                                 "lower(level_path) = ?")))
+      (mapconcat #'identity
+                 (delq nil
+                       (list (and term-condition
+                                  (format "(%s)" term-condition))
+                             level-condition))
+                 " AND "))))
 
 (defun json-log-viewer-repository--narrow-params (narrow)
   "Return vector of SQL parameters for NARROW."
-  (vconcat
-   (or (plist-get (json-log-viewer-repository--narrow-filter narrow) :terms)
-       nil)))
+  (let ((filter (json-log-viewer-repository--narrow-filter narrow)))
+    (vconcat
+     (or (plist-get filter :terms) nil)
+     (if (plist-get filter :level)
+         (vector (plist-get filter :level))
+       []))))
 
 (defun json-log-viewer-repository--select (db sql params)
   "Run sqlite SELECT SQL with optional PARAMS."

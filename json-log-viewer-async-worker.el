@@ -47,15 +47,18 @@
     (when-let ((term (json-log-viewer-async-worker--normalize-narrow-string filter)))
       (list :terms (list term) :operator 'and)))
    ((listp filter)
-    (let (terms)
+    (let (terms
+          (level (json-log-viewer-async-worker--normalize-narrow-string
+                  (plist-get filter :level))))
       (dolist (term (plist-get filter :terms))
         (when-let ((normalized
                     (json-log-viewer-async-worker--normalize-narrow-string term)))
           (push normalized terms)))
-      (when terms
+      (when (or terms level)
         (list :terms (nreverse terms)
               :operator (json-log-viewer-async-worker--normalize-narrow-operator
-                         (plist-get filter :operator))))))))
+                         (plist-get filter :operator))
+              :level level))))))
 
 (defun json-log-viewer-async-worker--parse-time (value)
   "Return epoch seconds parsed from VALUE, or nil."
@@ -281,20 +284,27 @@
       nil
     (split-string csv "," t)))
 
-(defun json-log-viewer-async-worker--json-matches-narrow-p (json-text narrow-filter)
-  "Return non-nil when JSON-TEXT matches NARROW-FILTER."
+(defun json-log-viewer-async-worker--json-matches-narrow-p (json-text level narrow-filter)
+  "Return non-nil when JSON-TEXT and LEVEL match NARROW-FILTER."
   (let ((filter (json-log-viewer-async-worker--normalize-narrow-filter narrow-filter)))
     (or (null filter)
         (let ((text (and (stringp json-text) (downcase json-text)))
-              (terms (plist-get filter :terms)))
-          (and text
-               (if (eq (plist-get filter :operator) 'or)
-                   (cl-some (lambda (term)
-                              (string-match-p (regexp-quote term) text))
-                            terms)
-                 (cl-every (lambda (term)
-                             (string-match-p (regexp-quote term) text))
-                           terms)))))))
+              (terms (plist-get filter :terms))
+              (filter-level (plist-get filter :level))
+              (entry-level (json-log-viewer-async-worker--normalize-narrow-string
+                            level)))
+          (and
+           (or (null filter-level)
+               (string-equal filter-level entry-level))
+           (or (null terms)
+               (and text
+                    (if (eq (plist-get filter :operator) 'or)
+                        (cl-some (lambda (term)
+                                   (string-match-p (regexp-quote term) text))
+                                 terms)
+                      (cl-every (lambda (term)
+                                  (string-match-p (regexp-quote term) text))
+                                terms)))))))))
 
 (defun json-log-viewer-async-worker--sqlite-insert-log-entry (db line config &optional narrow-filter)
   "Insert one LINE into DB and return summary plist when it matches NARROW-FILTER."
@@ -317,7 +327,8 @@
                message-path
                extra-paths
                storage-json)))
-      (when (json-log-viewer-async-worker--json-matches-narrow-p storage-json narrow-filter)
+      (when (json-log-viewer-async-worker--json-matches-narrow-p
+             storage-json level-path narrow-filter)
         (json-log-viewer-async-worker--stored-row->entry
          (json-log-viewer-repository-select-summary-entry-by-id db id))))))
 

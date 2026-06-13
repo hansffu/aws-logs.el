@@ -219,6 +219,9 @@ visible frame.  Set to nil or 0 to disable periodic live pulls."
 (defvar-local json-log-viewer--filter-operator 'and
   "Current multi-term filter operator, either `and' or `or'.")
 
+(defvar-local json-log-viewer--filter-level nil
+  "Current exact level filter for rendered entries, or nil.")
+
 (defvar-local json-log-viewer--context nil
   "Opaque refresh context owned by the caller.")
 
@@ -1099,12 +1102,18 @@ When WAIT-FOR-CALLBACK is non-nil, wait for a socket barrier response."
         (push value normalized)))
     (nreverse normalized)))
 
-(defun json-log-viewer--make-narrow-filter (terms &optional operator)
-  "Return a normalized narrow filter from TERMS and OPERATOR."
-  (let ((terms (json-log-viewer--normalize-narrow-terms terms)))
-    (when terms
+(defun json-log-viewer--normalize-narrow-level (level)
+  "Normalize LEVEL into a downcased level filter, or nil."
+  (json-log-viewer--normalize-narrow-string level))
+
+(defun json-log-viewer--make-narrow-filter (terms &optional operator level)
+  "Return a normalized narrow filter from TERMS, OPERATOR, and LEVEL."
+  (let ((terms (json-log-viewer--normalize-narrow-terms terms))
+        (level (json-log-viewer--normalize-narrow-level level)))
+    (when (or terms level)
       (list :terms terms
-            :operator (json-log-viewer--normalize-narrow-operator operator)))))
+            :operator (json-log-viewer--normalize-narrow-operator operator)
+            :level level))))
 
 (defun json-log-viewer--active-narrow-filter (&optional narrow-string)
   "Return current narrow filter, optionally forcing NARROW-STRING."
@@ -1113,7 +1122,12 @@ When WAIT-FOR-CALLBACK is non-nil, wait for a socket barrier response."
     (json-log-viewer--make-narrow-filter (list narrow-string) 'and))
    (json-log-viewer--filter-terms
     (json-log-viewer--make-narrow-filter
-     json-log-viewer--filter-terms json-log-viewer--filter-operator))
+     json-log-viewer--filter-terms
+     json-log-viewer--filter-operator
+     json-log-viewer--filter-level))
+   (json-log-viewer--filter-level
+    (json-log-viewer--make-narrow-filter
+     nil json-log-viewer--filter-operator json-log-viewer--filter-level))
    (json-log-viewer--filter-string
     (json-log-viewer--make-narrow-filter (list json-log-viewer--filter-string) 'and))))
 
@@ -1125,11 +1139,20 @@ When WAIT-FOR-CALLBACK is non-nil, wait for a socket barrier response."
   "Return normalized operator from FILTER plist."
   (json-log-viewer--normalize-narrow-operator (plist-get filter :operator)))
 
+(defun json-log-viewer--narrow-filter-level (filter)
+  "Return normalized level from FILTER plist."
+  (json-log-viewer--normalize-narrow-level (plist-get filter :level)))
+
 (defun json-log-viewer--worker-filter-command-args (filter)
   "Return worker command args for FILTER."
-  (when-let ((terms (json-log-viewer--narrow-filter-terms filter)))
-    (list :needles (vconcat terms)
-          :operator (symbol-name (json-log-viewer--narrow-filter-operator filter)))))
+  (let ((terms (json-log-viewer--narrow-filter-terms filter))
+        (level (json-log-viewer--narrow-filter-level filter)))
+    (when (or terms level)
+      (append
+       (list :needles (vconcat (or terms nil))
+             :operator (symbol-name (json-log-viewer--narrow-filter-operator filter)))
+       (when level
+         (list :level level))))))
 
 (defun json-log-viewer--make-async-job (op &optional line narrow-string narrow-filter)
   "Build worker queue payload for OP and optional LINE."
@@ -1597,6 +1620,7 @@ Returns cons cell (ENTRIES . NEXT-ID)."
         :filter json-log-viewer--filter-string
         :filter-terms json-log-viewer--filter-terms
         :filter-operator json-log-viewer--filter-operator
+        :filter-level json-log-viewer--filter-level
         :row-count json-log-viewer--entry-count
         :total-row-count json-log-viewer--total-entry-count
         :visible-row-count (json-log-viewer--visible-entry-count)))
@@ -1873,15 +1897,21 @@ When VISIBLE-ONLY is non-nil, return only currently visible entries."
   "Return non-nil when ENTRY-OVERLAY matches FILTER."
   (let ((terms (json-log-viewer--narrow-filter-terms filter))
         (operator (json-log-viewer--narrow-filter-operator filter))
+        (level (json-log-viewer--narrow-filter-level filter))
+        (entry-level (json-log-viewer--normalize-narrow-level
+                      (overlay-get entry-overlay 'json-log-viewer-level)))
         (text (or (json-log-viewer--storage-entry-filter-text entry-overlay) "")))
-    (or (null terms)
-        (if (eq operator 'or)
-            (cl-some (lambda (term)
+    (and
+     (or (null level)
+         (string-equal level entry-level))
+     (or (null terms)
+         (if (eq operator 'or)
+             (cl-some (lambda (term)
+                        (string-match-p (regexp-quote term) text))
+                      terms)
+           (cl-every (lambda (term)
                        (string-match-p (regexp-quote term) text))
-                     terms)
-          (cl-every (lambda (term)
-                      (string-match-p (regexp-quote term) text))
-                    terms)))))
+                     terms))))))
 
 (defun json-log-viewer--filter-managed-by-ingestor-p ()
   "Return non-nil when active narrowing is handled by async log ingestor."
@@ -1890,7 +1920,8 @@ When VISIBLE-ONLY is non-nil, return only currently visible entries."
 (defun json-log-viewer--apply-filter ()
   "Apply active filter to entry overlays in current buffer."
   (let* ((filter (json-log-viewer--active-narrow-filter))
-         (active (json-log-viewer--narrow-filter-terms filter)))
+         (active (or (json-log-viewer--narrow-filter-terms filter)
+                     (json-log-viewer--narrow-filter-level filter))))
     (dolist (entry-overlay json-log-viewer--entry-overlays)
       (when (overlay-buffer entry-overlay)
         (let ((invisible
@@ -1906,7 +1937,8 @@ When VISIBLE-ONLY is non-nil, return only currently visible entries."
 (defun json-log-viewer--apply-filter-to-overlays (overlays)
   "Apply current filter to OVERLAYS only."
   (let* ((filter (json-log-viewer--active-narrow-filter))
-         (active (json-log-viewer--narrow-filter-terms filter)))
+         (active (or (json-log-viewer--narrow-filter-terms filter)
+                     (json-log-viewer--narrow-filter-level filter))))
     (dolist (entry-overlay overlays)
       (let ((invisible
              (if (and active
@@ -1924,6 +1956,7 @@ When VISIBLE-ONLY is non-nil, return only currently visible entries."
     (setq json-log-viewer--filter-string
           (unless (string-empty-p normalized) normalized))
     (setq json-log-viewer--filter-terms nil)
+    (setq json-log-viewer--filter-level nil)
     (json-log-viewer--apply-filter)
     (json-log-viewer--highlight-current-line)))
 
@@ -1957,13 +1990,19 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback is applied."
   (cond
    ((and json-log-viewer--filter-terms
          (json-log-viewer--normalize-narrow-terms json-log-viewer--filter-terms))
-    (format "%s: %s"
-            (upcase (symbol-name
-                     (json-log-viewer--normalize-narrow-operator
-                      json-log-viewer--filter-operator)))
-            (mapconcat (lambda (term) (format "\"%s\"" term))
-                       json-log-viewer--filter-terms
-                       ", ")))
+    (concat
+     (format "%s: %s"
+             (upcase (symbol-name
+                      (json-log-viewer--normalize-narrow-operator
+                       json-log-viewer--filter-operator)))
+             (mapconcat (lambda (term) (format "\"%s\"" term))
+                        json-log-viewer--filter-terms
+                        ", "))
+     (if json-log-viewer--filter-level
+         (format " level:%s" json-log-viewer--filter-level)
+       "")))
+   (json-log-viewer--filter-level
+    (format "level:%s" json-log-viewer--filter-level))
    ((and json-log-viewer--filter-string
          (not (string-empty-p json-log-viewer--filter-string)))
     (format "\"%s\"" json-log-viewer--filter-string))
@@ -2105,24 +2144,26 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback is applied."
       (user-error "Narrow string cannot be empty"))
     (setq json-log-viewer--filter-string needle)
     (setq json-log-viewer--filter-terms nil)
+    (setq json-log-viewer--filter-level nil)
     (json-log-viewer--refresh-header)
     (json-log-viewer--request-rerender 'narrow needle)
     (message "Narrowing to \"%s\"..." needle)))
 
-(defun json-log-viewer--apply-multi-narrow-filter (terms operator)
-  "Apply multi-term narrow TERMS with OPERATOR."
+(defun json-log-viewer--apply-multi-narrow-filter (terms operator &optional level)
+  "Apply multi-term narrow TERMS with OPERATOR and optional LEVEL."
   (let ((terms (json-log-viewer--normalize-narrow-terms terms))
-        (operator (json-log-viewer--normalize-narrow-operator operator)))
-    (unless terms
-      (user-error "Add at least one narrow string"))
+        (operator (json-log-viewer--normalize-narrow-operator operator))
+        (level (json-log-viewer--normalize-narrow-level level)))
+    (unless (or terms level)
+      (user-error "Add at least one narrow string or level"))
     (setq json-log-viewer--filter-string nil)
     (setq json-log-viewer--filter-terms terms)
     (setq json-log-viewer--filter-operator operator)
+    (setq json-log-viewer--filter-level level)
     (json-log-viewer--refresh-header)
     (json-log-viewer--request-rerender 'narrow)
-    (message "Narrowing to %s filter: %s..."
-             (upcase (symbol-name operator))
-             (mapconcat (lambda (term) (format "\"%s\"" term)) terms ", "))))
+    (message "Narrowing to %s..."
+             (json-log-viewer--filter-summary))))
 
 (defun json-log-viewer--narrow-menu-terms ()
   "Return editable multi-narrow terms for the current viewer buffer."
@@ -2135,16 +2176,32 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback is applied."
   "Return editable multi-narrow operator for the current viewer buffer."
   (json-log-viewer--normalize-narrow-operator json-log-viewer--filter-operator))
 
+(defun json-log-viewer--narrow-menu-level ()
+  "Return editable multi-narrow level for the current viewer buffer."
+  (json-log-viewer--normalize-narrow-level json-log-viewer--filter-level))
+
 (defun json-log-viewer--narrow-menu-state-description ()
   "Return transient description for current multi-narrow state."
   (format "Filter: %s"
-          (if-let ((terms (json-log-viewer--narrow-menu-terms)))
-              (format "%s %s"
-                      (upcase (symbol-name (json-log-viewer--narrow-menu-operator)))
-                      (mapconcat (lambda (term) (format "\"%s\"" term))
-                                 terms
-                                 ", "))
-            "(none)")))
+          (let ((terms (json-log-viewer--narrow-menu-terms))
+                (level (json-log-viewer--narrow-menu-level)))
+            (if (or terms level)
+                (string-join
+                 (delq nil
+                       (list
+                        (when terms
+                          (format "%s %s"
+                                  (upcase
+                                   (symbol-name
+                                    (json-log-viewer--narrow-menu-operator)))
+                                  (mapconcat
+                                   (lambda (term) (format "\"%s\"" term))
+                                   terms
+                                   ", ")))
+                        (when level
+                          (format "level:%s" level))))
+                 " ")
+              "(none)"))))
 
 (transient-define-suffix json-log-viewer-narrow-menu-status ()
   "Show current multi-narrow state."
@@ -2186,13 +2243,28 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback is applied."
   (setq json-log-viewer--filter-operator
         (if (eq (json-log-viewer--narrow-menu-operator) 'and) 'or 'and)))
 
+(transient-define-suffix json-log-viewer-narrow-menu-set-level ()
+  "Set or clear the exact level filter."
+  :description (lambda ()
+                 (format "Level: %s"
+                         (or (json-log-viewer--narrow-menu-level) "(none)")))
+  :transient t
+  (interactive)
+  (let ((level (string-trim
+                (read-string "Level filter (empty clears): "
+                             (or (json-log-viewer--narrow-menu-level) "")))))
+    (setq json-log-viewer--filter-string nil)
+    (setq json-log-viewer--filter-level
+          (json-log-viewer--normalize-narrow-level level))))
+
 (transient-define-suffix json-log-viewer-narrow-menu-apply ()
   "Apply the current multi-narrow filter."
   :transient nil
   (interactive)
   (json-log-viewer--apply-multi-narrow-filter
    (json-log-viewer--narrow-menu-terms)
-   (json-log-viewer--narrow-menu-operator)))
+   (json-log-viewer--narrow-menu-operator)
+   (json-log-viewer--narrow-menu-level)))
 
 (transient-define-suffix json-log-viewer-narrow-menu-widen ()
   "Clear active narrowing and replay all stored entries."
@@ -2207,7 +2279,8 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback is applied."
    ["Edit"
     ("a" "Add string" json-log-viewer-narrow-menu-add)
     ("d" "Delete string" json-log-viewer-narrow-menu-delete)
-    ("t" json-log-viewer-narrow-menu-toggle-operator)]
+    ("t" json-log-viewer-narrow-menu-toggle-operator)
+    ("l" json-log-viewer-narrow-menu-set-level)]
    ["Apply"
     ("RET" "Apply" json-log-viewer-narrow-menu-apply)
     ("w" "Widen" json-log-viewer-narrow-menu-widen)]])
@@ -2224,6 +2297,7 @@ When WAIT-FOR-CALLBACK is non-nil, block until callback is applied."
   (interactive)
   (setq json-log-viewer--filter-string nil)
   (setq json-log-viewer--filter-terms nil)
+  (setq json-log-viewer--filter-level nil)
   (json-log-viewer--refresh-header)
   (json-log-viewer--request-rerender 'rerender nil)
   (message "Rendering all entries..."))
@@ -2509,6 +2583,7 @@ stops before the next chunk would exceed the active max-entries cap."
     (overlay-put entry-ov 'json-log-viewer-storage-entry-id entry-id)
     (overlay-put entry-ov 'json-log-viewer-storage-timestamp
                  (plist-get entry :timestamp))
+    (overlay-put entry-ov 'json-log-viewer-level (plist-get entry :level))
     (overlay-put entry-ov 'json-log-viewer-signature signature)
     (overlay-put entry-ov 'json-log-viewer-storage-signature signature)
     (push entry-ov json-log-viewer--entry-overlays)
@@ -2621,11 +2696,13 @@ When PRESERVE-FILTER is non-nil, keep the current active filter."
   (let ((active-filter (and preserve-filter json-log-viewer--filter-string))
         (active-filter-terms (and preserve-filter json-log-viewer--filter-terms))
         (active-filter-operator (and preserve-filter json-log-viewer--filter-operator))
+        (active-filter-level (and preserve-filter json-log-viewer--filter-level))
         (inhibit-read-only t)
         (ordered (json-log-viewer--sort-entries entries)))
     (setq json-log-viewer--filter-string active-filter)
     (setq json-log-viewer--filter-terms active-filter-terms)
     (setq json-log-viewer--filter-operator (or active-filter-operator 'and))
+    (setq json-log-viewer--filter-level active-filter-level)
     (json-log-viewer--clear-overlays)
     (setq json-log-viewer--seen-signatures (make-hash-table :test 'equal))
     (erase-buffer)
