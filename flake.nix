@@ -76,6 +76,7 @@
             rustc
             rustfmt
             clippy
+            python3
           ];
         };
       });
