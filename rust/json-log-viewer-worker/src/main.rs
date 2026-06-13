@@ -1,5 +1,6 @@
 use chrono::{DateTime, NaiveDateTime};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -63,12 +64,18 @@ enum Command {
         request_id: Option<i64>,
     },
     Narrow {
-        needle: String,
+        needle: Option<String>,
+        #[serde(default)]
+        needles: Vec<String>,
+        operator: Option<String>,
         #[serde(rename = "request-id")]
         request_id: Option<i64>,
     },
     Rerender {
         needle: Option<String>,
+        #[serde(default)]
+        needles: Vec<String>,
+        operator: Option<String>,
         #[serde(rename = "request-id")]
         request_id: Option<i64>,
     },
@@ -153,6 +160,18 @@ enum RenderMode {
     Narrow,
 }
 
+#[derive(Clone, Debug)]
+struct NarrowFilter {
+    terms: Vec<String>,
+    operator: NarrowOperator,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NarrowOperator {
+    And,
+    Or,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PublishMode {
     Live,
@@ -172,7 +191,7 @@ struct Store {
     auto_delete_worker_files: bool,
     config: RuntimeConfig,
     render_mode: RenderMode,
-    render_narrow: Option<String>,
+    render_narrow: Option<NarrowFilter>,
     publish_mode: PublishMode,
     pending_entries: VecDeque<Entry>,
     total_count: i64,
@@ -231,15 +250,13 @@ impl Store {
         let mut entries = Vec::new();
         let mut inserted_count = 0;
         for line in lines {
-            if let Some(entry) =
-                insert_log_entry(
-                    &tx,
-                    line,
-                    &viewer_config,
-                    &source_configs,
-                    active_narrow.as_deref(),
-                )?
-            {
+            if let Some(entry) = insert_log_entry(
+                &tx,
+                line,
+                &viewer_config,
+                &source_configs,
+                active_narrow.as_ref(),
+            )? {
                 entries.push(entry);
             }
             inserted_count += 1;
@@ -252,20 +269,20 @@ impl Store {
         Ok(())
     }
 
-    fn narrow(&mut self, needle: String) {
+    fn narrow(&mut self, filter: NarrowFilter) {
         self.publish_mode = PublishMode::Live;
         self.render_mode = RenderMode::Narrow;
-        self.render_narrow = Some(normalize_needle(Some(&needle)).unwrap_or_default());
+        self.render_narrow = Some(filter);
         self.pending_entries.clear();
         self.publish_rerender_chunks();
     }
 
-    fn rerender(&mut self, needle: Option<String>) {
+    fn rerender(&mut self, filter: Option<NarrowFilter>) {
         self.publish_mode = PublishMode::Live;
         self.pending_entries.clear();
-        if let Some(needle) = normalize_needle(needle.as_deref()) {
+        if let Some(filter) = filter {
             self.render_mode = RenderMode::Narrow;
-            self.render_narrow = Some(needle);
+            self.render_narrow = Some(filter);
         } else {
             self.render_mode = RenderMode::All;
             self.render_narrow = None;
@@ -311,7 +328,7 @@ impl Store {
     fn publish_rerender_chunks(&self) {
         self.output.send(json!({"cmd": "clear"}));
         let narrow = if self.render_mode == RenderMode::Narrow {
-            self.render_narrow.as_deref()
+            self.render_narrow.as_ref()
         } else {
             None
         };
@@ -344,7 +361,7 @@ impl Store {
             return Ok(());
         };
         let active_narrow = if self.render_mode == RenderMode::Narrow {
-            self.render_narrow.as_deref()
+            self.render_narrow.as_ref()
         } else {
             None
         };
@@ -513,12 +530,31 @@ fn handle_process_command(store: &mut Store, command: Command) -> bool {
             store.config.source_configs.insert(source, config);
             store.output.complete(request_id);
         }
-        Command::Narrow { needle, request_id } => {
-            store.narrow(needle);
+        Command::Narrow {
+            needle,
+            needles,
+            operator,
+            request_id,
+        } => {
+            match normalize_filter(needle.as_deref(), &needles, operator.as_deref()) {
+                Some(filter) => store.narrow(filter),
+                None => store
+                    .output
+                    .error("narrow command requires at least one needle"),
+            }
             store.output.complete(request_id);
         }
-        Command::Rerender { needle, request_id } => {
-            store.rerender(needle);
+        Command::Rerender {
+            needle,
+            needles,
+            operator,
+            request_id,
+        } => {
+            store.rerender(normalize_filter(
+                needle.as_deref(),
+                &needles,
+                operator.as_deref(),
+            ));
             store.output.complete(request_id);
         }
         Command::LoadMore {
@@ -837,12 +873,43 @@ fn normalize_needle(needle: Option<&str>) -> Option<String> {
     }
 }
 
+fn normalize_operator(operator: Option<&str>) -> NarrowOperator {
+    match operator.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value) if value == "or" => NarrowOperator::Or,
+        _ => NarrowOperator::And,
+    }
+}
+
+fn normalize_filter(
+    needle: Option<&str>,
+    needles: &[String],
+    operator: Option<&str>,
+) -> Option<NarrowFilter> {
+    let mut terms = Vec::new();
+    if let Some(term) = normalize_needle(needle) {
+        terms.push(term);
+    }
+    for needle in needles {
+        if let Some(term) = normalize_needle(Some(needle)) {
+            terms.push(term);
+        }
+    }
+    if terms.is_empty() {
+        None
+    } else {
+        Some(NarrowFilter {
+            terms,
+            operator: normalize_operator(operator),
+        })
+    }
+}
+
 fn insert_log_entry(
     db: &Connection,
     line: &str,
     default_config: &ViewerConfig,
     source_configs: &HashMap<String, ViewerConfig>,
-    narrow: Option<&str>,
+    narrow: Option<&NarrowFilter>,
 ) -> rusqlite::Result<Option<Entry>> {
     let parsed = serde_json::from_str::<Value>(line).ok();
     let normalized = normalize_storage_json(line, parsed.as_ref());
@@ -902,68 +969,100 @@ fn normalize_storage_json(line: &str, parsed: Option<&Value>) -> Value {
     }
 }
 
-fn narrow_matches(value: &Value, narrow: Option<&str>) -> bool {
+fn narrow_matches(value: &Value, narrow: Option<&NarrowFilter>) -> bool {
     match narrow {
         None => true,
-        Some(needle) => serde_json::to_string(value)
-            .map(|text| text.to_ascii_lowercase().contains(needle))
-            .unwrap_or(false),
+        Some(filter) => {
+            let Ok(text) = serde_json::to_string(value) else {
+                return false;
+            };
+            let text = text.to_ascii_lowercase();
+            match filter.operator {
+                NarrowOperator::And => filter.terms.iter().all(|term| text.contains(term)),
+                NarrowOperator::Or => filter.terms.iter().any(|term| text.contains(term)),
+            }
+        }
     }
+}
+
+fn narrow_condition_sql(narrow: Option<&NarrowFilter>) -> Option<String> {
+    let filter = narrow?;
+    if filter.terms.is_empty() {
+        return None;
+    }
+    let joiner = match filter.operator {
+        NarrowOperator::And => " AND ",
+        NarrowOperator::Or => " OR ",
+    };
+    Some(
+        filter
+            .terms
+            .iter()
+            .map(|_| "instr(lower(json), ?) > 0")
+            .collect::<Vec<_>>()
+            .join(joiner),
+    )
+}
+
+fn narrow_sql_params(narrow: Option<&NarrowFilter>) -> Vec<SqlValue> {
+    narrow
+        .map(|filter| {
+            filter
+                .terms
+                .iter()
+                .map(|term| SqlValue::Text(term.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn select_rerender_entries(
     db: &Connection,
     max_entries: Option<usize>,
-    narrow: Option<&str>,
+    narrow: Option<&NarrowFilter>,
 ) -> rusqlite::Result<Vec<Entry>> {
+    let condition = narrow_condition_sql(narrow);
     if let Some(limit) = max_entries {
-        let sql = if narrow.is_some() {
+        let mut sql = String::from(
             "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
              FROM (
                SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
-               FROM log_entry
-               WHERE instr(lower(json), ?) > 0
-               ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 0 ELSE 1 END,
-                        timestamp_epoch DESC, id DESC LIMIT ?
-             )
-             ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, timestamp_epoch, id"
-        } else {
-            "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
-             FROM (
-               SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
-               FROM log_entry
-               ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 0 ELSE 1 END,
-                        timestamp_epoch DESC, id DESC LIMIT ?
-             )
-             ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, timestamp_epoch, id"
-        };
-        if let Some(needle) = narrow {
-            rows_to_entries(
-                db.prepare(sql)?
-                    .query_map(params![needle, limit as i64], row_to_entry)?,
-            )
-        } else {
-            rows_to_entries(
-                db.prepare(sql)?
-                    .query_map(params![limit as i64], row_to_entry)?,
-            )
+               FROM log_entry ",
+        );
+        if let Some(condition) = condition {
+            sql.push_str("WHERE ");
+            sql.push_str(&condition);
+            sql.push(' ');
         }
+        sql.push_str(
+            "ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 0 ELSE 1 END,
+                     timestamp_epoch DESC, id DESC LIMIT ?
+             )
+             ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, timestamp_epoch, id",
+        );
+        let mut values = narrow_sql_params(narrow);
+        values.push(SqlValue::Integer(limit as i64));
+        rows_to_entries(
+            db.prepare(&sql)?
+                .query_map(params_from_iter(values), row_to_entry)?,
+        )
     } else {
-        let sql = if narrow.is_some() {
+        let mut sql = String::from(
             "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
-             FROM log_entry
-             WHERE instr(lower(json), ?) > 0
-             ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, timestamp_epoch, id"
-        } else {
-            "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
-             FROM log_entry
-             ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, timestamp_epoch, id"
-        };
-        if let Some(needle) = narrow {
-            rows_to_entries(db.prepare(sql)?.query_map(params![needle], row_to_entry)?)
-        } else {
-            rows_to_entries(db.prepare(sql)?.query_map([], row_to_entry)?)
+             FROM log_entry ",
+        );
+        if let Some(condition) = condition {
+            sql.push_str("WHERE ");
+            sql.push_str(&condition);
+            sql.push(' ');
         }
+        sql.push_str(
+            "ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, timestamp_epoch, id",
+        );
+        rows_to_entries(
+            db.prepare(&sql)?
+                .query_map(params_from_iter(narrow_sql_params(narrow)), row_to_entry)?,
+        )
     }
 }
 
@@ -971,43 +1070,31 @@ fn select_entries_before(
     db: &Connection,
     timestamp: f64,
     limit: usize,
-    narrow: Option<&str>,
+    narrow: Option<&NarrowFilter>,
     boundary_id: Option<i64>,
 ) -> rusqlite::Result<Vec<Entry>> {
-    let sql = if narrow.is_some() {
+    let mut sql = String::from(
         "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
          FROM log_entry
-         WHERE instr(lower(json), ?) > 0
-           AND (timestamp_epoch < ? OR (timestamp_epoch = ? AND id < ?))
-         ORDER BY timestamp_epoch DESC, id DESC LIMIT ?"
-    } else {
-        "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
-         FROM log_entry
-         WHERE timestamp_epoch < ? OR (timestamp_epoch = ? AND id < ?)
-         ORDER BY timestamp_epoch DESC, id DESC LIMIT ?"
-    };
-    let mut entries = if let Some(needle) = narrow {
-        rows_to_entries(db.prepare(sql)?.query_map(
-            params![
-                needle,
-                timestamp,
-                timestamp,
-                boundary_id.unwrap_or(i64::MAX),
-                limit as i64
-            ],
-            row_to_entry,
-        )?)?
-    } else {
-        rows_to_entries(db.prepare(sql)?.query_map(
-            params![
-                timestamp,
-                timestamp,
-                boundary_id.unwrap_or(i64::MAX),
-                limit as i64
-            ],
-            row_to_entry,
-        )?)?
-    };
+         WHERE (timestamp_epoch < ? OR (timestamp_epoch = ? AND id < ?)) ",
+    );
+    let mut values = vec![
+        SqlValue::Real(timestamp),
+        SqlValue::Real(timestamp),
+        SqlValue::Integer(boundary_id.unwrap_or(i64::MAX)),
+    ];
+    if let Some(condition) = narrow_condition_sql(narrow) {
+        sql.push_str("AND (");
+        sql.push_str(&condition);
+        sql.push_str(") ");
+        values.extend(narrow_sql_params(narrow));
+    }
+    sql.push_str("ORDER BY timestamp_epoch DESC, id DESC LIMIT ?");
+    values.push(SqlValue::Integer(limit as i64));
+    let mut entries = rows_to_entries(
+        db.prepare(&sql)?
+            .query_map(params_from_iter(values), row_to_entry)?,
+    )?;
     entries.reverse();
     Ok(entries)
 }
@@ -1016,38 +1103,31 @@ fn select_entries_after(
     db: &Connection,
     timestamp: f64,
     limit: usize,
-    narrow: Option<&str>,
+    narrow: Option<&NarrowFilter>,
     boundary_id: Option<i64>,
 ) -> rusqlite::Result<Vec<Entry>> {
-    let sql = if narrow.is_some() {
+    let mut sql = String::from(
         "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
          FROM log_entry
-         WHERE instr(lower(json), ?) > 0
-           AND (timestamp_epoch > ? OR (timestamp_epoch = ? AND id > ?))
-         ORDER BY timestamp_epoch ASC, id ASC LIMIT ?"
-    } else {
-        "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
-         FROM log_entry
-         WHERE timestamp_epoch > ? OR (timestamp_epoch = ? AND id > ?)
-         ORDER BY timestamp_epoch ASC, id ASC LIMIT ?"
-    };
-    if let Some(needle) = narrow {
-        rows_to_entries(db.prepare(sql)?.query_map(
-            params![
-                needle,
-                timestamp,
-                timestamp,
-                boundary_id.unwrap_or(0),
-                limit as i64
-            ],
-            row_to_entry,
-        )?)
-    } else {
-        rows_to_entries(db.prepare(sql)?.query_map(
-            params![timestamp, timestamp, boundary_id.unwrap_or(0), limit as i64],
-            row_to_entry,
-        )?)
+         WHERE (timestamp_epoch > ? OR (timestamp_epoch = ? AND id > ?)) ",
+    );
+    let mut values = vec![
+        SqlValue::Real(timestamp),
+        SqlValue::Real(timestamp),
+        SqlValue::Integer(boundary_id.unwrap_or(0)),
+    ];
+    if let Some(condition) = narrow_condition_sql(narrow) {
+        sql.push_str("AND (");
+        sql.push_str(&condition);
+        sql.push_str(") ");
+        values.extend(narrow_sql_params(narrow));
     }
+    sql.push_str("ORDER BY timestamp_epoch ASC, id ASC LIMIT ?");
+    values.push(SqlValue::Integer(limit as i64));
+    rows_to_entries(
+        db.prepare(&sql)?
+            .query_map(params_from_iter(values), row_to_entry)?,
+    )
 }
 
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {

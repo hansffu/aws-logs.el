@@ -19,6 +19,7 @@
     ("zj" . "load newer")
     ("zt" . "window at time")
     ("zn" . "narrow")
+    ("zN" . "narrow menu")
     ("zw" . "widen")
     ("?" . "show info")
     ("zf" . "toggle follow")))
@@ -39,6 +40,7 @@ Safe to call multiple times."
       (kbd "zj") #'json-log-viewer-slide-window-newer
       (kbd "zt") #'json-log-viewer-window-at-time
       (kbd "zn") #'json-log-viewer-narrow
+      (kbd "zN") #'json-log-viewer-narrow-menu
       (kbd "zw") #'json-log-viewer-widen
       (kbd "zf") #'json-log-viewer-toggle-auto-follow))
   (setq json-log-viewer--keybindings-function #'json-log-viewer--evil-popup-keybindings)

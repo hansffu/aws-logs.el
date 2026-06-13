@@ -175,32 +175,78 @@ Returned rows are ascending plists of shape
    (vector timestamp-epoch timestamp source level-path message-path extra-paths json-text))
   (car (car (sqlite-select db "SELECT last_insert_rowid()"))))
 
+(defun json-log-viewer-repository--normalize-narrow-string (needle)
+  "Normalize NEEDLE into a downcased substring filter, or nil."
+  (let ((normalized (string-trim (or needle ""))))
+    (unless (string-empty-p normalized)
+      (downcase normalized))))
+
+(defun json-log-viewer-repository--normalize-narrow-operator (operator)
+  "Normalize OPERATOR into `and' or `or'."
+  (cond
+   ((memq operator '(and or)) operator)
+   ((and (stringp operator) (string-equal (downcase operator) "or")) 'or)
+   (t 'and)))
+
+(defun json-log-viewer-repository--narrow-filter (narrow)
+  "Return normalized narrow filter plist from NARROW."
+  (cond
+   ((null narrow) nil)
+   ((stringp narrow)
+    (when-let ((term (json-log-viewer-repository--normalize-narrow-string narrow)))
+      (list :terms (list term) :operator 'and)))
+   ((listp narrow)
+    (let (terms)
+      (dolist (term (plist-get narrow :terms))
+        (when-let ((normalized
+                    (json-log-viewer-repository--normalize-narrow-string term)))
+          (push normalized terms)))
+      (when terms
+        (list :terms (nreverse terms)
+              :operator (json-log-viewer-repository--normalize-narrow-operator
+                         (plist-get narrow :operator))))))))
+
+(defun json-log-viewer-repository--narrow-condition (narrow)
+  "Return SQL condition for NARROW, without WHERE or AND."
+  (when-let ((filter (json-log-viewer-repository--narrow-filter narrow)))
+    (let ((joiner (if (eq (plist-get filter :operator) 'or) " OR " " AND ")))
+      (mapconcat (lambda (_term) "instr(lower(json), ?) > 0")
+                 (plist-get filter :terms)
+                 joiner))))
+
+(defun json-log-viewer-repository--narrow-params (narrow)
+  "Return vector of SQL parameters for NARROW."
+  (vconcat
+   (or (plist-get (json-log-viewer-repository--narrow-filter narrow) :terms)
+       nil)))
+
+(defun json-log-viewer-repository--select (db sql params)
+  "Run sqlite SELECT SQL with optional PARAMS."
+  (if (> (length params) 0)
+      (sqlite-select db sql params)
+    (sqlite-select db sql)))
+
 (defun json-log-viewer-repository-select-summary-entries (db &optional narrow-string)
   "Return summary row plists from DB, optionally filtered by NARROW-STRING."
-  (mapcar
-   (lambda (row)
-     (list :id (nth 0 row)
-           :sort-key (nth 1 row)
-           :timestamp (nth 2 row)
-           :source (nth 3 row)
-           :level-path (nth 4 row)
-           :message-path (nth 5 row)
-           :extra-paths (nth 6 row)))
-   (if narrow-string
-       (sqlite-select
-        db
-       (concat
-        "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths "
-        "FROM log_entry "
-        "WHERE instr(lower(json), ?) > 0 "
-         "ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, timestamp_epoch, id")
-        (vector narrow-string))
-     (sqlite-select
+  (let ((condition (json-log-viewer-repository--narrow-condition narrow-string))
+        (params (json-log-viewer-repository--narrow-params narrow-string)))
+    (mapcar
+     (lambda (row)
+       (list :id (nth 0 row)
+             :sort-key (nth 1 row)
+             :timestamp (nth 2 row)
+             :source (nth 3 row)
+             :level-path (nth 4 row)
+             :message-path (nth 5 row)
+             :extra-paths (nth 6 row)))
+     (json-log-viewer-repository--select
       db
       (concat
        "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths "
        "FROM log_entry "
-       "ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, timestamp_epoch, id")))))
+       (if condition (concat "WHERE " condition " ") "")
+       "ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, timestamp_epoch, id")
+      params))))
 
 (defun json-log-viewer-repository-select-summary-entry-by-id (db entry-id)
   "Return summary row plist for ENTRY-ID from DB."
@@ -226,33 +272,23 @@ Returned rows are ascending plists of shape
 When NARROW-STRING is non-nil, only matching rows are returned."
   ;; Inner query selects the newest LIMIT rows (DESC); outer re-orders them
   ;; ascending for display.  NULL timestamps sort last in display order.
-  (let ((rows
-         (if narrow-string
-             (sqlite-select
-              db
-              (concat
-               "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths "
-               "FROM ("
-               "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths "
-               "FROM log_entry "
-               "WHERE instr(lower(json), ?) > 0 "
-               "ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 0 ELSE 1 END, "
-               "timestamp_epoch DESC, id DESC LIMIT ?"
-               ") ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, "
-               "timestamp_epoch, id")
-              (vector narrow-string limit))
-           (sqlite-select
-            db
-            (concat
-             "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths "
-             "FROM ("
-             "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths "
-             "FROM log_entry "
-             "ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 0 ELSE 1 END, "
-             "timestamp_epoch DESC, id DESC LIMIT ?"
-             ") ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, "
-             "timestamp_epoch, id")
-            (vector limit)))))
+  (let* ((condition (json-log-viewer-repository--narrow-condition narrow-string))
+         (params (vconcat (json-log-viewer-repository--narrow-params narrow-string)
+                          (vector limit)))
+         (rows
+          (json-log-viewer-repository--select
+           db
+           (concat
+            "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths "
+            "FROM ("
+            "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths "
+            "FROM log_entry "
+            (if condition (concat "WHERE " condition " ") "")
+            "ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 0 ELSE 1 END, "
+            "timestamp_epoch DESC, id DESC LIMIT ?"
+            ") ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, "
+            "timestamp_epoch, id")
+           params)))
     (mapcar
      (lambda (row)
        (list :id (nth 0 row)
@@ -271,12 +307,14 @@ When NARROW-STRING is non-nil, only matching rows are returned."
 Rows are ordered ascending by timestamp/id. When BOUNDARY-ID is non-nil,
 it is used as a fallback for rows with NULL timestamps."
   (let* ((boundary-id (or boundary-id 0))
+         (condition (json-log-viewer-repository--narrow-condition narrow-string))
+         (filter-params (json-log-viewer-repository--narrow-params narrow-string))
          (where-clause
           (concat
            "WHERE (timestamp_epoch < ? "
            "OR (timestamp_epoch = ? AND id < ?) "
            "OR (timestamp_epoch IS NULL AND id < ?)) "
-           (if narrow-string "AND instr(lower(json), ?) > 0 " "")))
+           (if condition (concat "AND (" condition ") ") "")))
          (select
           (concat
            "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths "
@@ -302,9 +340,9 @@ it is used as a fallback for rows with NULL timestamps."
            "timestamp_epoch DESC, id DESC LIMIT ?"
            ") ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, "
            "timestamp_epoch, id")
-          (if narrow-string
-              (vector timestamp timestamp boundary-id boundary-id narrow-string limit)
-            (vector timestamp timestamp boundary-id boundary-id limit)))
+          (vconcat (vector timestamp timestamp boundary-id boundary-id)
+                   filter-params
+                   (vector limit)))
        (sqlite-select
         db
         (concat
@@ -312,9 +350,8 @@ it is used as a fallback for rows with NULL timestamps."
          where-clause
          "ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, "
          "timestamp_epoch, id")
-        (if narrow-string
-            (vector timestamp timestamp boundary-id boundary-id narrow-string)
-          (vector timestamp timestamp boundary-id boundary-id)))))))
+        (vconcat (vector timestamp timestamp boundary-id boundary-id)
+                 filter-params))))))
 
 (defun json-log-viewer-repository-select-summary-after
     (db timestamp limit &optional narrow-string boundary-id)
@@ -323,12 +360,14 @@ it is used as a fallback for rows with NULL timestamps."
 Rows are ordered ascending by timestamp/id. When BOUNDARY-ID is non-nil,
 it is used as a fallback for rows with NULL timestamps."
   (let* ((boundary-id (or boundary-id 0))
+         (condition (json-log-viewer-repository--narrow-condition narrow-string))
+         (filter-params (json-log-viewer-repository--narrow-params narrow-string))
          (where-clause
           (concat
            "WHERE (timestamp_epoch > ? "
            "OR (timestamp_epoch = ? AND id > ?) "
            "OR (timestamp_epoch IS NULL AND id > ?)) "
-           (if narrow-string "AND instr(lower(json), ?) > 0 " "")))
+           (if condition (concat "AND (" condition ") ") "")))
          (select
           (concat
            "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths "
@@ -350,13 +389,11 @@ it is used as a fallback for rows with NULL timestamps."
        "ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, "
        "timestamp_epoch, id"
        (if (and (integerp limit) (> limit 0)) " LIMIT ?" ""))
-      (if narrow-string
-          (if (and (integerp limit) (> limit 0))
-              (vector timestamp timestamp boundary-id boundary-id narrow-string limit)
-            (vector timestamp timestamp boundary-id boundary-id narrow-string))
-        (if (and (integerp limit) (> limit 0))
-            (vector timestamp timestamp boundary-id boundary-id limit)
-          (vector timestamp timestamp boundary-id boundary-id)))))))
+      (vconcat (vector timestamp timestamp boundary-id boundary-id)
+               filter-params
+               (if (and (integerp limit) (> limit 0))
+                   (vector limit)
+                 []))))))
 
 (defun json-log-viewer-repository-reset-log-entries (db)
   "Delete all log rows in DB."

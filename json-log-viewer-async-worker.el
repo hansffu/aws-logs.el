@@ -32,6 +32,31 @@
     (unless (string-empty-p normalized)
       (downcase normalized))))
 
+(defun json-log-viewer-async-worker--normalize-narrow-operator (operator)
+  "Normalize OPERATOR into `and' or `or'."
+  (cond
+   ((memq operator '(and or)) operator)
+   ((and (stringp operator) (string-equal (downcase operator) "or")) 'or)
+   (t 'and)))
+
+(defun json-log-viewer-async-worker--normalize-narrow-filter (filter)
+  "Normalize FILTER into a plist with :terms and :operator."
+  (cond
+   ((null filter) nil)
+   ((stringp filter)
+    (when-let ((term (json-log-viewer-async-worker--normalize-narrow-string filter)))
+      (list :terms (list term) :operator 'and)))
+   ((listp filter)
+    (let (terms)
+      (dolist (term (plist-get filter :terms))
+        (when-let ((normalized
+                    (json-log-viewer-async-worker--normalize-narrow-string term)))
+          (push normalized terms)))
+      (when terms
+        (list :terms (nreverse terms)
+              :operator (json-log-viewer-async-worker--normalize-narrow-operator
+                         (plist-get filter :operator))))))))
+
 (defun json-log-viewer-async-worker--parse-time (value)
   "Return epoch seconds parsed from VALUE, or nil."
   (when (and (stringp value) (not (string-empty-p value)))
@@ -256,15 +281,23 @@
       nil
     (split-string csv "," t)))
 
-(defun json-log-viewer-async-worker--json-matches-narrow-p (json-text narrow-string)
-  "Return non-nil when JSON-TEXT contains NARROW-STRING."
-  (or (null narrow-string)
-      (and (stringp json-text)
-           (string-match-p (regexp-quote narrow-string)
-                           (downcase json-text)))))
+(defun json-log-viewer-async-worker--json-matches-narrow-p (json-text narrow-filter)
+  "Return non-nil when JSON-TEXT matches NARROW-FILTER."
+  (let ((filter (json-log-viewer-async-worker--normalize-narrow-filter narrow-filter)))
+    (or (null filter)
+        (let ((text (and (stringp json-text) (downcase json-text)))
+              (terms (plist-get filter :terms)))
+          (and text
+               (if (eq (plist-get filter :operator) 'or)
+                   (cl-some (lambda (term)
+                              (string-match-p (regexp-quote term) text))
+                            terms)
+                 (cl-every (lambda (term)
+                             (string-match-p (regexp-quote term) text))
+                           terms)))))))
 
-(defun json-log-viewer-async-worker--sqlite-insert-log-entry (db line config &optional narrow-string)
-  "Insert one LINE into DB and return summary plist when it matches NARROW-STRING."
+(defun json-log-viewer-async-worker--sqlite-insert-log-entry (db line config &optional narrow-filter)
+  "Insert one LINE into DB and return summary plist when it matches NARROW-FILTER."
   (let* ((summary (json-log-viewer-async-worker--line->summary line config))
          (parsed (plist-get summary :parsed))
          (timestamp-text (plist-get summary :timestamp))
@@ -284,7 +317,7 @@
                message-path
                extra-paths
                storage-json)))
-      (when (json-log-viewer-async-worker--json-matches-narrow-p storage-json narrow-string)
+      (when (json-log-viewer-async-worker--json-matches-narrow-p storage-json narrow-filter)
         (json-log-viewer-async-worker--stored-row->entry
          (json-log-viewer-repository-select-summary-entry-by-id db id))))))
 
@@ -364,6 +397,9 @@
 (defvar json-log-viewer-async-worker--render-narrow-string nil
   "Worker-local active narrow string, or nil when rendering all entries.")
 
+(defvar json-log-viewer-async-worker--render-narrow-filter nil
+  "Worker-local active narrow filter plist, or nil when rendering all entries.")
+
 (defvar json-log-viewer-async-worker--publish-mode 'live
   "Worker-local publish mode: `live' or `on-demand'.")
 
@@ -373,8 +409,9 @@
 
 (defun json-log-viewer-async-worker--publish-rerender-chunks ()
   "Publish clear/render commands for current worker render mode."
-  (let ((narrow-string (and (eq json-log-viewer-async-worker--render-mode 'narrow)
-                            json-log-viewer-async-worker--render-narrow-string))
+  (let ((narrow-filter (and (eq json-log-viewer-async-worker--render-mode 'narrow)
+                            (or json-log-viewer-async-worker--render-narrow-filter
+                                json-log-viewer-async-worker--render-narrow-string)))
         (chunk-size (max 1 (or json-log-viewer-async-worker--rebuild-chunk-size 1)))
         (entry-limit (and (integerp json-log-viewer-async-worker--max-entries)
                           (> json-log-viewer-async-worker--max-entries 0)
@@ -384,11 +421,11 @@
                          (json-log-viewer-async-worker--sqlite-select-entries-tail
                           json-log-viewer-async-worker--db
                           entry-limit
-                          narrow-string)
+                          narrow-filter)
                        (json-log-viewer-async-worker--sqlite-select-entries
                         json-log-viewer-async-worker--db
                         nil
-                        narrow-string))))
+                        narrow-filter))))
       (while remaining
         (let ((batch nil)
               (count 0))
@@ -413,6 +450,7 @@
                    1)))
   (setq json-log-viewer-async-worker--render-mode 'all)
   (setq json-log-viewer-async-worker--render-narrow-string nil)
+  (setq json-log-viewer-async-worker--render-narrow-filter nil)
   (setq json-log-viewer-async-worker--publish-mode 'live)
   (let* ((file (make-temp-file "json-log-viewer-worker-" nil ".sqlite"))
          (db (sqlite-open file)))
@@ -432,6 +470,7 @@
   (setq json-log-viewer-async-worker--sqlite-file nil)
   (setq json-log-viewer-async-worker--render-mode 'all)
   (setq json-log-viewer-async-worker--render-narrow-string nil)
+  (setq json-log-viewer-async-worker--render-narrow-filter nil)
   (setq json-log-viewer-async-worker--publish-mode 'live))
 
 (defun json-log-viewer-async-worker--ensure-storage ()
@@ -469,13 +508,18 @@
          (request-id (plist-get job :request-id))
          (config (json-log-viewer-async-worker--config-from-job job))
          (narrow-string (json-log-viewer-async-worker--normalize-narrow-string
-                         (plist-get job :narrow-string))))
+                         (plist-get job :narrow-string)))
+         (narrow-filter (or (json-log-viewer-async-worker--normalize-narrow-filter
+                             (plist-get job :narrow-filter))
+                            (json-log-viewer-async-worker--normalize-narrow-filter
+                             narrow-string))))
     (json-log-viewer-async-worker--ensure-storage)
     (pcase op
       ('reset
        (setq json-log-viewer-async-worker--publish-mode 'live)
        (setq json-log-viewer-async-worker--render-mode 'all)
        (setq json-log-viewer-async-worker--render-narrow-string nil)
+       (setq json-log-viewer-async-worker--render-narrow-filter nil)
        (json-log-viewer-repository-reset-log-entries
         json-log-viewer-async-worker--db)
        (json-log-viewer-async-worker--publish-cmd 'clear)
@@ -490,26 +534,30 @@
                       line
                       config
                       (and (eq json-log-viewer-async-worker--render-mode 'narrow)
-                           json-log-viewer-async-worker--render-narrow-string)))
+                           (or json-log-viewer-async-worker--render-narrow-filter
+                               json-log-viewer-async-worker--render-narrow-string))))
          (when (and entry
                     (eq json-log-viewer-async-worker--publish-mode 'live))
            (json-log-viewer-async-worker--publish-cmd 'render-entries :entries (list entry)))
          nil))
       ('narrow
-       (unless narrow-string
-         (error "Log-ingestor narrow op requires :narrow-string"))
+       (unless narrow-filter
+         (error "Log-ingestor narrow op requires :narrow-string or :narrow-filter"))
        (setq json-log-viewer-async-worker--render-mode 'narrow)
        (setq json-log-viewer-async-worker--render-narrow-string narrow-string)
+       (setq json-log-viewer-async-worker--render-narrow-filter narrow-filter)
        (json-log-viewer-async-worker--publish-rerender-chunks)
        nil)
       ('rerender
        (setq json-log-viewer-async-worker--publish-mode 'live)
-       (if narrow-string
+       (if narrow-filter
            (progn
              (setq json-log-viewer-async-worker--render-mode 'narrow)
-             (setq json-log-viewer-async-worker--render-narrow-string narrow-string))
+             (setq json-log-viewer-async-worker--render-narrow-string narrow-string)
+             (setq json-log-viewer-async-worker--render-narrow-filter narrow-filter))
          (setq json-log-viewer-async-worker--render-mode 'all)
-         (setq json-log-viewer-async-worker--render-narrow-string nil))
+         (setq json-log-viewer-async-worker--render-narrow-string nil)
+         (setq json-log-viewer-async-worker--render-narrow-filter nil))
        (json-log-viewer-async-worker--publish-rerender-chunks)
        nil)
       ('load-more
@@ -520,7 +568,8 @@
               (boundary-id (plist-get job :entry-id))
               (prepend (plist-get job :prepend))
               (active-narrow (and (eq json-log-viewer-async-worker--render-mode 'narrow)
-                                  json-log-viewer-async-worker--render-narrow-string))
+                                  (or json-log-viewer-async-worker--render-narrow-filter
+                                      json-log-viewer-async-worker--render-narrow-string)))
               (chunk-size (max 1 (or json-log-viewer-async-worker--chunk-size 1))))
          (unless (and (integerp limit) (> limit 0))
            (error "load-more op requires positive integer :limit, got: %S" limit))

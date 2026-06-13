@@ -588,6 +588,56 @@
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
+(ert-deftest json-log-viewer-narrow-multiple-and-or-replays-matches-test ()
+  (let* ((buf (aws-logs-core-test--make-viewer
+               "*json-log-viewer-multi-narrow-test*"
+               '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"level\":\"info\",\"msg\":\"alpha beta\"}"
+                 "{\"timestamp\":\"2026-01-01T00:00:01Z\",\"level\":\"info\",\"msg\":\"alpha only\"}"
+                 "{\"timestamp\":\"2026-01-01T00:00:02Z\",\"level\":\"info\",\"msg\":\"beta only\"}"
+                 "{\"timestamp\":\"2026-01-01T00:00:03Z\",\"level\":\"info\",\"msg\":\"gamma\"}")
+               :timestamp-path "timestamp"
+               :level-path "level"
+               :message-path "msg")))
+    (unwind-protect
+        (with-current-buffer buf
+          (setq json-log-viewer--filter-string nil)
+          (setq json-log-viewer--filter-terms '("alpha" "beta"))
+          (setq json-log-viewer--filter-operator 'and)
+          (json-log-viewer--request-rerender 'narrow nil t)
+          (should (= json-log-viewer--entry-count 1))
+          (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+            (should (string-match-p "alpha beta" text))
+            (should-not (string-match-p "alpha only" text))
+            (should-not (string-match-p "beta only" text))
+            (should-not (string-match-p "gamma" text)))
+          (json-log-viewer-push
+           buf
+           '("{\"timestamp\":\"2026-01-01T00:00:04Z\",\"level\":\"info\",\"msg\":\"alpha beta live\"}"
+             "{\"timestamp\":\"2026-01-01T00:00:05Z\",\"level\":\"info\",\"msg\":\"alpha live\"}"))
+          (should (= json-log-viewer--entry-count 2))
+          (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+            (should (string-match-p "alpha beta live" text))
+            (should-not (string-match-p "alpha live" text)))
+          (setq json-log-viewer--filter-string nil)
+          (setq json-log-viewer--filter-terms '("alpha" "gamma"))
+          (setq json-log-viewer--filter-operator 'or)
+          (json-log-viewer--request-rerender 'narrow nil t)
+          (should (= json-log-viewer--entry-count 5))
+          (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+            (should (string-match-p "alpha beta" text))
+            (should (string-match-p "alpha only" text))
+            (should (string-match-p "gamma" text))
+            (should (string-match-p "alpha live" text))
+            (should-not (string-match-p "beta only" text)))
+          (setq json-log-viewer--filter-string "gamma")
+          (setq json-log-viewer--filter-terms nil)
+          (json-log-viewer--request-rerender 'narrow "gamma" t)
+          (should (= json-log-viewer--entry-count 1))
+          (should (string-match-p "Narrow: \"gamma\""
+                                  (json-log-viewer--header-line-string))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
 (ert-deftest json-log-viewer-widen-replays-all-stored-json-rows-test ()
   (let* ((buf (aws-logs-core-test--make-viewer
                "*json-log-viewer-widen-replay-test*"
