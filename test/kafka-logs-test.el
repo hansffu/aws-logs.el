@@ -473,6 +473,173 @@
       (when (buffer-live-p viewer)
         (kill-buffer viewer)))))
 
+(ert-deftest kafka-logs-stream-to-buffer-uses-source-payload-format-test ()
+  (let* ((viewer (generate-new-buffer "*kafka-logs-composite-source-format-test*"))
+         (kafka-logs-connections '(("prod" :brokers "localhost:9092")))
+         (kafka-logs-kcat "kcat")
+         wrapper-command)
+    (unwind-protect
+        (progn
+          (with-current-buffer viewer
+            (composite-log-viewer-mode)
+            (setq-local kafka-logs--viewer-payload-format nil))
+          (cl-letf (((symbol-function 'kafka-logs--consume-args)
+                     (lambda () '("-b" "localhost:9092" "-t" "orders")))
+                    ((symbol-function 'kafka-logs--command-with-filter)
+                     (lambda (args &optional _line-buffered)
+                       (cons "kcat" args)))
+                    ((symbol-function 'json-log-viewer-run-when-ready)
+                     (lambda (buffer function)
+                       (with-current-buffer buffer
+                         (funcall function))))
+                    ((symbol-function 'json-log-viewer-worker-socket-path)
+                     (lambda (&optional _buffer) "/tmp/kafka-test.sock"))
+                    ((symbol-function 'make-process)
+                     (lambda (&rest args)
+                       (setq wrapper-command (plist-get args :command))
+                       :fake-process))
+                    ((symbol-function 'set-process-sentinel) #'ignore)
+                    ((symbol-function 'set-process-query-on-exit-flag) #'ignore)
+                    ((symbol-function 'kafka-logs--add-buffer-process) #'ignore)
+                    ((symbol-function 'message) #'ignore))
+            (kafka-logs-stream-to-buffer
+             viewer
+             '(:connection "prod"
+               :topic "orders"
+               :value-format json
+               :payload-format json
+               :message-path "payload.type"
+               :extra-paths ("topic" "key" "payload.type")
+               :json-paths ("payload")))
+            (should (member "--payload-format" wrapper-command))
+            (should (equal (cadr (member "--payload-format" wrapper-command))
+                           "json"))
+            (should-not (member "--source" wrapper-command))
+            (should (equal (cadr (member "--source-id" wrapper-command))
+                           "kafka:prod/orders"))))
+      (when (buffer-live-p viewer)
+        (kill-buffer viewer)))))
+
+(ert-deftest kafka-logs-stream-to-buffer-disambiguates-duplicate-source-id-test ()
+  (let* ((viewer (generate-new-buffer "*kafka-logs-composite-source-id-test*"))
+         (kafka-logs-connections '(("prod" :brokers "localhost:9092")))
+         (kafka-logs-kcat "kcat")
+         commands)
+    (unwind-protect
+        (progn
+          (with-current-buffer viewer
+            (composite-log-viewer-mode))
+          (cl-letf (((symbol-function 'kafka-logs--consume-args)
+                     (lambda () '("-b" "localhost:9092" "-t" "orders")))
+                    ((symbol-function 'kafka-logs--command-with-filter)
+                     (lambda (args &optional _line-buffered)
+                       (cons "kcat" args)))
+                    ((symbol-function 'json-log-viewer-run-when-ready)
+                     (lambda (buffer function)
+                       (with-current-buffer buffer
+                         (funcall function))))
+                    ((symbol-function 'json-log-viewer-worker-socket-path)
+                     (lambda (&optional _buffer) "/tmp/kafka-test.sock"))
+                    ((symbol-function 'make-process)
+                     (lambda (&rest args)
+                       (push (plist-get args :command) commands)
+                       :fake-process))
+                    ((symbol-function 'set-process-sentinel) #'ignore)
+                    ((symbol-function 'set-process-query-on-exit-flag) #'ignore)
+                    ((symbol-function 'kafka-logs--add-buffer-process) #'ignore)
+                    ((symbol-function 'message) #'ignore))
+            (kafka-logs-stream-to-buffer
+             viewer
+             '(:connection "prod"
+               :topic "orders"
+               :value-format json
+               :payload-format json
+               :message-path "payload.type"))
+            (kafka-logs-stream-to-buffer
+             viewer
+             '(:connection "prod"
+               :topic "orders"
+               :value-format json
+               :payload-format json
+               :message-path "payload")))
+          (setq commands (nreverse commands))
+          (should (equal (cadr (member "--source-id" (nth 0 commands)))
+                         "kafka:prod/orders"))
+          (should (equal (cadr (member "--source-id" (nth 1 commands)))
+                         "kafka:prod/orders#2"))
+          (with-current-buffer viewer
+            (should (equal
+                     (plist-get
+                      (gethash "kafka:prod/orders" json-log-viewer--source-configs)
+                      :message-path)
+                     "payload.type"))
+            (should (equal
+                     (plist-get
+                      (gethash "kafka:prod/orders#2" json-log-viewer--source-configs)
+                      :message-path)
+                     "payload"))))
+      (when (buffer-live-p viewer)
+        (kill-buffer viewer)))))
+
+(ert-deftest kafka-logs-composite-real-worker-uses-per-topic-message-path-test ()
+  (let* ((viewer (json-log-viewer-make-buffer
+                  "*kafka-logs-composite-real-worker-test*"
+                  :timestamp-path "timestamp"
+                  :level-path "level"
+                  :message-path "message"
+                  :mode #'composite-log-viewer-mode))
+         (kafka-logs-connections '(("cluster-a" :brokers "localhost:9092")))
+         (line-a (json-serialize
+                  '(:topic "topic-a"
+                    :ts 1781447361217
+                    :key "record-key"
+                    :payload "{\"type\":\"ExampleEvent\",\"requestId\":\"request-2\"}")))
+         (line-b (json-serialize
+                  '(:topic "topic-b"
+                    :ts 1781447361218
+                    :key "record-key"
+                    :payload "{\"message\":\"payload message\"}")))
+         (call 0))
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'kafka-logs--consume-args)
+                     (lambda () nil))
+                    ((symbol-function 'kafka-logs--command-with-filter)
+                     (lambda (_args &optional _line-buffered)
+                       (setq call (1+ call))
+                       (list "printf" "%s\n" (if (= call 1) line-a line-b))))
+                    ((symbol-function 'message) #'ignore))
+            (kafka-logs-stream-to-buffer
+             viewer
+             '(:connection "cluster-a"
+               :topic "topic-a"
+               :value-format json
+               :payload-format json
+               :json-paths ("payload")
+               :message-path "payload.type"
+               :extra-paths ("topic" "key" "payload.type")))
+            (kafka-logs-stream-to-buffer
+             viewer
+             '(:connection "cluster-a"
+               :topic "topic-b"
+               :value-format json
+               :payload-format json
+               :message-path "payload"
+               :extra-paths ("topic" "key"))))
+          (dotimes (_ 20)
+            (accept-process-output nil 0.05))
+          (with-current-buffer viewer
+            (json-log-viewer--await-pull-complete)
+            (let ((summary (buffer-substring-no-properties (point-min) (point-max))))
+              (should (string-match-p
+                       "\\[topic-a\\].*\\[record-key\\].*\\[ExampleEvent\\] ExampleEvent"
+                       summary))
+              (should (string-match-p
+                       "\\[topic-b\\].*\\[record-key\\].*{\"message\":\"payload message\"}"
+                       summary)))))
+      (when (buffer-live-p viewer)
+        (kill-buffer viewer)))))
+
 (ert-deftest kafka-logs-transient-viewer-buffer-follows-current-composite-test ()
   (let ((viewer (generate-new-buffer "*kafka-logs-composite-current-test*"))
         (kafka-logs-viewer-buffer "stale"))

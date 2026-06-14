@@ -30,6 +30,8 @@
                   (buffer-or-name log-lines &optional preserve-filter))
 (declare-function json-log-viewer-register-source-config "json-log-viewer"
                   (buffer-or-name source &rest args))
+(declare-function json-log-viewer-unique-source-id "json-log-viewer"
+                  (buffer-or-name source &rest args))
 
 (define-derived-mode kube-logs-viewer-mode json-log-viewer-mode "Kube-Logs"
   "Major mode for Kubernetes log buffers rendered with `json-log-viewer`."
@@ -234,6 +236,9 @@ Each element has the form (NAME . PLIST).")
 (defvar-local kube-logs--viewer-target nil
   "Target name displayed in the current viewer buffer header.")
 
+(defvar-local kube-logs--viewer-source-id nil
+  "Source ID used for source-specific rendering in composite buffers.")
+
 (defvar-local kube-logs--viewer-follow nil
   "Follow state displayed in the current viewer buffer header.")
 
@@ -426,6 +431,7 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
          "--namespace" (or kube-logs--viewer-namespace kube-logs-namespace "")
          "--target" (or kube-logs--viewer-target kube-logs-target "")
          "--kind" (or kube-logs--viewer-target-kind kube-logs-target-kind "")
+         "--source-id" (or kube-logs--viewer-source-id "kube")
          "--")
    command))
 
@@ -441,7 +447,8 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
        (user-error "Set a namespace first or disable namespace override with -n"))
      (list "--namespace" kube-logs-namespace))
    (list "--target-kind" kube-logs-target-kind
-         "--target" kube-logs-target)
+         "--target" kube-logs-target
+         "--source-id" (or kube-logs--viewer-source-id "kube"))
    (when kube-logs-tail-lines
      (list "--tail" (number-to-string kube-logs-tail-lines)))
    (when (and kube-logs-since (not (string-empty-p kube-logs-since)))
@@ -564,6 +571,8 @@ When INSTALL-KEYMAP is non-nil, install kube-logs key bindings."
     (setq-local kube-logs--viewer-namespace-enabled kube-logs-namespace-enabled)
     (setq-local kube-logs--viewer-target-kind kube-logs-target-kind)
     (setq-local kube-logs--viewer-target kube-logs-target)
+    (setq-local kube-logs--viewer-source-id
+                (or kube-logs--viewer-source-id "kube"))
     (setq-local kube-logs--viewer-follow kube-logs-follow)
     (setq-local kube-logs--viewer-tail kube-logs-tail-lines)
     (setq-local kube-logs--viewer-since kube-logs-since)))
@@ -589,16 +598,29 @@ When INSTALL-KEYMAP is non-nil, install kube-logs key bindings."
   (and (kube-logs--selected-viewer-buffer-p)
        (json-log-viewer-composite-buffer-p kube-logs-viewer-buffer)))
 
-(defun kube-logs--register-composite-source-config (buffer)
+(defun kube-logs--register-composite-source-config
+    (buffer &optional source-id timestamp-path level-path message-path extra-paths)
   "Register current kube formatting for composite BUFFER."
-  (when (json-log-viewer-composite-buffer-p buffer)
-    (json-log-viewer-register-source-config
-     buffer
-     "kube"
-     :timestamp-path kube-logs-timestamp-path
-     :level-path kube-logs-level-path
-     :message-path kube-logs-message-path
-     :extra-paths kube-logs-extra-paths)))
+  (let ((target (json-log-viewer-get-buffer buffer)))
+    (when (json-log-viewer-composite-buffer-p target)
+      (json-log-viewer-register-source-config
+       target
+       (or source-id
+           (with-current-buffer target kube-logs--viewer-source-id)
+           "kube")
+       :timestamp-path (or timestamp-path kube-logs-timestamp-path)
+       :level-path (or level-path kube-logs-level-path)
+       :message-path (or message-path kube-logs-message-path)
+       :extra-paths (or extra-paths kube-logs-extra-paths)))))
+
+(defun kube-logs--composite-source-id
+    (namespace-enabled namespace target-kind target &optional source-id)
+  "Return source ID for a Kube composite source."
+  (or source-id
+      (format "kube:%s/%s/%s"
+              (kube-logs--namespace-display namespace-enabled namespace)
+              (or target-kind "-")
+              (or target "-"))))
 
 (defun kube-logs--plist-value (plist key default)
   "Return PLIST KEY value, or DEFAULT when KEY is absent."
@@ -620,7 +642,7 @@ When INSTALL-KEYMAP is non-nil, install kube-logs key bindings."
   (kube-logs--reset-buffer-state buffer install-keymap)
   (kube-logs--set-viewer-state buffer))
 
-(defun kube-logs--append-to-viewer-buffer (buffer)
+(defun kube-logs--append-to-viewer-buffer (buffer &optional source-id)
   "Prepare BUFFER for an additional kube source without stopping existing ones."
   (with-current-buffer buffer
     (unless kube-logs--initialized-p
@@ -628,7 +650,8 @@ When INSTALL-KEYMAP is non-nil, install kube-logs key bindings."
       (add-hook 'kill-buffer-hook
                 (lambda ()
                   (kube-logs--kill-buffer-process (current-buffer)))
-                nil t)))
+                nil t))
+    (setq-local kube-logs--viewer-source-id (or source-id "kube")))
   (kube-logs--set-viewer-state buffer))
 
 (defun kube-logs--make-viewer-buffer (&optional on-ready)
@@ -675,6 +698,8 @@ ON-READY is called once the async worker is ready to receive jobs."
 SOURCE is a plist.  Supported keys are:
 
 - `:context': kubectl context, or nil for the kubectl default.
+- `:source-id': optional composite source ID. Defaults to
+  `kube:NAMESPACE/KIND/TARGET'.
 - `:namespace': namespace string.
 - `:namespace-enabled': non-nil to pass `--namespace'.
 - `:target-kind': `pod', `deployment', \"pod\", or \"deployment\".
@@ -689,6 +714,7 @@ The stream always follows from now with `--tail=0' and no `--since'."
   (let* ((viewer (json-log-viewer-get-buffer buffer))
          (context (kube-logs--plist-value
                    source :context kube-logs-default-context))
+         (source-id (kube-logs--plist-value source :source-id nil))
          (namespace (kube-logs--plist-value
                      source :namespace kube-logs-default-namespace))
          (namespace-enabled (kube-logs--plist-value
@@ -743,9 +769,24 @@ The stream always follows from now with `--tail=0' and no `--since'."
     (unless (memq kube-logs-stream-backend '(rust kubectl))
       (user-error ":stream-backend must be rust or kubectl, got: %S"
                   kube-logs-stream-backend))
-    (let ((captured-context kube-logs-context)
+    (let* ((normalized-source-id
+            (kube-logs--composite-source-id
+             kube-logs-namespace-enabled
+             kube-logs-namespace
+             kube-logs-target-kind
+             kube-logs-target
+             source-id))
+           (allocated-source-id
+            (json-log-viewer-unique-source-id
+             viewer normalized-source-id
+             :timestamp-path kube-logs-timestamp-path
+             :level-path kube-logs-level-path
+             :message-path kube-logs-message-path
+             :extra-paths kube-logs-extra-paths))
+           (captured-context kube-logs-context)
           (captured-namespace kube-logs-namespace)
           (captured-namespace-enabled kube-logs-namespace-enabled)
+          (captured-source-id allocated-source-id)
           (captured-target-kind kube-logs-target-kind)
           (captured-target kube-logs-target)
           (captured-filter kube-logs-filter)
@@ -756,8 +797,11 @@ The stream always follows from now with `--tail=0' and no `--since'."
           (captured-message-path kube-logs-message-path)
           (captured-extra-paths kube-logs-extra-paths)
           (description (kube-logs--target-description)))
-      (kube-logs--append-to-viewer-buffer viewer)
-      (kube-logs--register-composite-source-config viewer)
+      (kube-logs--append-to-viewer-buffer viewer allocated-source-id)
+      (kube-logs--register-composite-source-config
+       viewer allocated-source-id
+       kube-logs-timestamp-path kube-logs-level-path
+       kube-logs-message-path kube-logs-extra-paths)
       (json-log-viewer-run-when-ready
        viewer
        (lambda ()
@@ -775,7 +819,8 @@ The stream always follows from now with `--tail=0' and no `--since'."
                (kube-logs-timestamp-path captured-timestamp-path)
                (kube-logs-level-path captured-level-path)
                (kube-logs-message-path captured-message-path)
-               (kube-logs-extra-paths captured-extra-paths))
+               (kube-logs-extra-paths captured-extra-paths)
+               (kube-logs--viewer-source-id captured-source-id))
            (let ((viewer-buffer (current-buffer)))
              (pcase kube-logs-stream-backend
                ('rust
@@ -809,7 +854,8 @@ The stream always follows from now with `--tail=0' and no `--since'."
                        (wrapper-command
                         (let ((kube-logs--viewer-namespace captured-namespace)
                               (kube-logs--viewer-target captured-target)
-                              (kube-logs--viewer-target-kind captured-target-kind))
+                              (kube-logs--viewer-target-kind captured-target-kind)
+                              (kube-logs--viewer-source-id captured-source-id))
                           (kube-logs--wrapper-command socket-path command)))
                        (process
                         (make-process
@@ -858,6 +904,8 @@ The stream always follows from now with `--tail=0' and no `--since'."
         (when timestamp
           (puthash "timestamp" timestamp obj))
         (puthash "source" "kube" obj)
+        (when kube-logs--viewer-source-id
+          (puthash "sourceId" kube-logs--viewer-source-id obj))
         (puthash "raw" without-prefix obj)
         (puthash "namespace" (or kube-logs--viewer-namespace kube-logs-namespace "") obj)
         (puthash "target" (or kube-logs--viewer-target kube-logs-target "") obj)

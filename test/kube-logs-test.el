@@ -98,6 +98,8 @@
                :stream-backend kubectl)))
           (should (member "--tail=0" captured-command))
           (should (member "--follow" captured-command))
+          (should (equal (cadr (member "--source-id" captured-command))
+                         "kube:payments/deployment/payments-api"))
           (should-not (cl-some (lambda (arg)
                                  (string-prefix-p "--since" arg))
                                captured-command)))
@@ -122,6 +124,7 @@
                        "--namespace" "payments"
                        "--target-kind" "deployment"
                        "--target" "payments-api"
+                       "--source-id" "kube"
                        "--tail" "150"
                        "--since" "10m"
                        "--filter" "ERROR|WARN"))))))

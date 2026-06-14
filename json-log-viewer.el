@@ -307,7 +307,7 @@ visible frame.  Set to nil or 0 to disable periodic live pulls."
   "List of JSON paths rendered as pretty JSON detail blocks.")
 
 (defvar-local json-log-viewer--source-configs nil
-  "Hash table mapping source names to per-source render config plists.")
+  "Hash table mapping source names or source IDs to render config plists.")
 
 (defconst json-log-viewer--source-directory
   (let ((source-file (or load-file-name
@@ -790,6 +790,8 @@ When BUFFER-OR-NAME is nil, use the current buffer."
     (buffer-or-name source &key timestamp-path level-path message-path extra-paths json-paths)
   "Register SOURCE render config on composite BUFFER-OR-NAME.
 
+SOURCE may be a visible source name or a hidden `sourceId' value from entries.
+
 The worker acknowledges the config before this function returns."
   (unless (and (stringp source) (not (string-empty-p source)))
     (user-error "Source must be a non-empty string"))
@@ -806,6 +808,30 @@ The worker acknowledges the config before this function returns."
                :source source
                :config config)
          t)))))
+
+(cl-defun json-log-viewer-unique-source-id
+    (buffer-or-name source &key timestamp-path level-path message-path extra-paths json-paths)
+  "Return a non-conflicting source ID for SOURCE in BUFFER-OR-NAME.
+
+When SOURCE is already registered with an equal render config, return SOURCE.
+When SOURCE is registered with a different render config, append a numeric
+suffix so same upstream source streams can use independent render configs."
+  (unless (and (stringp source) (not (string-empty-p source)))
+    (user-error "Source must be a non-empty string"))
+  (let ((target (json-log-viewer-get-buffer buffer-or-name))
+        (config (json-log-viewer--render-config-plist
+                 timestamp-path level-path message-path extra-paths json-paths)))
+    (with-current-buffer target
+      (let ((candidate source)
+            (index 2)
+            existing)
+        (while (and (hash-table-p json-log-viewer--source-configs)
+                    (setq existing
+                          (gethash candidate json-log-viewer--source-configs))
+                    (not (equal existing config)))
+          (setq candidate (format "%s#%d" source index))
+          (setq index (1+ index)))
+        candidate))))
 
 (defun json-log-viewer--pull-max-messages ()
   "Return the current maximum number of live messages to pull."
@@ -1381,13 +1407,8 @@ JSON-PATHS is a list of paths to render as JSON blocks instead of flattening."
 
 (defun json-log-viewer--source-tag-label-width (source)
   "Return shared source label width for SOURCE in the current buffer."
-  (let ((width (max json-log-viewer-composite-source-tag-width
-                    (length (or source "")))))
-    (when (hash-table-p json-log-viewer--source-configs)
-      (maphash (lambda (configured-source _config)
-                 (setq width (max width (length configured-source))))
-               json-log-viewer--source-configs))
-    width))
+  (max json-log-viewer-composite-source-tag-width
+       (length (or source ""))))
 
 (defun json-log-viewer--center-string (value width)
   "Return VALUE centered in a field WIDTH characters wide."
@@ -1529,7 +1550,12 @@ Returns cons cell (ENTRIES . NEXT-ID)."
                   (or (plist-get entry :source)
                       (json-log-viewer-shared--resolve-path
                        parsed "source" flattened-fields))))
-         (source-config (json-log-viewer--source-render-config source))
+         (source-id (json-log-viewer-shared--value->string
+                     (or (plist-get entry :source-id)
+                         (json-log-viewer-shared--resolve-path
+                          parsed "sourceId" flattened-fields))))
+         (source-config (or (json-log-viewer--source-render-config source-id)
+                            (json-log-viewer--source-render-config source)))
          (timestamp-path (or (plist-get source-config :timestamp-path)
                              json-log-viewer--timestamp-path))
          (level-path (or (plist-get source-config :level-path)

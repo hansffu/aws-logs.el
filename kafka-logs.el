@@ -38,6 +38,8 @@
                   (&optional buffer-or-name))
 (declare-function json-log-viewer-register-source-config "json-log-viewer"
                   (buffer-or-name source &rest args))
+(declare-function json-log-viewer-unique-source-id "json-log-viewer"
+                  (buffer-or-name source &rest args))
 (declare-function json-log-viewer-push "json-log-viewer"
                   (buffer-or-name log-lines))
 (declare-function json-log-viewer-replace-log-lines "json-log-viewer"
@@ -252,6 +254,9 @@ Each element has the form (NAME . PLIST).")
 
 (defvar-local kafka-logs--viewer-topic nil
   "Topic shown in current viewer buffer header.")
+
+(defvar-local kafka-logs--viewer-source-id nil
+  "Source ID used for source-specific rendering in composite buffers.")
 
 (defvar-local kafka-logs--viewer-stream nil
   "Stream state shown in current viewer buffer header.")
@@ -906,6 +911,7 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
          "--socket" socket-path
          "kafka"
          "--connection" (or kafka-logs--viewer-connection kafka-logs-connection "")
+         "--source-id" (or kafka-logs--viewer-source-id "kafka")
          "--topic" (or kafka-logs--viewer-topic kafka-logs-topic "")
          "--payload-format" (if (eq kafka-logs--viewer-payload-format 'json)
                                 "json"
@@ -1018,17 +1024,35 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
   (and (kafka-logs--selected-viewer-buffer-p)
        (json-log-viewer-composite-buffer-p kafka-logs-viewer-buffer)))
 
-(defun kafka-logs--register-composite-source-config (buffer)
+(defun kafka-logs--register-composite-source-config
+    (buffer &optional source-id message-path extra-paths json-paths)
   "Register current Kafka formatting for composite BUFFER."
-  (when (json-log-viewer-composite-buffer-p buffer)
-    (json-log-viewer-register-source-config
-     buffer
-     "kafka"
-     :timestamp-path "timestamp"
-     :level-path "level"
-     :message-path (or kafka-logs-message-path kafka-logs-default-message-path "message")
-     :extra-paths kafka-logs-extra-paths
-     :json-paths kafka-logs-json-paths)))
+  (let ((target (json-log-viewer-get-buffer buffer)))
+    (when (json-log-viewer-composite-buffer-p target)
+      (json-log-viewer-register-source-config
+       target
+       (or source-id
+           (with-current-buffer target kafka-logs--viewer-source-id)
+           "kafka")
+       :timestamp-path "timestamp"
+       :level-path "level"
+       :message-path (or message-path
+                         (with-current-buffer target
+                           kafka-logs--viewer-message-path)
+                         kafka-logs-message-path
+                         kafka-logs-default-message-path
+                         "message")
+       :extra-paths (or extra-paths kafka-logs-extra-paths)
+       :json-paths (or json-paths
+                       (with-current-buffer target kafka-logs--viewer-json-paths)
+                       kafka-logs-json-paths)))))
+
+(defun kafka-logs--composite-source-id (connection topic &optional source-id)
+  "Return source ID for a Kafka composite source."
+  (or source-id
+      (format "kafka:%s/%s"
+              (or connection "-")
+              (or topic "-"))))
 
 (defun kafka-logs--initialize-viewer-buffer
     (buffer message-path json-paths &optional install-keymap)
@@ -1047,6 +1071,7 @@ session.  When INSTALL-KEYMAP is non-nil, install kafka-logs key bindings."
     (setq-local kafka-logs--stream-pending-lines nil)
     (setq-local kafka-logs--stream-drain-timer nil)
     (setq-local kafka-logs--viewer-connection kafka-logs-connection)
+    (setq-local kafka-logs--viewer-source-id "kafka")
     (setq-local kafka-logs--viewer-topic kafka-logs-topic)
     (setq-local kafka-logs--viewer-stream kafka-logs-stream)
     (setq-local kafka-logs--viewer-time-range kafka-logs-time-range)
@@ -1064,7 +1089,7 @@ session.  When INSTALL-KEYMAP is non-nil, install kafka-logs key bindings."
     (when install-keymap
       (kafka-logs--install-viewer-keymap))))
 
-(defun kafka-logs--append-to-viewer-buffer (buffer message-path json-paths)
+(defun kafka-logs--append-to-viewer-buffer (buffer message-path json-paths &optional source-id)
   "Prepare BUFFER for an additional Kafka source.
 
 MESSAGE-PATH and JSON-PATHS are the normalized rendering paths for the current
@@ -1077,6 +1102,7 @@ source."
                   (kafka-logs--kill-buffer-process (current-buffer)))
                 nil t))
     (setq-local kafka-logs--viewer-connection kafka-logs-connection)
+    (setq-local kafka-logs--viewer-source-id (or source-id "kafka"))
     (setq-local kafka-logs--viewer-topic kafka-logs-topic)
     (setq-local kafka-logs--viewer-stream kafka-logs-stream)
     (setq-local kafka-logs--viewer-time-range kafka-logs-time-range)
@@ -1100,6 +1126,8 @@ source."
 SOURCE is a plist.  Supported keys are:
 
 - `:connection': configured Kafka connection name.
+- `:source-id': optional composite source ID. Defaults to
+  `kafka:CONNECTION/TOPIC'.
 - `:topic': topic name.
 - `:filter': optional grep regex.
 - `:value-format': one of `auto', `json', `avro', or `string'.
@@ -1114,6 +1142,7 @@ maximum message options."
          (connection (kafka-logs--plist-value
                       source :connection kafka-logs-default-connection))
          (topic (kafka-logs--plist-value source :topic kafka-logs-default-topic))
+         (source-id (kafka-logs--plist-value source :source-id nil))
          (filter (kafka-logs--plist-value source :filter kafka-logs-default-filter))
          (value-format (kafka-logs--plist-value
                         source :value-format kafka-logs-default-value-format))
@@ -1160,8 +1189,20 @@ maximum message options."
              kafka-logs-message-path "kafka-logs-message-path"))
            (args (kafka-logs--consume-args))
            (command (kafka-logs--command-with-filter args t))
+           (normalized-source-id
+            (kafka-logs--composite-source-id
+             kafka-logs-connection kafka-logs-topic source-id))
+           (allocated-source-id
+            (json-log-viewer-unique-source-id
+             viewer normalized-source-id
+             :timestamp-path "timestamp"
+             :level-path "level"
+             :message-path normalized-message-path
+             :extra-paths normalized-extra-paths
+             :json-paths normalized-json-paths))
            (label (format "%s/%s" kafka-logs-connection kafka-logs-topic))
            (captured-connection kafka-logs-connection)
+           (captured-source-id allocated-source-id)
            (captured-topic kafka-logs-topic)
            (captured-filter kafka-logs-filter)
            (captured-value-format kafka-logs-value-format)
@@ -1174,8 +1215,10 @@ maximum message options."
       (setq kafka-logs-json-paths normalized-json-paths)
       (setq kafka-logs-message-path normalized-message-path)
       (kafka-logs--append-to-viewer-buffer
-       viewer normalized-message-path normalized-json-paths)
-      (kafka-logs--register-composite-source-config viewer)
+       viewer normalized-message-path normalized-json-paths allocated-source-id)
+      (kafka-logs--register-composite-source-config
+       viewer allocated-source-id normalized-message-path
+       normalized-extra-paths normalized-json-paths)
       (json-log-viewer-run-when-ready
        viewer
        (lambda ()
@@ -1190,7 +1233,11 @@ maximum message options."
                (kafka-logs-payload-format captured-payload-format)
                (kafka-logs-extra-paths captured-extra-paths)
                (kafka-logs-json-paths captured-json-paths)
-               (kafka-logs-message-path captured-message-path))
+               (kafka-logs-message-path captured-message-path)
+               (kafka-logs--viewer-connection captured-connection)
+               (kafka-logs--viewer-source-id captured-source-id)
+               (kafka-logs--viewer-topic captured-topic)
+               (kafka-logs--viewer-payload-format captured-payload-format))
            (let* ((viewer-buffer (current-buffer))
                   (socket-path (json-log-viewer-worker-socket-path viewer-buffer))
                   (wrapper-command (kafka-logs--wrapper-command socket-path command))
@@ -1312,6 +1359,8 @@ duplicates are preserved as arrays."
         (when level
           (puthash "level" level obj))
         (puthash "source" "kafka" obj)
+        (when kafka-logs--viewer-source-id
+          (puthash "sourceId" kafka-logs--viewer-source-id obj))
         (puthash "raw" clean obj)
         (puthash "connection" (or kafka-logs--viewer-connection kafka-logs-connection "") obj)
         (when topic

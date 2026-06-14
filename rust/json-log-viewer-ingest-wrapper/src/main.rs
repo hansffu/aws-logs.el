@@ -27,9 +27,11 @@ enum Mode {
         namespace: String,
         target: String,
         kind: String,
+        source_id: String,
     },
     Kafka {
         connection: String,
+        source_id: String,
         topic: String,
         payload_json: bool,
     },
@@ -135,6 +137,7 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
             let mut namespace = String::new();
             let mut target = String::new();
             let mut kind = String::new();
+            let mut source_id = String::new();
             while idx < args.len() && args[idx] != "--" {
                 match args[idx].as_str() {
                     "--namespace" => {
@@ -152,6 +155,11 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
                         kind = args.get(idx).cloned().unwrap_or_default();
                         idx += 1;
                     }
+                    "--source-id" => {
+                        idx += 1;
+                        source_id = args.get(idx).cloned().unwrap_or_default();
+                        idx += 1;
+                    }
                     other => return Err(format!("unexpected kube option: {other}")),
                 }
             }
@@ -159,10 +167,12 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
                 namespace,
                 target,
                 kind,
+                source_id,
             }
         }
         "kafka" => {
             let mut connection = String::new();
+            let mut source_id = String::new();
             let mut topic = String::new();
             let mut payload_json = false;
             while idx < args.len() && args[idx] != "--" {
@@ -170,6 +180,11 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
                     "--connection" => {
                         idx += 1;
                         connection = args.get(idx).cloned().unwrap_or_default();
+                        idx += 1;
+                    }
+                    "--source-id" => {
+                        idx += 1;
+                        source_id = args.get(idx).cloned().unwrap_or_default();
                         idx += 1;
                     }
                     "--topic" => {
@@ -187,6 +202,7 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
             }
             Mode::Kafka {
                 connection,
+                source_id,
                 topic,
                 payload_json,
             }
@@ -211,12 +227,16 @@ fn normalize_line(mode: &Mode, line: &str) -> Result<Option<String>, String> {
             namespace,
             target,
             kind,
-        } => Ok(normalize_kube_line(line, namespace, target, kind)),
+            source_id,
+        } => Ok(normalize_kube_line(
+            line, namespace, target, kind, source_id,
+        )),
         Mode::Kafka {
             connection,
+            source_id,
             topic,
             payload_json,
-        } => normalize_kafka_line(line, connection, topic, *payload_json),
+        } => normalize_kafka_line(line, connection, source_id, topic, *payload_json),
     }
 }
 
@@ -228,7 +248,13 @@ fn write_ingest_line(socket: &mut UnixStream, json_line: &str) -> io::Result<()>
     socket.write_all(&frame)
 }
 
-fn normalize_kube_line(line: &str, namespace: &str, target: &str, kind: &str) -> Option<String> {
+fn normalize_kube_line(
+    line: &str,
+    namespace: &str,
+    target: &str,
+    kind: &str,
+    source_id: &str,
+) -> Option<String> {
     let clean = line.trim_end_matches('\r');
     if clean.is_empty() {
         return None;
@@ -244,6 +270,9 @@ fn normalize_kube_line(line: &str, namespace: &str, target: &str, kind: &str) ->
         );
     }
     obj.insert("source".to_string(), Value::String("kube".to_string()));
+    if !source_id.is_empty() {
+        obj.insert("sourceId".to_string(), Value::String(source_id.to_string()));
+    }
     obj.insert("raw".to_string(), Value::String(without_prefix));
     obj.insert(
         "namespace".to_string(),
@@ -283,6 +312,7 @@ fn is_timestamp(value: &str) -> bool {
 fn normalize_kafka_line(
     line: &str,
     connection: &str,
+    source_id: &str,
     fallback_topic: &str,
     payload_json: bool,
 ) -> Result<Option<String>, String> {
@@ -333,6 +363,9 @@ fn normalize_kafka_line(
         obj.insert("level".to_string(), Value::String(level));
     }
     obj.insert("source".to_string(), Value::String("kafka".to_string()));
+    if !source_id.is_empty() {
+        obj.insert("sourceId".to_string(), Value::String(source_id.to_string()));
+    }
     obj.insert("raw".to_string(), Value::String(clean.to_string()));
     obj.insert(
         "connection".to_string(),
@@ -420,4 +453,48 @@ fn parse_json_maybe(value: &str) -> Option<Value> {
         return None;
     }
     serde_json::from_str(value).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kafka_payload_json_exposes_nested_payload_fields() {
+        let line = r#"{"topic":"example.events.v1","partition":1,"offset":100,"ts":1781447361217,"headers":["X-Correlation-Id","request-1","source","example-service"],"key":"record-key","payload":"{\n    \"type\": \"ExampleEvent\",\n    \"requestId\": \"request-2\",\n    \"key\": \"record-key\"\n}"}"#;
+        let normalized = normalize_kafka_line(
+            line,
+            "cluster-a",
+            "kafka:cluster-a/example.events.v1",
+            "fallback",
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let parsed = serde_json::from_str::<Value>(&normalized).unwrap();
+
+        assert_eq!(parsed["source"], "kafka");
+        assert_eq!(parsed["sourceId"], "kafka:cluster-a/example.events.v1");
+        assert_eq!(parsed["payload"]["type"], "ExampleEvent");
+        assert_eq!(parsed["payload"]["requestId"], "request-2");
+        assert_eq!(parsed["topic"], "example.events.v1");
+        assert_eq!(parsed["key"], "record-key");
+    }
+
+    #[test]
+    fn kube_source_id_is_separate_from_display_source() {
+        let normalized = normalize_kube_line(
+            r#"2026-06-14T12:00:00Z {"message":"ok"}"#,
+            "payments",
+            "api",
+            "deployment",
+            "kube:payments/deployment/api",
+        )
+        .unwrap();
+        let parsed = serde_json::from_str::<Value>(&normalized).unwrap();
+
+        assert_eq!(parsed["source"], "kube");
+        assert_eq!(parsed["sourceId"], "kube:payments/deployment/api");
+        assert_eq!(parsed["payload"]["message"], "ok");
+    }
 }

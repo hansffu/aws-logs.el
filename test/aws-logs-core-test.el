@@ -1141,7 +1141,7 @@
              (json-log-viewer--render-config-plist
               "timestamp" "payload.level" "payload.message" '("namespace") nil)
              json-log-viewer--source-configs)
-    (puthash "kafka"
+    (puthash "kafka:prod/orders"
              (json-log-viewer--render-config-plist
               "ts" "severity" "payload.message" '("topic") nil)
              json-log-viewer--source-configs)
@@ -1155,7 +1155,7 @@
              1 nil))
            (kafka-entry
             (json-log-viewer--json-line->entry-with-config
-             "{\"source\":\"kafka\",\"ts\":\"2026-01-01T00:00:02Z\",\"severity\":\"debug\",\"payload\":{\"message\":\"kafka msg\"},\"topic\":\"orders\"}"
+             "{\"source\":\"kafka\",\"sourceId\":\"kafka:prod/orders\",\"ts\":\"2026-01-01T00:00:02Z\",\"severity\":\"debug\",\"payload\":{\"message\":\"kafka msg\"},\"topic\":\"orders\"}"
              2 nil))
            (kube-propertized-summary (json-log-viewer--json-summary kube-entry nil))
            (aws-summary (substring-no-properties

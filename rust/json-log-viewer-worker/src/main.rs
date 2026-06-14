@@ -417,20 +417,21 @@ impl Store {
     }
 
     fn entry_details(&self, entry_id: i64, request_id: Option<i64>) -> rusqlite::Result<()> {
-        let row: Option<(String, Option<String>)> = self
+        let row: Option<(String, Option<String>, Option<String>)> = self
             .db
             .query_row(
-                "SELECT json, source FROM log_entry WHERE id = ?",
+                "SELECT json, source, source_id FROM log_entry WHERE id = ?",
                 params![entry_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
         let fields = row
             .as_ref()
-            .map(|(text, source)| {
+            .map(|(text, source, source_id)| {
                 let config = config_for_source(
                     &self.config.viewer,
                     &self.config.source_configs,
+                    source_id.as_deref(),
                     source.as_deref(),
                 );
                 entry_fields(text, config)
@@ -457,6 +458,7 @@ fn setup_db(db: &Connection) -> rusqlite::Result<()> {
            timestamp_epoch REAL,
            timestamp TEXT,
            source TEXT,
+           source_id TEXT,
            source_lc TEXT,
            level_path TEXT,
            level_lc TEXT,
@@ -973,8 +975,14 @@ fn insert_log_entry(
     let json_text = serde_json::to_string(&normalized).unwrap_or_else(|_| line.to_string());
     let search_text_lc = search_text_for_storage(&normalized, line);
     let source = resolve_path(parsed.as_ref(), Some("source"));
+    let source_id = resolve_path(parsed.as_ref(), Some("sourceId"));
     let source_lc = source.as_deref().map(normalize_index_value);
-    let config = config_for_source(default_config, source_configs, source.as_deref());
+    let config = config_for_source(
+        default_config,
+        source_configs,
+        source_id.as_deref(),
+        source.as_deref(),
+    );
     let timestamp = resolve_path(parsed.as_ref(), config.timestamp_path.as_deref())
         .unwrap_or_else(|| "-".to_string());
     let timestamp_epoch = parse_time(&timestamp);
@@ -990,12 +998,13 @@ fn insert_log_entry(
         .collect::<Vec<_>>();
     let extra_csv = extra_fields.join(",");
     db.execute(
-        "INSERT INTO log_entry(timestamp_epoch, timestamp, source, source_lc, level_path, level_lc, message_path, extra_paths, json, search_text_lc)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO log_entry(timestamp_epoch, timestamp, source, source_id, source_lc, level_path, level_lc, message_path, extra_paths, json, search_text_lc)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             timestamp_epoch,
             timestamp,
             source,
+            source_id,
             source_lc,
             level,
             level_lc,
@@ -1039,10 +1048,12 @@ fn normalize_index_value(value: &str) -> String {
 fn config_for_source<'a>(
     default_config: &'a ViewerConfig,
     source_configs: &'a HashMap<String, ViewerConfig>,
+    source_id: Option<&str>,
     source: Option<&str>,
 ) -> &'a ViewerConfig {
-    source
-        .and_then(|source| source_configs.get(source))
+    source_id
+        .and_then(|source_id| source_configs.get(source_id))
+        .or_else(|| source.and_then(|source| source_configs.get(source)))
         .unwrap_or(default_config)
 }
 
@@ -1689,10 +1700,8 @@ mod tests {
         narrow: Option<&NarrowFilter>,
     ) -> Vec<Entry> {
         let mut entries = Vec::new();
-        stream_rerender_entry_batches(db, max_entries, narrow, 2, |batch| {
-            entries.extend(batch)
-        })
-        .unwrap();
+        stream_rerender_entry_batches(db, max_entries, narrow, 2, |batch| entries.extend(batch))
+            .unwrap();
         entries
     }
 
@@ -1854,5 +1863,44 @@ mod tests {
 
         assert!(display_plan.contains("log_entry_display_order_idx"));
         assert!(tail_plan.contains("log_entry_tail_order_idx"));
+    }
+
+    #[test]
+    fn source_config_can_resolve_nested_kafka_payload_fields() {
+        let db = test_db();
+        let line = r#"{"connection":"cluster-a","key":"record-key","payload":{"key":"record-key","requestId":"request-2","type":"ExampleEvent"},"source":"kafka","sourceId":"kafka:cluster-a/example.events.v1","timestamp":"2026-06-14T12:00:00.000Z","topic":"example.events.v1"}"#;
+        let default_config = ViewerConfig {
+            timestamp_path: Some("timestamp".to_string()),
+            level_path: Some("level".to_string()),
+            message_path: Some("message".to_string()),
+            extra_paths: Vec::new(),
+            json_paths: Vec::new(),
+        };
+        let mut source_configs = HashMap::new();
+        source_configs.insert(
+            "kafka:cluster-a/example.events.v1".to_string(),
+            ViewerConfig {
+                timestamp_path: Some("timestamp".to_string()),
+                level_path: Some("level".to_string()),
+                message_path: Some("payload.type".to_string()),
+                extra_paths: vec![
+                    "topic".to_string(),
+                    "key".to_string(),
+                    "payload.type".to_string(),
+                ],
+                json_paths: vec!["payload".to_string()],
+            },
+        );
+
+        let (entry, _) =
+            insert_log_entry(&db, line, &default_config, &source_configs, None).unwrap();
+        let entry = entry.unwrap();
+
+        assert_eq!(entry.source.as_deref(), Some("kafka"));
+        assert_eq!(entry.message, "ExampleEvent");
+        assert_eq!(
+            entry.extra_fields,
+            vec!["example.events.v1", "record-key", "ExampleEvent"]
+        );
     }
 }

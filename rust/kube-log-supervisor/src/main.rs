@@ -25,6 +25,7 @@ struct Args {
     namespace: Option<String>,
     target_kind: String,
     target: String,
+    source_id: String,
     tail_lines: Option<i64>,
     since_seconds: Option<i64>,
     filter: Option<String>,
@@ -251,6 +252,7 @@ impl Supervisor {
                 &self.namespace,
                 &self.args.target,
                 &self.args.target_kind,
+                &self.args.source_id,
                 pod_name,
                 self.filter.as_ref(),
             )? {
@@ -336,6 +338,7 @@ fn normalize_kube_line(
     namespace: &str,
     target: &str,
     kind: &str,
+    source_id: &str,
     pod: &str,
     filter: Option<&Regex>,
 ) -> Result<Option<String>, String> {
@@ -358,6 +361,9 @@ fn normalize_kube_line(
         );
     }
     obj.insert("source".to_string(), Value::String("kube".to_string()));
+    if !source_id.is_empty() {
+        obj.insert("sourceId".to_string(), Value::String(source_id.to_string()));
+    }
     obj.insert("raw".to_string(), Value::String(clean.to_string()));
     obj.insert(
         "namespace".to_string(),
@@ -393,6 +399,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
     let mut namespace = None;
     let mut target_kind = None;
     let mut target = None;
+    let mut source_id = String::new();
     let mut tail_lines = None;
     let mut since_seconds = None;
     let mut filter = None;
@@ -419,6 +426,10 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
                 idx += 1;
                 target = args.get(idx).cloned();
             }
+            "--source-id" => {
+                idx += 1;
+                source_id = args.get(idx).cloned().unwrap_or_default();
+            }
             "--tail" => {
                 idx += 1;
                 tail_lines = parse_i64_arg(args.get(idx), "--tail")?;
@@ -441,6 +452,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
         namespace,
         target_kind: target_kind.ok_or_else(|| "missing --target-kind KIND".to_string())?,
         target: target.ok_or_else(|| "missing --target NAME".to_string())?,
+        source_id,
         tail_lines,
         since_seconds,
         filter,

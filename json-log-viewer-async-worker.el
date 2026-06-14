@@ -192,6 +192,8 @@
          (sort-key (or timestamp-epoch (+ 1000000000000.0 id)))
          (source (json-log-viewer-shared--value->string
                   (json-log-viewer-shared--resolve-path parsed "source" flattened)))
+         (source-id (json-log-viewer-shared--value->string
+                     (json-log-viewer-shared--resolve-path parsed "sourceId" flattened)))
          (level (or (json-log-viewer-shared--resolve-path
                      parsed (plist-get config :level-path) flattened)
                     "-"))
@@ -212,6 +214,7 @@
      (list :id id
            :sort-key sort-key
            :source source
+           :source-id source-id
            :timestamp (or timestamp "-")
            :level level
            :message message
@@ -251,6 +254,8 @@
          (sort-key (or timestamp-epoch nil))
          (source (json-log-viewer-shared--value->string
                   (json-log-viewer-shared--resolve-path parsed "source" flattened)))
+         (source-id (json-log-viewer-shared--value->string
+                     (json-log-viewer-shared--resolve-path parsed "sourceId" flattened)))
          (level (or (json-log-viewer-shared--resolve-path
                      parsed (plist-get config :level-path) flattened)
                     "-"))
@@ -265,6 +270,7 @@
     (list :parsed parsed
           :sort-key sort-key
           :source source
+          :source-id source-id
           :timestamp (or timestamp "-")
           :timestamp-epoch timestamp-epoch
           :level level
@@ -312,6 +318,7 @@
          (parsed (plist-get summary :parsed))
          (timestamp-text (plist-get summary :timestamp))
          (source (plist-get summary :source))
+         (source-id (plist-get summary :source-id))
          (level-path (plist-get summary :level))
          (message-path (plist-get summary :message))
          (extra-paths (json-log-viewer-async-worker--extra-fields->csv
@@ -326,7 +333,8 @@
                level-path
                message-path
                extra-paths
-               storage-json)))
+               storage-json
+               source-id)))
       (when (json-log-viewer-async-worker--json-matches-narrow-p
              storage-json level-path narrow-filter)
         (json-log-viewer-async-worker--stored-row->entry

@@ -31,6 +31,7 @@
     "timestamp_epoch REAL, "
     "timestamp TEXT, "
     "source TEXT, "
+    "source_id TEXT, "
     "source_lc TEXT, "
     "level_path TEXT, "
     "level_lc TEXT, "
@@ -71,7 +72,9 @@
     "tokenize='trigram', "
     "detail='none')"))
   (ignore-errors
-    (sqlite-execute db "ALTER TABLE log_entry ADD COLUMN source TEXT")))
+    (sqlite-execute db "ALTER TABLE log_entry ADD COLUMN source TEXT"))
+  (ignore-errors
+    (sqlite-execute db "ALTER TABLE log_entry ADD COLUMN source_id TEXT")))
 
 (defun json-log-viewer-repository-lock-error-p (err)
   "Return non-nil when ERR indicates sqlite lock contention."
@@ -199,7 +202,8 @@ Returned rows are ascending plists of shape
      rows)))
 
 (defun json-log-viewer-repository-insert-entry
-    (db timestamp-epoch timestamp source level-path message-path extra-paths json-text)
+    (db timestamp-epoch timestamp source level-path message-path extra-paths json-text
+        &optional source-id)
   "Insert one log entry in DB and return its id."
   (let ((source-lc (and source (downcase (string-trim source))))
         (level-lc (and level-path (downcase (string-trim level-path))))
@@ -208,10 +212,10 @@ Returned rows are ascending plists of shape
      db
      (concat
       "INSERT INTO log_entry("
-      "timestamp_epoch, timestamp, source, source_lc, level_path, level_lc, "
+      "timestamp_epoch, timestamp, source, source_id, source_lc, level_path, level_lc, "
       "message_path, extra_paths, json, search_text_lc) "
-      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-     (vector timestamp-epoch timestamp source source-lc level-path level-lc
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+     (vector timestamp-epoch timestamp source source-id source-lc level-path level-lc
              message-path extra-paths json-text search-text-lc))
     (let ((id (car (car (sqlite-select db "SELECT last_insert_rowid()")))))
       (sqlite-execute
@@ -566,7 +570,12 @@ Returns plist \(:copied N :next-after-id ID)."
                      "ORDER BY id LIMIT ?)")
                     (vector after-id after-id max-id chunk-size))))
                  (next-after-id (or (nth 0 meta-row) after-id))
-                 (copied (or (nth 1 meta-row) 0)))
+                 (copied (or (nth 1 meta-row) 0))
+                 (source-has-source-id
+                  (member "source_id"
+                          (mapcar #'cadr
+                                  (sqlite-select
+                                   db "PRAGMA source_db.table_info(log_entry)")))))
             (when (> copied 0)
               (let ((previous-max-id
                      (json-log-viewer-repository-select-max-id db)))
@@ -574,10 +583,12 @@ Returns plist \(:copied N :next-after-id ID)."
                  db
                  (concat
                   "INSERT INTO log_entry("
-                  "id, timestamp_epoch, timestamp, source, source_lc, "
+                  "id, timestamp_epoch, timestamp, source, source_id, source_lc, "
                   "level_path, level_lc, message_path, extra_paths, json, "
                   "search_text_lc) "
                   "SELECT NULL, timestamp_epoch, timestamp, source, "
+                  (if source-has-source-id "source_id" "NULL")
+                  ", "
                   "lower(trim(source)), level_path, lower(trim(level_path)), "
                   "message_path, extra_paths, json, lower(json) "
                   "FROM source_db.log_entry "
