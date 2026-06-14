@@ -5,6 +5,7 @@
 
 (require 'json-log-viewer)
 (require 'json-log-viewer-async-worker)
+(require 'json-log-viewer-repository)
 (require 'aws-logs-insights)
 (require 'aws-logs-tail)
 (require 'aws-logs)
@@ -933,6 +934,60 @@
       (dolist (path (list socket-path db-path wal-path shm-path))
         (when (file-exists-p path)
           (delete-file path))))))
+
+(ert-deftest json-log-viewer-repository-narrow-search-index-test ()
+  (let* ((db-path (make-temp-file "json-log-viewer-repository-test-" nil ".sqlite"))
+         (db (sqlite-open db-path)))
+    (unwind-protect
+        (progn
+          (json-log-viewer-repository-setup-db db)
+          (json-log-viewer-repository-create-schema db)
+          (json-log-viewer-repository-insert-entry
+           db 1767225600.0 "2026-01-01T00:00:00Z" nil
+           "INFO" "visible" nil
+           "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"level\":\"INFO\",\"msg\":\"visible\",\"payload\":{\"request\":\"needle-123\"}}")
+          (json-log-viewer-repository-insert-entry
+           db 1767225601.0 "2026-01-01T00:00:01Z" nil
+           "error" "xy visible" nil
+           "{\"timestamp\":\"2026-01-01T00:00:01Z\",\"level\":\"error\",\"msg\":\"xy visible\"}")
+          (json-log-viewer-repository-insert-entry
+           db 1767225602.0 "2026-01-01T00:00:02Z" nil
+           "error" "needle error" nil
+           "{\"timestamp\":\"2026-01-01T00:00:02Z\",\"level\":\"error\",\"msg\":\"needle error\"}")
+          (should
+           (equal
+            (mapcar (lambda (row) (plist-get row :message-path))
+                    (json-log-viewer-repository-select-summary-entries
+                     db "needle"))
+            '("visible" "needle error")))
+          (should
+           (equal
+            (mapcar (lambda (row) (plist-get row :message-path))
+                    (json-log-viewer-repository-select-summary-entries
+                     db "xy"))
+            '("xy visible")))
+          (should
+           (equal
+            (mapcar (lambda (row) (plist-get row :message-path))
+                    (json-log-viewer-repository-select-summary-entries
+                     db '(:terms ("needle") :operator and :level "ERROR")))
+            '("needle error")))
+          (should
+           (equal
+            (mapcar (lambda (row) (plist-get row :message-path))
+                    (json-log-viewer-repository-select-summary-tail-entries
+                     db 1 "needle"))
+            '("needle error")))
+          (json-log-viewer-repository-reset-log-entries db)
+          (should
+           (= 0
+              (caar
+               (sqlite-select
+                db
+                "SELECT count(*) FROM log_entry_fts WHERE log_entry_fts MATCH 'nee'")))))
+      (ignore-errors (sqlite-close db))
+      (when (file-exists-p db-path)
+        (delete-file db-path)))))
 
 (ert-deftest json-log-viewer-status-updates-total-count-test ()
   (with-temp-buffer

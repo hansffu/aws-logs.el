@@ -9,6 +9,7 @@
 ;;; Code:
 
 (require 'sqlite)
+(require 'cl-lib)
 (require 'subr-x)
 
 (defconst json-log-viewer-repository-sqlite-lock-retries 12
@@ -30,11 +31,31 @@
     "timestamp_epoch REAL, "
     "timestamp TEXT, "
     "source TEXT, "
+    "source_lc TEXT, "
     "level_path TEXT, "
+    "level_lc TEXT, "
     "message_path TEXT, "
     "extra_paths TEXT, "
-    "json TEXT NOT NULL)"))
+    "json TEXT NOT NULL, "
+    "search_text_lc TEXT NOT NULL)"))
   (sqlite-execute db "CREATE INDEX log_entry_timestamp_idx ON log_entry(timestamp_epoch, id)")
+  (sqlite-execute db
+                  (concat
+                   "CREATE INDEX log_entry_level_timestamp_idx "
+                   "ON log_entry(level_lc, timestamp_epoch, id)"))
+  (sqlite-execute db
+                  (concat
+                   "CREATE INDEX log_entry_source_timestamp_idx "
+                   "ON log_entry(source_lc, timestamp_epoch, id)"))
+  (sqlite-execute
+   db
+   (concat
+    "CREATE VIRTUAL TABLE log_entry_fts USING fts5("
+    "search_text_lc, "
+    "content='log_entry', "
+    "content_rowid='id', "
+    "tokenize='trigram', "
+    "detail='none')"))
   (ignore-errors
     (sqlite-execute db "ALTER TABLE log_entry ADD COLUMN source TEXT")))
 
@@ -106,7 +127,7 @@
           (sqlite-select db
                          (concat
                           "SELECT id FROM log_entry "
-                          "WHERE instr(lower(json), ?) > 0")
+                          "WHERE instr(search_text_lc, ?) > 0")
                          (vector needle))))
 
 (defun json-log-viewer-repository-select-all-json-lines (db)
@@ -166,14 +187,24 @@ Returned rows are ascending plists of shape
 (defun json-log-viewer-repository-insert-entry
     (db timestamp-epoch timestamp source level-path message-path extra-paths json-text)
   "Insert one log entry in DB and return its id."
-  (sqlite-execute
-   db
-   (concat
-    "INSERT INTO log_entry("
-    "timestamp_epoch, timestamp, source, level_path, message_path, extra_paths, json) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?)")
-   (vector timestamp-epoch timestamp source level-path message-path extra-paths json-text))
-  (car (car (sqlite-select db "SELECT last_insert_rowid()"))))
+  (let ((source-lc (and source (downcase (string-trim source))))
+        (level-lc (and level-path (downcase (string-trim level-path))))
+        (search-text-lc (downcase json-text)))
+    (sqlite-execute
+     db
+     (concat
+      "INSERT INTO log_entry("
+      "timestamp_epoch, timestamp, source, source_lc, level_path, level_lc, "
+      "message_path, extra_paths, json, search_text_lc) "
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+     (vector timestamp-epoch timestamp source source-lc level-path level-lc
+             message-path extra-paths json-text search-text-lc))
+    (let ((id (car (car (sqlite-select db "SELECT last_insert_rowid()")))))
+      (sqlite-execute
+       db
+       "INSERT INTO log_entry_fts(rowid, search_text_lc) VALUES (?, ?)"
+       (vector id search-text-lc))
+      id)))
 
 (defun json-log-viewer-repository--normalize-narrow-string (needle)
   "Normalize NEEDLE into a downcased substring filter, or nil."
@@ -209,33 +240,81 @@ Returned rows are ascending plists of shape
                          (plist-get narrow :operator))
               :level level))))))
 
-(defun json-log-viewer-repository--narrow-condition (narrow)
-  "Return SQL condition for NARROW, without WHERE or AND."
-  (when-let ((filter (json-log-viewer-repository--narrow-filter narrow)))
-    (let* ((terms (plist-get filter :terms))
-           (joiner (if (eq (plist-get filter :operator) 'or) " OR " " AND "))
-           (term-condition (and terms
-                                (mapconcat
-                                 (lambda (_term) "instr(lower(json), ?) > 0")
-                                 terms
-                                 joiner)))
-           (level-condition (and (plist-get filter :level)
-                                 "lower(level_path) = ?")))
-      (mapconcat #'identity
-                 (delq nil
-                       (list (and term-condition
-                                  (format "(%s)" term-condition))
-                             level-condition))
-                 " AND "))))
+(defun json-log-viewer-repository--term-trigrams (term)
+  "Return overlapping 3-character strings for TERM."
+  (let (trigrams)
+    (dotimes (idx (max 0 (- (length term) 2)))
+      (push (substring term idx (+ idx 3)) trigrams))
+    (nreverse trigrams)))
 
-(defun json-log-viewer-repository--narrow-params (narrow)
-  "Return vector of SQL parameters for NARROW."
-  (let ((filter (json-log-viewer-repository--narrow-filter narrow)))
-    (vconcat
-     (or (plist-get filter :terms) nil)
-     (if (plist-get filter :level)
-         (vector (plist-get filter :level))
-       []))))
+(defun json-log-viewer-repository--escape-fts-phrase (value)
+  "Escape VALUE for a quoted FTS phrase."
+  (replace-regexp-in-string "\"" "\"\"" value t t))
+
+(defun json-log-viewer-repository--fts-query-for-terms (terms operator)
+  "Return trigram FTS query for TERMS using OPERATOR."
+  (let ((term-joiner (if (eq operator 'or) " OR " " AND ")))
+    (mapconcat
+     (lambda (term)
+       (format
+        "(%s)"
+        (mapconcat
+         (lambda (trigram)
+           (format "\"%s\""
+                   (json-log-viewer-repository--escape-fts-phrase trigram)))
+         (json-log-viewer-repository--term-trigrams term)
+         " AND ")))
+     terms
+     term-joiner)))
+
+(defun json-log-viewer-repository--narrow-plan (narrow)
+  "Return SQL FROM, condition, and params for NARROW."
+  (let ((filter (json-log-viewer-repository--narrow-filter narrow))
+        conditions
+        params
+        (from "FROM log_entry e "))
+    (when filter
+      (let* ((terms (plist-get filter :terms))
+             (operator (plist-get filter :operator))
+             (use-fts (and terms
+                           (cl-every (lambda (term) (>= (length term) 3))
+                                     terms))))
+        (when use-fts
+          (setq from
+                (concat
+                 "FROM log_entry_fts "
+                 "JOIN log_entry e ON e.id = log_entry_fts.rowid "))
+          (push "log_entry_fts MATCH ?" conditions)
+          (setq params
+                (append params
+                        (list
+                         (json-log-viewer-repository--fts-query-for-terms
+                          terms operator)))))
+        (when terms
+          (let ((joiner (if (eq operator 'or) " OR " " AND ")))
+            (push
+             (format
+              "(%s)"
+              (mapconcat
+               (lambda (_term) "instr(e.search_text_lc, ?) > 0")
+               terms
+               joiner))
+             conditions)
+            (setq params (append params terms))))
+        (when-let ((level (plist-get filter :level)))
+          (push "e.level_lc = ?" conditions)
+          (setq params (append params (list level))))))
+    (list :from from
+          :condition (and conditions
+                          (mapconcat #'identity (nreverse conditions) " AND "))
+          :params (vconcat params))))
+
+(defun json-log-viewer-repository--where-clause (&rest conditions)
+  "Return WHERE clause for non-nil CONDITIONS."
+  (let ((conditions (delq nil conditions)))
+    (if conditions
+        (concat "WHERE " (mapconcat #'identity conditions " AND ") " ")
+      "")))
 
 (defun json-log-viewer-repository--select (db sql params)
   "Run sqlite SELECT SQL with optional PARAMS."
@@ -245,8 +324,9 @@ Returned rows are ascending plists of shape
 
 (defun json-log-viewer-repository-select-summary-entries (db &optional narrow-string)
   "Return summary row plists from DB, optionally filtered by NARROW-STRING."
-  (let ((condition (json-log-viewer-repository--narrow-condition narrow-string))
-        (params (json-log-viewer-repository--narrow-params narrow-string)))
+  (let* ((plan (json-log-viewer-repository--narrow-plan narrow-string))
+         (condition (plist-get plan :condition))
+         (params (plist-get plan :params)))
     (mapcar
      (lambda (row)
        (list :id (nth 0 row)
@@ -259,9 +339,10 @@ Returned rows are ascending plists of shape
      (json-log-viewer-repository--select
       db
       (concat
-       "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths "
-       "FROM log_entry "
-       (if condition (concat "WHERE " condition " ") "")
+       "SELECT e.id, e.timestamp_epoch, e.timestamp, e.source, "
+       "e.level_path, e.message_path, e.extra_paths "
+       (plist-get plan :from)
+       (json-log-viewer-repository--where-clause condition)
        "ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, timestamp_epoch, id")
       params))))
 
@@ -289,18 +370,19 @@ Returned rows are ascending plists of shape
 When NARROW-STRING is non-nil, only matching rows are returned."
   ;; Inner query selects the newest LIMIT rows (DESC); outer re-orders them
   ;; ascending for display.  NULL timestamps sort last in display order.
-  (let* ((condition (json-log-viewer-repository--narrow-condition narrow-string))
-         (params (vconcat (json-log-viewer-repository--narrow-params narrow-string)
-                          (vector limit)))
+  (let* ((plan (json-log-viewer-repository--narrow-plan narrow-string))
+         (condition (plist-get plan :condition))
+         (params (vconcat (plist-get plan :params) (vector limit)))
          (rows
           (json-log-viewer-repository--select
            db
            (concat
             "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths "
             "FROM ("
-            "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths "
-            "FROM log_entry "
-            (if condition (concat "WHERE " condition " ") "")
+            "SELECT e.id, e.timestamp_epoch, e.timestamp, e.source, "
+            "e.level_path, e.message_path, e.extra_paths "
+            (plist-get plan :from)
+            (json-log-viewer-repository--where-clause condition)
             "ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 0 ELSE 1 END, "
             "timestamp_epoch DESC, id DESC LIMIT ?"
             ") ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, "
@@ -324,18 +406,21 @@ When NARROW-STRING is non-nil, only matching rows are returned."
 Rows are ordered ascending by timestamp/id. When BOUNDARY-ID is non-nil,
 it is used as a fallback for rows with NULL timestamps."
   (let* ((boundary-id (or boundary-id 0))
-         (condition (json-log-viewer-repository--narrow-condition narrow-string))
-         (filter-params (json-log-viewer-repository--narrow-params narrow-string))
-         (where-clause
+         (plan (json-log-viewer-repository--narrow-plan narrow-string))
+         (condition (plist-get plan :condition))
+         (filter-params (plist-get plan :params))
+         (boundary-condition
           (concat
-           "WHERE (timestamp_epoch < ? "
-           "OR (timestamp_epoch = ? AND id < ?) "
-           "OR (timestamp_epoch IS NULL AND id < ?)) "
-           (if condition (concat "AND (" condition ") ") "")))
+           "(e.timestamp_epoch < ? "
+           "OR (e.timestamp_epoch = ? AND e.id < ?) "
+           "OR (e.timestamp_epoch IS NULL AND e.id < ?))"))
+         (where-clause (json-log-viewer-repository--where-clause
+                        boundary-condition condition))
          (select
           (concat
-           "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths "
-           "FROM log_entry ")))
+           "SELECT e.id, e.timestamp_epoch, e.timestamp, e.source, "
+           "e.level_path, e.message_path, e.extra_paths "
+           (plist-get plan :from))))
     (mapcar
      (lambda (row)
        (list :id (nth 0 row)
@@ -377,18 +462,21 @@ it is used as a fallback for rows with NULL timestamps."
 Rows are ordered ascending by timestamp/id. When BOUNDARY-ID is non-nil,
 it is used as a fallback for rows with NULL timestamps."
   (let* ((boundary-id (or boundary-id 0))
-         (condition (json-log-viewer-repository--narrow-condition narrow-string))
-         (filter-params (json-log-viewer-repository--narrow-params narrow-string))
-         (where-clause
+         (plan (json-log-viewer-repository--narrow-plan narrow-string))
+         (condition (plist-get plan :condition))
+         (filter-params (plist-get plan :params))
+         (boundary-condition
           (concat
-           "WHERE (timestamp_epoch > ? "
-           "OR (timestamp_epoch = ? AND id > ?) "
-           "OR (timestamp_epoch IS NULL AND id > ?)) "
-           (if condition (concat "AND (" condition ") ") "")))
+           "(e.timestamp_epoch > ? "
+           "OR (e.timestamp_epoch = ? AND e.id > ?) "
+           "OR (e.timestamp_epoch IS NULL AND e.id > ?))"))
+         (where-clause (json-log-viewer-repository--where-clause
+                        boundary-condition condition))
          (select
           (concat
-           "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths "
-           "FROM log_entry ")))
+           "SELECT e.id, e.timestamp_epoch, e.timestamp, e.source, "
+           "e.level_path, e.message_path, e.extra_paths "
+           (plist-get plan :from))))
     (mapcar
      (lambda (row)
        (list :id (nth 0 row)
@@ -414,11 +502,21 @@ it is used as a fallback for rows with NULL timestamps."
 
 (defun json-log-viewer-repository-reset-log-entries (db)
   "Delete all log rows in DB."
+  (sqlite-execute db "DELETE FROM log_entry_fts")
   (sqlite-execute db "DELETE FROM log_entry"))
 
 (defun json-log-viewer-repository-truncate-oldest (db count)
   "Delete COUNT oldest rows in DB and return COUNT."
   (when (> count 0)
+    (sqlite-execute
+     db
+     (concat
+      "DELETE FROM log_entry_fts "
+      "WHERE rowid IN ("
+      "SELECT id FROM log_entry "
+      "ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, timestamp_epoch, id "
+      "LIMIT ?)")
+     (vector count))
     (sqlite-execute
      db
      (concat
@@ -456,16 +554,28 @@ Returns plist \(:copied N :next-after-id ID)."
                  (next-after-id (or (nth 0 meta-row) after-id))
                  (copied (or (nth 1 meta-row) 0)))
             (when (> copied 0)
-              (sqlite-execute
-               db
-               (concat
-                "INSERT INTO log_entry("
-                "id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths, json) "
-                "SELECT NULL, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths, json "
-                "FROM source_db.log_entry "
-                "WHERE id > ? AND id <= ? "
-                "ORDER BY id LIMIT ?")
-               (vector after-id max-id chunk-size)))
+              (let ((previous-max-id
+                     (json-log-viewer-repository-select-max-id db)))
+                (sqlite-execute
+                 db
+                 (concat
+                  "INSERT INTO log_entry("
+                  "id, timestamp_epoch, timestamp, source, source_lc, "
+                  "level_path, level_lc, message_path, extra_paths, json, "
+                  "search_text_lc) "
+                  "SELECT NULL, timestamp_epoch, timestamp, source, "
+                  "lower(trim(source)), level_path, lower(trim(level_path)), "
+                  "message_path, extra_paths, json, lower(json) "
+                  "FROM source_db.log_entry "
+                  "WHERE id > ? AND id <= ? "
+                  "ORDER BY id LIMIT ?")
+                 (vector after-id max-id chunk-size))
+                (sqlite-execute
+                 db
+                 (concat
+                  "INSERT INTO log_entry_fts(rowid, search_text_lc) "
+                  "SELECT id, search_text_lc FROM log_entry WHERE id > ?")
+                 (vector previous-max-id))))
             (list :copied copied :next-after-id next-after-id)))
       (when attached
         (ignore-errors (sqlite-execute db "DETACH DATABASE source_db"))))))

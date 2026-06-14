@@ -64,19 +64,25 @@ enum Command {
         request_id: Option<i64>,
     },
     Narrow {
+        #[serde(default)]
         needle: Option<String>,
         #[serde(default)]
         needles: Vec<String>,
+        #[serde(default)]
         operator: Option<String>,
+        #[serde(default)]
         level: Option<String>,
         #[serde(rename = "request-id")]
         request_id: Option<i64>,
     },
     Rerender {
+        #[serde(default)]
         needle: Option<String>,
         #[serde(default)]
         needles: Vec<String>,
+        #[serde(default)]
         operator: Option<String>,
+        #[serde(default)]
         level: Option<String>,
         #[serde(rename = "request-id")]
         request_id: Option<i64>,
@@ -234,7 +240,9 @@ impl Store {
         self.pending_entries.clear();
         self.total_count = 0;
         self.level_counts.clear();
-        let _ = self.db.execute("DELETE FROM log_entry", []);
+        if let Err(err) = reset_log_entries(&self.db) {
+            self.output.error(err.to_string());
+        }
         self.output.send(json!({"cmd": "clear"}));
         self.output.send(self.status_payload(0));
     }
@@ -344,13 +352,15 @@ impl Store {
         } else {
             None
         };
-        match select_rerender_entries(&self.db, self.config.max_entries, narrow) {
-            Ok(entries) => {
-                for batch in entries.chunks(self.config.rebuild_chunk_size.max(1)) {
-                    self.output
-                        .send(json!({"cmd": "render-entries", "entries": batch}));
-                }
-            }
+        let output = self.output.clone();
+        match stream_rerender_entry_batches(
+            &self.db,
+            self.config.max_entries,
+            narrow,
+            self.config.rebuild_chunk_size.max(1),
+            move |batch| output.send(json!({"cmd": "render-entries", "entries": batch})),
+        ) {
+            Ok(()) => {}
             Err(err) => self.output.error(err.to_string()),
         }
     }
@@ -447,12 +457,24 @@ fn setup_db(db: &Connection) -> rusqlite::Result<()> {
            timestamp_epoch REAL,
            timestamp TEXT,
            source TEXT,
+           source_lc TEXT,
            level_path TEXT,
+           level_lc TEXT,
            message_path TEXT,
            extra_paths TEXT,
-           json TEXT NOT NULL
+           json TEXT NOT NULL,
+           search_text_lc TEXT NOT NULL
          );
-         CREATE INDEX log_entry_timestamp_idx ON log_entry(timestamp_epoch, id);",
+         CREATE INDEX log_entry_timestamp_idx ON log_entry(timestamp_epoch, id);
+         CREATE INDEX log_entry_level_timestamp_idx ON log_entry(level_lc, timestamp_epoch, id);
+         CREATE INDEX log_entry_source_timestamp_idx ON log_entry(source_lc, timestamp_epoch, id);
+         CREATE VIRTUAL TABLE log_entry_fts USING fts5(
+           search_text_lc,
+           content='log_entry',
+           content_rowid='id',
+           tokenize='trigram',
+           detail='none'
+         );",
     )
 }
 
@@ -937,13 +959,16 @@ fn insert_log_entry(
     let parsed = serde_json::from_str::<Value>(line).ok();
     let normalized = normalize_storage_json(line, parsed.as_ref());
     let json_text = serde_json::to_string(&normalized).unwrap_or_else(|_| line.to_string());
+    let search_text_lc = search_text_for_storage(&normalized, line);
     let source = resolve_path(parsed.as_ref(), Some("source"));
+    let source_lc = source.as_deref().map(normalize_index_value);
     let config = config_for_source(default_config, source_configs, source.as_deref());
     let timestamp = resolve_path(parsed.as_ref(), config.timestamp_path.as_deref())
         .unwrap_or_else(|| "-".to_string());
     let timestamp_epoch = parse_time(&timestamp);
     let level = resolve_path(parsed.as_ref(), config.level_path.as_deref())
         .unwrap_or_else(|| "-".to_string());
+    let level_lc = normalize_index_value(&level);
     let message = resolve_path(parsed.as_ref(), config.message_path.as_deref())
         .unwrap_or_else(|| line.to_string());
     let extra_fields = config
@@ -953,11 +978,26 @@ fn insert_log_entry(
         .collect::<Vec<_>>();
     let extra_csv = extra_fields.join(",");
     db.execute(
-        "INSERT INTO log_entry(timestamp_epoch, timestamp, source, level_path, message_path, extra_paths, json)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
-        params![timestamp_epoch, timestamp, source, level, message, extra_csv, json_text],
+        "INSERT INTO log_entry(timestamp_epoch, timestamp, source, source_lc, level_path, level_lc, message_path, extra_paths, json, search_text_lc)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            timestamp_epoch,
+            timestamp,
+            source,
+            source_lc,
+            level,
+            level_lc,
+            message,
+            extra_csv,
+            json_text,
+            search_text_lc
+        ],
     )?;
     let id = db.last_insert_rowid();
+    db.execute(
+        "INSERT INTO log_entry_fts(rowid, search_text_lc) VALUES (?, ?)",
+        params![id, search_text_lc],
+    )?;
     let entry = if narrow_matches(&normalized, &level, narrow) {
         Some(Entry {
             id,
@@ -972,6 +1012,16 @@ fn insert_log_entry(
         None
     };
     Ok((entry, level))
+}
+
+fn search_text_for_storage(normalized: &Value, fallback: &str) -> String {
+    serde_json::to_string(normalized)
+        .unwrap_or_else(|_| fallback.to_string())
+        .to_ascii_lowercase()
+}
+
+fn normalize_index_value(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
 }
 
 fn config_for_source<'a>(
@@ -1017,100 +1067,176 @@ fn narrow_matches(value: &Value, level: &str, narrow: Option<&NarrowFilter>) -> 
     }
 }
 
-fn narrow_condition_sql(narrow: Option<&NarrowFilter>) -> Option<String> {
-    let filter = narrow?;
-    if filter.terms.is_empty() && filter.level.is_none() {
-        return None;
+#[derive(Debug, PartialEq, Eq)]
+enum TextSearchPlan {
+    None,
+    Fts { query: String },
+    Scan,
+}
+
+struct QueryPlan {
+    from_sql: &'static str,
+    where_sql: Option<String>,
+    params: Vec<SqlValue>,
+}
+
+fn text_search_plan(filter: Option<&NarrowFilter>) -> TextSearchPlan {
+    let Some(filter) = filter else {
+        return TextSearchPlan::None;
+    };
+    if filter.terms.is_empty() {
+        return TextSearchPlan::None;
     }
-    let term_condition = if filter.terms.is_empty() {
-        None
+    if filter.terms.iter().all(|term| term.chars().count() >= 3) {
+        TextSearchPlan::Fts {
+            query: fts_query_for_terms(&filter.terms, filter.operator),
+        }
     } else {
+        TextSearchPlan::Scan
+    }
+}
+
+fn fts_query_for_terms(terms: &[String], operator: NarrowOperator) -> String {
+    let joiner = match operator {
+        NarrowOperator::And => " AND ",
+        NarrowOperator::Or => " OR ",
+    };
+    terms
+        .iter()
+        .map(|term| {
+            let trigrams = term_trigrams(term);
+            let trigram_query = trigrams
+                .iter()
+                .map(|trigram| format!("\"{}\"", escape_fts_phrase(trigram)))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            format!("({trigram_query})")
+        })
+        .collect::<Vec<_>>()
+        .join(joiner)
+}
+
+fn term_trigrams(term: &str) -> Vec<String> {
+    let chars = term.chars().collect::<Vec<_>>();
+    chars
+        .windows(3)
+        .map(|window| window.iter().collect::<String>())
+        .collect()
+}
+
+fn escape_fts_phrase(value: &str) -> String {
+    value.replace('"', "\"\"")
+}
+
+fn query_plan(narrow: Option<&NarrowFilter>) -> QueryPlan {
+    let Some(filter) = narrow else {
+        return QueryPlan {
+            from_sql: "FROM log_entry e ",
+            where_sql: None,
+            params: Vec::new(),
+        };
+    };
+    let mut conditions = Vec::new();
+    let mut params = Vec::new();
+    let from_sql = match text_search_plan(Some(filter)) {
+        TextSearchPlan::None => "FROM log_entry e ",
+        TextSearchPlan::Fts { query } => {
+            conditions.push("log_entry_fts MATCH ?".to_string());
+            params.push(SqlValue::Text(query));
+            "FROM log_entry_fts JOIN log_entry e ON e.id = log_entry_fts.rowid "
+        }
+        TextSearchPlan::Scan => "FROM log_entry e ",
+    };
+
+    if !filter.terms.is_empty() {
         let joiner = match filter.operator {
             NarrowOperator::And => " AND ",
             NarrowOperator::Or => " OR ",
         };
-        Some(format!(
+        conditions.push(format!(
             "({})",
             filter
                 .terms
                 .iter()
-                .map(|_| "instr(lower(json), ?) > 0")
+                .map(|_| "instr(e.search_text_lc, ?) > 0")
                 .collect::<Vec<_>>()
                 .join(joiner)
-        ))
-    };
-    let level_condition = filter.level.as_ref().map(|_| "lower(level_path) = ?");
-    Some(
-        [term_condition.as_deref(), level_condition]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" AND "),
-    )
-}
-
-fn narrow_sql_params(narrow: Option<&NarrowFilter>) -> Vec<SqlValue> {
-    let mut values = narrow
-        .map(|filter| {
-            filter
-                .terms
-                .iter()
-                .map(|term| SqlValue::Text(term.clone()))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if let Some(level) = narrow.and_then(|filter| filter.level.as_ref()) {
-        values.push(SqlValue::Text(level.clone()));
+        ));
+        params.extend(filter.terms.iter().map(|term| SqlValue::Text(term.clone())));
     }
-    values
+
+    if let Some(level) = &filter.level {
+        conditions.push("e.level_lc = ?".to_string());
+        params.push(SqlValue::Text(level.clone()));
+    }
+
+    QueryPlan {
+        from_sql,
+        where_sql: if conditions.is_empty() {
+            None
+        } else {
+            Some(conditions.join(" AND "))
+        },
+        params,
+    }
 }
 
-fn select_rerender_entries(
+fn push_where(sql: &mut String, conditions: &[Option<String>]) {
+    let conditions = conditions.iter().flatten().cloned().collect::<Vec<_>>();
+    if !conditions.is_empty() {
+        sql.push_str("WHERE ");
+        sql.push_str(&conditions.join(" AND "));
+        sql.push(' ');
+    }
+}
+
+fn stream_rerender_entry_batches<F>(
     db: &Connection,
     max_entries: Option<usize>,
     narrow: Option<&NarrowFilter>,
-) -> rusqlite::Result<Vec<Entry>> {
-    let condition = narrow_condition_sql(narrow);
+    batch_size: usize,
+    publish_batch: F,
+) -> rusqlite::Result<()>
+where
+    F: FnMut(Vec<Entry>),
+{
+    let plan = query_plan(narrow);
     if let Some(limit) = max_entries {
         let mut sql = String::from(
             "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
              FROM (
-               SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
-               FROM log_entry ",
+               SELECT e.id, e.timestamp_epoch, e.timestamp, e.source, e.level_path, e.message_path, e.extra_paths ",
         );
-        if let Some(condition) = condition {
-            sql.push_str("WHERE ");
-            sql.push_str(&condition);
-            sql.push(' ');
-        }
+        sql.push_str(plan.from_sql);
+        push_where(&mut sql, &[plan.where_sql.clone()]);
         sql.push_str(
             "ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 0 ELSE 1 END,
                      timestamp_epoch DESC, id DESC LIMIT ?
              )
              ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, timestamp_epoch, id",
         );
-        let mut values = narrow_sql_params(narrow);
+        let mut values = plan.params;
         values.push(SqlValue::Integer(limit as i64));
-        rows_to_entries(
+        stream_entries(
             db.prepare(&sql)?
                 .query_map(params_from_iter(values), row_to_entry)?,
+            batch_size,
+            publish_batch,
         )
     } else {
         let mut sql = String::from(
-            "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
-             FROM log_entry ",
+            "SELECT e.id, e.timestamp_epoch, e.timestamp, e.source, e.level_path, e.message_path, e.extra_paths ",
         );
-        if let Some(condition) = condition {
-            sql.push_str("WHERE ");
-            sql.push_str(&condition);
-            sql.push(' ');
-        }
+        sql.push_str(plan.from_sql);
+        push_where(&mut sql, &[plan.where_sql.clone()]);
         sql.push_str(
             "ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, timestamp_epoch, id",
         );
-        rows_to_entries(
+        stream_entries(
             db.prepare(&sql)?
-                .query_map(params_from_iter(narrow_sql_params(narrow)), row_to_entry)?,
+                .query_map(params_from_iter(plan.params), row_to_entry)?,
+            batch_size,
+            publish_batch,
         )
     }
 }
@@ -1122,22 +1248,24 @@ fn select_entries_before(
     narrow: Option<&NarrowFilter>,
     boundary_id: Option<i64>,
 ) -> rusqlite::Result<Vec<Entry>> {
+    let plan = query_plan(narrow);
     let mut sql = String::from(
-        "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
-         FROM log_entry
-         WHERE (timestamp_epoch < ? OR (timestamp_epoch = ? AND id < ?)) ",
+        "SELECT e.id, e.timestamp_epoch, e.timestamp, e.source, e.level_path, e.message_path, e.extra_paths ",
     );
+    sql.push_str(plan.from_sql);
     let mut values = vec![
         SqlValue::Real(timestamp),
         SqlValue::Real(timestamp),
         SqlValue::Integer(boundary_id.unwrap_or(i64::MAX)),
     ];
-    if let Some(condition) = narrow_condition_sql(narrow) {
-        sql.push_str("AND (");
-        sql.push_str(&condition);
-        sql.push_str(") ");
-        values.extend(narrow_sql_params(narrow));
-    }
+    values.extend(plan.params);
+    push_where(
+        &mut sql,
+        &[
+            Some("(e.timestamp_epoch < ? OR (e.timestamp_epoch = ? AND e.id < ?))".to_string()),
+            plan.where_sql,
+        ],
+    );
     sql.push_str("ORDER BY timestamp_epoch DESC, id DESC LIMIT ?");
     values.push(SqlValue::Integer(limit as i64));
     let mut entries = rows_to_entries(
@@ -1155,22 +1283,24 @@ fn select_entries_after(
     narrow: Option<&NarrowFilter>,
     boundary_id: Option<i64>,
 ) -> rusqlite::Result<Vec<Entry>> {
+    let plan = query_plan(narrow);
     let mut sql = String::from(
-        "SELECT id, timestamp_epoch, timestamp, source, level_path, message_path, extra_paths
-         FROM log_entry
-         WHERE (timestamp_epoch > ? OR (timestamp_epoch = ? AND id > ?)) ",
+        "SELECT e.id, e.timestamp_epoch, e.timestamp, e.source, e.level_path, e.message_path, e.extra_paths ",
     );
+    sql.push_str(plan.from_sql);
     let mut values = vec![
         SqlValue::Real(timestamp),
         SqlValue::Real(timestamp),
         SqlValue::Integer(boundary_id.unwrap_or(0)),
     ];
-    if let Some(condition) = narrow_condition_sql(narrow) {
-        sql.push_str("AND (");
-        sql.push_str(&condition);
-        sql.push_str(") ");
-        values.extend(narrow_sql_params(narrow));
-    }
+    values.extend(plan.params);
+    push_where(
+        &mut sql,
+        &[
+            Some("(e.timestamp_epoch > ? OR (e.timestamp_epoch = ? AND e.id > ?))".to_string()),
+            plan.where_sql,
+        ],
+    );
     sql.push_str("ORDER BY timestamp_epoch ASC, id ASC LIMIT ?");
     values.push(SqlValue::Integer(limit as i64));
     rows_to_entries(
@@ -1234,6 +1364,30 @@ where
     T: Iterator<Item = rusqlite::Result<Entry>>,
 {
     rows.collect()
+}
+
+fn stream_entries<T, F>(rows: T, batch_size: usize, mut publish_batch: F) -> rusqlite::Result<()>
+where
+    T: Iterator<Item = rusqlite::Result<Entry>>,
+    F: FnMut(Vec<Entry>),
+{
+    let mut batch = Vec::with_capacity(batch_size);
+    for row in rows {
+        batch.push(row?);
+        if batch.len() >= batch_size {
+            publish_batch(std::mem::take(&mut batch));
+        }
+    }
+    if !batch.is_empty() {
+        publish_batch(batch);
+    }
+    Ok(())
+}
+
+fn reset_log_entries(db: &Connection) -> rusqlite::Result<()> {
+    db.execute("DELETE FROM log_entry_fts", [])?;
+    db.execute("DELETE FROM log_entry", [])?;
+    Ok(())
 }
 
 fn entry_fields(json_text: &str, config: &ViewerConfig) -> Vec<FieldRow> {
@@ -1490,5 +1644,174 @@ fn normalize_boundary(value: &Value) -> Option<f64> {
         Value::Number(number) => number.as_f64(),
         Value::String(text) => parse_time(text),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> ViewerConfig {
+        ViewerConfig {
+            timestamp_path: Some("timestamp".to_string()),
+            level_path: Some("level".to_string()),
+            message_path: Some("msg".to_string()),
+            extra_paths: Vec::new(),
+            json_paths: Vec::new(),
+        }
+    }
+
+    fn test_db() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        setup_db(&db).unwrap();
+        db
+    }
+
+    fn insert_test_line(db: &Connection, line: &str) {
+        insert_log_entry(db, line, &test_config(), &HashMap::new(), None).unwrap();
+    }
+
+    fn collect_rerender(
+        db: &Connection,
+        max_entries: Option<usize>,
+        narrow: Option<&NarrowFilter>,
+    ) -> Vec<Entry> {
+        let mut entries = Vec::new();
+        stream_rerender_entry_batches(db, max_entries, narrow, 2, |batch| {
+            entries.extend(batch)
+        })
+        .unwrap();
+        entries
+    }
+
+    fn filter(terms: &[&str], operator: NarrowOperator, level: Option<&str>) -> NarrowFilter {
+        NarrowFilter {
+            terms: terms.iter().map(|term| term.to_string()).collect(),
+            operator,
+            level: level.map(ToOwned::to_owned),
+        }
+    }
+
+    #[test]
+    fn fts_search_returns_hidden_json_matches() {
+        let db = test_db();
+        insert_test_line(
+            &db,
+            r#"{"timestamp":"2026-01-01T00:00:00Z","level":"info","msg":"visible","payload":{"request":"needle-123"}}"#,
+        );
+        insert_test_line(
+            &db,
+            r#"{"timestamp":"2026-01-01T00:00:01Z","level":"info","msg":"other","payload":{"request":"ignore"}}"#,
+        );
+        let narrow = filter(&["needle"], NarrowOperator::And, None);
+
+        assert!(matches!(
+            text_search_plan(Some(&narrow)),
+            TextSearchPlan::Fts { .. }
+        ));
+        let entries = collect_rerender(&db, None, Some(&narrow));
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].message, "visible");
+    }
+
+    #[test]
+    fn short_terms_use_scan_fallback() {
+        let db = test_db();
+        insert_test_line(
+            &db,
+            r#"{"timestamp":"2026-01-01T00:00:00Z","level":"info","msg":"xy visible"}"#,
+        );
+        insert_test_line(
+            &db,
+            r#"{"timestamp":"2026-01-01T00:00:01Z","level":"info","msg":"other"}"#,
+        );
+        let narrow = filter(&["xy"], NarrowOperator::And, None);
+
+        assert_eq!(text_search_plan(Some(&narrow)), TextSearchPlan::Scan);
+        let entries = collect_rerender(&db, None, Some(&narrow));
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].message, "xy visible");
+    }
+
+    #[test]
+    fn and_or_and_level_filters_preserve_behavior() {
+        let db = test_db();
+        insert_test_line(
+            &db,
+            r#"{"timestamp":"2026-01-01T00:00:00Z","level":"INFO","msg":"alpha beta"}"#,
+        );
+        insert_test_line(
+            &db,
+            r#"{"timestamp":"2026-01-01T00:00:01Z","level":"error","msg":"alpha only"}"#,
+        );
+        insert_test_line(
+            &db,
+            r#"{"timestamp":"2026-01-01T00:00:02Z","level":"error","msg":"gamma"}"#,
+        );
+
+        let and_filter = filter(&["alpha", "beta"], NarrowOperator::And, None);
+        let or_level_filter = filter(&["alpha", "gamma"], NarrowOperator::Or, Some("error"));
+
+        assert_eq!(
+            collect_rerender(&db, None, Some(&and_filter))
+                .into_iter()
+                .map(|entry| entry.message)
+                .collect::<Vec<_>>(),
+            vec!["alpha beta"]
+        );
+        assert_eq!(
+            collect_rerender(&db, None, Some(&or_level_filter))
+                .into_iter()
+                .map(|entry| entry.message)
+                .collect::<Vec<_>>(),
+            vec!["alpha only", "gamma"]
+        );
+    }
+
+    #[test]
+    fn capped_rerender_limits_newest_then_orders_for_display() {
+        let db = test_db();
+        for idx in 0..5 {
+            insert_test_line(
+                &db,
+                &format!(
+                    r#"{{"timestamp":"2026-01-01T00:00:0{idx}Z","level":"info","msg":"hit-{idx}"}}"#
+                ),
+            );
+        }
+        let narrow = filter(&["hit"], NarrowOperator::And, None);
+
+        let messages = collect_rerender(&db, Some(3), Some(&narrow))
+            .into_iter()
+            .map(|entry| entry.message)
+            .collect::<Vec<_>>();
+
+        assert_eq!(messages, vec!["hit-2", "hit-3", "hit-4"]);
+    }
+
+    #[test]
+    fn reset_removes_base_and_fts_rows() {
+        let db = test_db();
+        insert_test_line(
+            &db,
+            r#"{"timestamp":"2026-01-01T00:00:00Z","level":"info","msg":"needle"}"#,
+        );
+
+        reset_log_entries(&db).unwrap();
+
+        let base_count: i64 = db
+            .query_row("SELECT count(*) FROM log_entry", [], |row| row.get(0))
+            .unwrap();
+        let fts_matches: i64 = db
+            .query_row(
+                "SELECT count(*) FROM log_entry_fts WHERE log_entry_fts MATCH 'nee'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(base_count, 0);
+        assert_eq!(fts_matches, 0);
     }
 }
