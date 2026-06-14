@@ -989,6 +989,58 @@
       (when (file-exists-p db-path)
         (delete-file db-path)))))
 
+(ert-deftest json-log-viewer-delete-worker-files-removes-unix-socket-test ()
+  (let* ((socket-path (make-temp-file "json-log-viewer-worker-socket-test-"))
+         (server nil))
+    (unwind-protect
+        (progn
+          (delete-file socket-path)
+          (setq server
+                (condition-case err
+                    (make-network-process
+                     :name "json-log-viewer-worker-socket-test"
+                     :server t
+                     :family 'local
+                     :service socket-path
+                     :noquery t)
+                  (file-error
+                   (ert-skip
+                    (format "Cannot create Unix socket in this environment: %s"
+                            (error-message-string err))))))
+          (delete-process server)
+          (setq server nil)
+          (json-log-viewer--delete-worker-files socket-path)
+          (should-not (json-log-viewer--worker-file-present-p socket-path)))
+      (when (process-live-p server)
+        (delete-process server))
+      (when (json-log-viewer--worker-file-present-p socket-path)
+        (delete-file socket-path)))))
+
+(ert-deftest json-log-viewer-stop-async-queue-kills-worker-process-buffer-test ()
+  (let ((viewer (generate-new-buffer "*json-log-viewer-worker-cleanup-test*"))
+        (process-buffer (generate-new-buffer " *json-log-viewer-worker-cleanup-test*"))
+        process)
+    (unwind-protect
+        (progn
+          (setq process
+                (make-pipe-process
+                 :name "json-log-viewer-worker-cleanup-test"
+                 :buffer process-buffer
+                 :noquery t))
+          (with-current-buffer viewer
+            (setq-local json-log-viewer--async-queue
+                        (json-log-viewer--worker-create
+                         :process process
+                         :socket-path nil))
+            (json-log-viewer--stop-async-queue))
+          (should-not (buffer-live-p process-buffer)))
+      (when (process-live-p process)
+        (delete-process process))
+      (when (buffer-live-p process-buffer)
+        (kill-buffer process-buffer))
+      (when (buffer-live-p viewer)
+        (kill-buffer viewer)))))
+
 (ert-deftest json-log-viewer-status-updates-total-count-test ()
   (with-temp-buffer
     (json-log-viewer-mode)

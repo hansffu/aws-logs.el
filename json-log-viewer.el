@@ -685,6 +685,13 @@ When BUFFER-OR-NAME is nil, use the current buffer."
     (json-log-viewer--async-apply-command result)
     (json-log-viewer--finalize-rebuild-if-empty)))
 
+(defun json-log-viewer--kill-worker-process-buffer (process)
+  "Kill hidden process buffer for worker PROCESS, when present."
+  (when-let ((buffer (and process (process-buffer process))))
+    (when (and (buffer-live-p buffer)
+               (not (eq buffer (current-buffer))))
+      (kill-buffer buffer))))
+
 (defun json-log-viewer--stop-async-queue ()
   "Stop worker for current buffer."
   (json-log-viewer--cancel-render-queue)
@@ -697,7 +704,8 @@ When BUFFER-OR-NAME is nil, use the current buffer."
       (when (process-live-p proc)
         (ignore-errors
           (process-send-string proc (json-log-viewer--json-line '(:cmd "stop"))))
-        (delete-process proc)))
+        (delete-process proc))
+      (json-log-viewer--kill-worker-process-buffer proc))
     (when json-log-viewer-auto-delete-worker-files
       (json-log-viewer--delete-worker-files
        (json-log-viewer--worker-socket-path worker)))
@@ -735,6 +743,8 @@ When BUFFER-OR-NAME is nil, use the current buffer."
       (when-let ((ingest (json-log-viewer--worker-ingest-process worker)))
         (when (process-live-p ingest)
           (delete-process ingest)))
+      (json-log-viewer--kill-worker-process-buffer
+       (json-log-viewer--worker-process worker))
       (when json-log-viewer-auto-delete-worker-files
         (json-log-viewer--delete-worker-files
          (json-log-viewer--worker-socket-path worker)))
@@ -748,6 +758,14 @@ When BUFFER-OR-NAME is nil, use the current buffer."
   (when socket-path
     (concat socket-path ".sqlite")))
 
+(defun json-log-viewer--worker-file-present-p (path)
+  "Return non-nil when PATH names a deletable worker file or socket."
+  (and path
+       (or (file-exists-p path)
+           (file-symlink-p path)
+           (and (fboundp 'file-socket-p)
+                (file-socket-p path)))))
+
 (defun json-log-viewer--delete-worker-files (socket-path)
   "Delete worker socket and SQLite files derived from SOCKET-PATH."
   (when socket-path
@@ -757,8 +775,8 @@ When BUFFER-OR-NAME is nil, use the current buffer."
                                 db-path
                                 (and db-path (concat db-path "-wal"))
                                 (and db-path (concat db-path "-shm")))))
-      (when (file-exists-p path)
-        (ignore-errors (delete-file path)))))))
+        (when (json-log-viewer--worker-file-present-p path)
+          (ignore-errors (delete-file path)))))))
 
 (defun json-log-viewer--worker-config ()
   "Return worker config plist for current buffer."
