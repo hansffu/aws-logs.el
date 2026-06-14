@@ -2,38 +2,80 @@
 
 * Overview
 
-This repository is a small family of Emacs Lisp log tooling packages built around one shared core:
+This repository is a family of Emacs log tooling packages built around one
+shared viewer and a small Rust runtime.
 
-- Source adapters collect logs from external systems and normalize them into JSON lines.
-- =json-log-viewer= stores those lines in SQLite, derives summary metadata asynchronously, and renders interactive log buffers.
-- Higher-level packages provide transient UIs, session state, source-specific command building, and source-specific header metadata.
+- Source adapters collect logs from external systems and normalize them into
+  JSON lines.
+- =json-log-viewer= owns Emacs buffers, overlays, keybindings, source render
+  configuration, and the worker protocol.
+- Rust binaries own high-volume ingestion, JSON normalization, SQLite storage,
+  filtering, lazy detail lookup, and Kubernetes stream supervision.
+- Higher-level packages provide transient UIs, session state, presets,
+  source-specific command building, and source-specific header metadata.
 
 The current packages are:
 
 - =aws-logs=: CloudWatch tailing and Logs Insights querying.
-- =kube-logs=: Kubernetes log viewing through =kubectl logs=.
+- =kube-logs=: Kubernetes log viewing through =kubectl= or the Rust kube
+  supervisor.
 - =kafka-logs=: Kafka message viewing through =kcat=.
-- =json-log-viewer=: generic viewer, storage, filtering, and rendering engine.
+- =composite-log-viewer=: one shared viewer buffer for multiple kube/kafka
+  streams.
+- =json-log-viewer=: generic viewer, worker client, storage protocol,
+  filtering, sliding windows, and rendering engine.
+
+* Architectural Goals
+
+The architecture is designed to keep Emacs responsive under large or continuous
+log volume.
+
+That means:
+
+- Do not make Emacs parse, store, filter, or reshape every log line when a
+  worker process can do it.
+- Keep process filters lightweight. In streaming paths, Emacs should start the
+  source process and receive small rendered batches, not synchronously process
+  unbounded stdout chunks.
+- Push high-volume data over a Unix socket to Rust instead of through the Emacs
+  command channel.
+- Keep visible Emacs state small: rendered summary overlays, current filter
+  state, current source config, and enough IDs to request details lazily.
+- Prefer pull-based UI updates. The worker can ingest continuously while Emacs
+  periodically asks for pending visible entries, and hidden buffers skip pulls
+  unless background refresh is enabled.
+- Preserve source-specific behavior at the adapter layer. The viewer should not
+  learn how to parse =kubectl=, =kcat=, or =aws= output directly.
+
+Any change that adds parsing, blocking CLI calls, full-detail rendering, or
+large in-memory data structures to the main Emacs process should be treated as
+an architecture regression unless there is a clear reason.
 
 * Architectural Style
 
 The system follows a layered structure:
 
 1. UI/session layer
-   - Transient menus and buffer-local/session variables capture user intent.
+   - Transient menus and session variables capture user intent.
    - Examples: =aws-logs.el=, =kube-logs.el=, =kafka-logs.el=.
 2. Source execution layer
-   - Builds CLI commands, runs subprocesses, and handles one-shot vs streaming flows.
-   - Converts source output into normalized JSON lines or row objects.
+   - Builds CLI commands, starts subprocesses, and handles one-shot vs streaming
+     flows.
+   - Converts source output into normalized JSON lines, either in Emacs for
+     lower-volume paths or in Rust for streaming paths.
 3. Shared viewer layer
-   - Stores log data in per-buffer SQLite databases.
-   - Asynchronously derives display summaries and details.
-   - Renders foldable overlays, handles narrow/widen, refresh, and auto-follow.
-4. Async infrastructure layer
-   - Runs ordered jobs in subordinate Emacs processes.
-   - Keeps heavy SQLite and normalization work off the main UI thread.
+   - Creates viewer buffers.
+   - Registers summary/detail path configuration.
+   - Renders foldable overlays and handles user interaction.
+   - Sends control commands to the Rust worker.
+4. Rust runtime layer
+   - Stores entries in per-buffer SQLite databases.
+   - Derives summaries and source-specific render metadata.
+   - Performs narrow/rerender/load-more/detail queries.
+   - Supervises high-volume ingestion outside Emacs.
 
-This keeps source-specific logic mostly separate from rendering/storage logic.
+This keeps source-specific logic separate from rendering/storage logic, and it
+keeps the highest-volume work outside the main editor process.
 
 * Main Components
 
@@ -41,7 +83,9 @@ This keeps source-specific logic mostly separate from rendering/storage logic.
 
 *** =aws-logs.el=
 
-- Owns user-facing session state: profile, region, log group, time range, follow mode, ECS mode, filters, Insights query, summary field overrides, and presets.
+- Owns user-facing session state: profile, region, log group, time range,
+  follow mode, ECS mode, filters, Insights query, summary field overrides, and
+  presets.
 - Defines the transient UI and saved-query workflow.
 - Delegates execution to:
   - =aws-logs-tail.el= for =aws logs tail=
@@ -50,46 +94,60 @@ This keeps source-specific logic mostly separate from rendering/storage logic.
 
 *** =aws-logs-tail.el=
 
-- Builds =aws logs tail= commands from the session state.
-- Supports two rendering modes:
-  - Plain comint output for raw tailing.
-  - ECS/JSON mode through =json-log-viewer=.
-- In ECS streaming mode it implements a staged pipeline:
-  - process chunk queue
-  - raw line queue
-  - JSON normalization queue
-  - batched viewer pushes
-- Applies backpressure by pausing and resuming the subprocess when queues exceed watermarks.
+- Builds =aws logs tail= commands from session state.
+- Supports plain comint output for raw tailing.
+- Supports ECS/JSON mode through =json-log-viewer=.
+- Uses batching/backpressure in ECS streaming paths to avoid flooding Emacs with
+  redraw work.
+
+AWS tail is more Emacs-mediated than kube/kafka streaming. Avoid moving
+additional heavy parsing into this path; prefer the shared worker/socket design
+for higher-throughput AWS ingestion.
 
 *** =aws-logs-insights.el=
 
-- Runs asynchronous Logs Insights queries using =start-query= and polling =get-query-results=.
-- Freezes source context into the viewer buffer so refreshes keep using the original query, log group, and AWS args.
+- Runs asynchronous Logs Insights queries using =start-query= and polling
+  =get-query-results=.
+- Freezes source context into the viewer buffer so refreshes keep using the
+  original query, log group, and AWS args.
 - Converts Insights rows into JSON lines with synthetic summary fields:
   - =__summary_timestamp=
   - =__summary_level=
   - =__summary_message=
   - synthetic extra fields
-- Uses =json-log-viewer= as the display surface for both initial loads and refreshes.
+- Uses =json-log-viewer= as the display surface for initial loads and refreshes.
 
 *** =aws-logs-query.el=
 
 - Defines a small major mode for Logs Insights query editing.
 - Provides popup editing with recursive-edit and finish/cancel commands.
-- Supplies syntax highlighting used both in the editor and in transient summaries.
+- Supplies syntax highlighting used in the editor and transient summaries.
 
 *** =kube-logs.el=
 
-- Provides a transient UI for =kubectl logs=.
-- Manages context, namespace, target kind/name, follow, tail, since, filters, and presets.
-- Converts Kubernetes log lines into normalized JSON objects with fields such as:
-  - =timestamp=
-  - =raw=
-  - =namespace=
-  - =target=
-  - =kind=
-  - =payload=
-- Uses =json-log-viewer= for both one-shot and streaming modes.
+- Provides a transient UI for Kubernetes logs.
+- Manages context, namespace, target kind/name, follow, tail, since, filters,
+  stream backend, debug process buffers, formatting paths, and presets.
+- One-shot fetches use =kubectl logs= and then push normalized JSON lines into
+  the viewer.
+- Streaming supports two backends:
+  - =rust=: =kube-log-supervisor= uses kube-rs to follow pods/deployments and
+    writes normalized frames to the viewer worker socket.
+  - =kubectl=: a =kubectl logs --follow= process is wrapped by
+    =json-log-viewer-ingest-wrapper=, which normalizes stdout and writes to the
+    worker socket.
+- Can append to a selected =composite-log-viewer= buffer instead of creating a
+  dedicated kube buffer.
+
+Kubernetes normalized objects include fields such as:
+
+- =source=
+- =timestamp=
+- =raw=
+- =namespace=
+- =target=
+- =kind=
+- =payload=
 
 *** =kafka-logs.el=
 
@@ -97,97 +155,153 @@ This keeps source-specific logic mostly separate from rendering/storage logic.
 - Manages connection definitions, topic selection, stream vs time-span mode,
   filters, value wire format, payload rendering, message path, JSON detail
   paths, and extra summary paths.
-- Resolves credentials from =auth-source= when configured.
-- Resolves Schema Registry credentials from =auth-source= when configured.
+- Resolves Kafka and Schema Registry credentials from =auth-source= when
+  configured.
 - Auto-detects Avro topics by checking Schema Registry for conventional
   =<topic>-value= subjects, then delegates Avro decoding to =kcat=.
-- Converts kcat JSON envelopes into normalized JSON objects with fields such as:
-  - =timestamp=
-  - =level=
-  - =topic=
-  - =partition=
-  - =offset=
-  - =key=
-  - =headers=
-  - =payload=
-- Uses =json-log-viewer= for both one-shot and streaming consumption.
+- One-shot/time-span fetches collect =kcat= output asynchronously and push
+  normalized JSON lines.
+- Streaming runs =kcat= through =json-log-viewer-ingest-wrapper= so Emacs does
+  not parse every message.
+- Can append to a selected =composite-log-viewer= buffer instead of creating a
+  dedicated Kafka buffer.
 
-** Shared Viewer and Storage
+Kafka normalized objects include fields such as:
+
+- =source=
+- =timestamp=
+- =level=
+- =topic=
+- =partition=
+- =offset=
+- =key=
+- =headers=
+- =payload=
+
+*** =composite-log-viewer.el=
+
+- Creates a single =json-log-viewer= buffer in =composite-log-viewer-mode=.
+- Starts multiple kube/kafka stream sources into that buffer.
+- Dispatches source plists to =kube-logs-stream-to-buffer= or
+  =kafka-logs-stream-to-buffer=.
+- Does not support AWS sources.
+- Always streams from the start time of the composite session:
+  - Kafka starts at the topic end.
+  - Kubernetes follows with =--tail=0= and no =--since=.
+
+Composite mode relies on per-source render configuration. Kube and Kafka
+register their own timestamp, level, message, extra, and JSON detail paths so
+one shared buffer can render mixed sources correctly.
+
+** Shared Viewer and Rust Runtime
 
 *** =json-log-viewer.el=
 
-This is the core of the repository.
+This is the Emacs-side core.
 
 Responsibilities:
 
 - Create viewer buffers with =json-log-viewer-make-buffer=.
-- Normalize summary/display configuration:
+- Start and stop one Rust worker per viewer buffer.
+- Maintain buffer-local render state:
+  - current filter terms/operator/level
+  - current source render configs
+  - rendered summary overlays
+  - expanded detail overlays
+  - pull timer and worker readiness state
+- Normalize display configuration:
   - timestamp path
   - level path
   - message path
   - extra summary paths
   - JSON detail block paths
-- Persist raw JSON in a per-buffer SQLite database.
-- Run async ingestion and truncation queues.
-- Render foldable summary rows with overlay-backed expansion.
-- Support:
-  - streaming append
-  - non-streaming replace
-  - narrow/widen replay from stored JSON
-  - refresh callbacks
-  - auto-follow
+- Register per-source render config for composite buffers with
+  =json-log-viewer-register-source-config=.
+- Send low-volume control commands to the worker.
+- Send direct JSON lines to the worker ingestion socket for lower-volume API
+  pushes.
+- Pull rendered batches from the worker and append/prepend summary overlays.
+- Request full details lazily when an entry is expanded.
+- Support narrow/widen, multi-term filters, level filters, sliding windows,
+  refresh callbacks, and auto-follow.
 
 Important design choice:
 
 - The main buffer keeps summaries and overlays in memory.
-- Full detail data lives in SQLite and is loaded lazily when an entry is expanded.
+- Full detail data lives in the worker-owned SQLite database and is loaded
+  lazily.
+- Live entries wait in Rust until Emacs pulls them.
 
-This is why large or streaming buffers remain usable without storing all rendered details directly on overlays.
+This is why large or streaming buffers remain usable without materializing all
+rendered details directly in Emacs.
+
+*** =json-log-viewer-worker=
+
+Rust binary: =rust/json-log-viewer-worker/src/main.rs=.
+
+Responsibilities:
+
+- Own the per-buffer SQLite database.
+- Listen on a Unix socket for high-volume line-framed ingestion.
+- Parse and normalize JSON lines.
+- Resolve summary paths and source-specific render config.
+- Maintain capped pending live entries for pull-based display.
+- Execute reset, narrow, rerender, load-more, entry-details, configure-source,
+  pull, and stop commands.
+- Return small Lisp-readable result forms to Emacs.
+
+The worker has two channels:
+
+- Control channel: stdin/stdout JSON commands from Emacs, Lisp-readable result
+  forms back to Emacs.
+- Ingestion channel: Unix socket frames, currently =L <json-line>= for entries
+  and =F <request-id>= for flush barriers.
+
+*** =json-log-viewer-ingest-wrapper=
+
+Rust binary: =rust/json-log-viewer-ingest-wrapper/src/main.rs=.
+
+Responsibilities:
+
+- Run a source command such as =kubectl= or =kcat=.
+- Read stdout outside Emacs.
+- Normalize kube/kafka output into viewer JSON.
+- Write normalized JSON frames directly to the worker socket.
+- Keep stderr/diagnostic output low-volume for Emacs process filters.
+
+This wrapper is the main mechanism that prevents high-throughput kube/kafka
+streams from saturating Emacs process filters.
+
+*** =kube-log-supervisor=
+
+Rust binary: =rust/kube-log-supervisor/src/main.rs=.
+
+Responsibilities:
+
+- Use kube-rs to follow pod/deployment logs.
+- Watch deployment-selected pods and start/stop pod streams as pods appear or
+  disappear.
+- Normalize Kubernetes log lines into viewer JSON.
+- Write JSON frames directly to the worker socket.
+
+This avoids a fragile shell pipeline for the default kube streaming backend and
+keeps pod watch/log stream work out of Emacs.
 
 *** =json-log-viewer-shared.el=
 
 - Shared JSON/path helper library.
-- Handles:
-  - JSON parsing
-  - path resolution
-  - escaped-dot path handling
-  - flattening nested JSON
-  - conversion of nested values to one-line summary strings
+- Handles JSON parsing, path resolution, escaped-dot paths, flattening nested
+  JSON, and nested value stringification.
+- Still matters for Emacs-side summary helpers and tests.
 
-Both the main viewer and the async worker depend on the same path semantics, which keeps summaries and details consistent.
+*** =json-log-viewer-repository.el= and =json-log-viewer-async-worker.el=
 
-*** =json-log-viewer-repository.el=
-
-- SQL-only storage layer around SQLite.
-- Defines schema and reusable repository operations for:
-  - inserts
-  - summary row selection
-  - raw JSON lookup
-  - filtering searches
-  - truncation
-  - copying rows from one SQLite database into another
-
-It is intentionally thin so the viewer and async workers share one data model.
-
-*** =json-log-viewer-async-worker.el=
-
-- Worker-side logic for async ingestion and truncation.
-- Runs inside subordinate Emacs processes started by =async-job-queue=.
-- Responsibilities:
-  - parse JSON lines
-  - derive summary metadata
-  - write rows into SQLite
-  - rebuild visible entries for narrow/widen
-  - delete old rows when streaming retention limits are exceeded
-
-*** =async-job-queue.el=
-
-- Small ordered async queue abstraction.
-- Starts a dedicated subordinate Emacs process.
-- Serializes a processing function into that worker.
-- Guarantees job callbacks are delivered in push order.
-
-This ordering guarantee matters because log ingest, replay, and truncation must not race in a way that breaks the viewer’s visible ordering.
+- Emacs-side SQLite repository and worker logic retained for compatibility and
+  tests.
+- Keep them coherent while they remain in the tree, but the primary runtime
+  path is the Rust worker.
+- Do not add new high-volume behavior to these modules unless explicitly
+  reintroducing the Emacs worker path.
 
 *** =json-log-viewer-evil.el=
 
@@ -196,163 +310,276 @@ This ordering guarantee matters because log ingest, replay, and truncation must 
 
 * Data Model
 
-The shared data contract across source adapters is “normalized JSON line”.
+The shared data contract across source adapters is "normalized JSON line".
 
-Each source package turns external output into a JSON object string with enough fields for the viewer to do three jobs:
+Each source package turns external output into a JSON object string with enough
+fields for the viewer and worker to:
 
 - render summary lines
-- keep the raw/full payload for expansion and searching
+- keep raw/full payload for expansion and searching
 - preserve source context in consistent fields
+- identify which source-specific render config applies
 
-The viewer then stores each entry in SQLite as:
+The worker stores each entry in SQLite as:
 
 - raw JSON text
-- resolved summary metadata
+- resolved source name
+- resolved summary metadata:
   - timestamp
   - level
   - message
   - extra fields
 - sortable timestamp epoch when available
 
-The rendered buffer uses summary metadata for the visible line and retrieves full details lazily from SQLite on expansion.
+The rendered buffer uses summary metadata for visible lines and retrieves full
+details lazily from SQLite on expansion.
 
 * Primary Flows
 
-** 1. AWS tail / kube logs / Kafka stream
+** 1. Dedicated kube/kafka stream
 
-1. User configures options in a transient UI.
-2. Source package builds CLI args and starts a subprocess.
-3. Process output arrives in chunks.
-4. Source adapter normalizes output into JSON lines.
-5. Source adapter pushes JSON lines into =json-log-viewer=.
-6. =json-log-viewer= submits ingest jobs to the async worker queue.
-7. Worker writes raw JSON plus summary metadata into SQLite.
-8. Callback appends visible entries into the viewer buffer.
+1. User configures options in the kube or Kafka transient.
+2. Source package creates a dedicated =json-log-viewer= buffer.
+3. =json-log-viewer= starts a Rust worker and receives a socket path.
+4. Source package starts either:
+   - =json-log-viewer-ingest-wrapper= around =kubectl= or =kcat=, or
+   - =kube-log-supervisor= for the Rust Kubernetes backend.
+5. Rust source process writes normalized JSON frames to the worker socket.
+6. Worker parses, summarizes, stores, caps, and queues visible entries.
+7. Emacs periodically sends =pull= when the buffer is visible.
+8. Worker returns a batch of rendered entries.
+9. Emacs inserts summary overlays. Details are loaded only on expansion.
 
-** 2. AWS Logs Insights
+** 2. Composite kube/kafka stream
+
+1. Caller invokes =composite-log-viewer-create= with a buffer name and source
+   plist list.
+2. Composite viewer creates one shared =json-log-viewer= buffer.
+3. Each source plist is dispatched to the kube or Kafka stream starter.
+4. Each source starter registers source-specific render paths with the worker.
+5. Each source starts its own Rust wrapper/supervisor process.
+6. All sources write normalized JSON frames to the same worker socket.
+7. The worker stores and renders mixed entries using the source field and
+   per-source config.
+8. Emacs pulls and displays one combined timeline with source tags.
+
+** 3. AWS Logs Insights
 
 1. User sets a query and launches Insights.
 2. =aws-logs-insights.el= starts =aws logs start-query= asynchronously.
 3. It polls =get-query-results= until completion.
 4. Rows are transformed into JSON lines with synthetic summary fields.
-5. =json-log-viewer= replaces the viewer contents.
+5. =json-log-viewer= replaces the viewer contents through the worker.
 6. Later refreshes rerun the frozen query context from the viewer buffer.
+
+** 4. One-shot kube/Kafka lookups
+
+1. Source package starts the CLI asynchronously.
+2. Output is collected in a temporary buffer.
+3. On successful exit, source code normalizes lines to viewer JSON.
+4. Dedicated buffers replace their contents; selected composite buffers append.
+5. The viewer sends those lines to the worker ingestion socket.
+
+This path does more work in Emacs than streaming. Keep it acceptable by using it
+for bounded output only.
 
 * Data Flow Diagram
 
 #+begin_example
-                +-------------------+
-                |   Transient/UI    |
-                | aws/kube/kafka    |
-                +---------+---------+
-                          |
-                          v
-                +-------------------+
-                | Session variables |
-                | presets/query cfg |
-                +---------+---------+
-                          |
-                          v
-        +-------------------------------------------+
-        | Source adapters                           |
-        | aws-logs-tail / aws-logs-insights         |
-        | kube-logs / kafka-logs                    |
-        +---------+-------------------+-------------+
-                  |                   |
-                  | subprocess output |
-                  | / query results   |
-                  v                   |
-        +-------------------------+   |
-        | JSON-line normalization |<--+
-        | source-specific mapping |
-        +------------+------------+
-                     |
-                     v
-        +-----------------------------+
-        | json-log-viewer             |
-        | buffer API + render engine  |
-        +-------------+---------------+
-                      |
-                      | async jobs
-                      v
-        +-----------------------------+
-        | async-job-queue             |
-        | subordinate Emacs workers   |
-        +-------------+---------------+
-                      |
-                      v
-        +-----------------------------+
-        | json-log-viewer-async-worker|
-        | parse / summarize / filter  |
-        +-------------+---------------+
-                      |
-                      v
-        +-----------------------------+
-        | SQLite repository           |
-        | raw JSON + summary metadata |
-        +-------------+---------------+
-                      |
-        lazy details  | visible summary rows
-         on expand    |
-                      v
-        +-----------------------------+
-        | json-log-viewer buffer      |
-        | overlays, narrow, refresh   |
-        +-----------------------------+
+             +----------------------+
+             | Transient/UI or Lisp |
+             | aws / kube / kafka   |
+             | composite spec       |
+             +----------+-----------+
+                        |
+                        v
+             +----------------------+
+             | Source adapter       |
+             | command + render cfg |
+             +----------+-----------+
+                        |
+        low volume      |      high volume streaming
+        JSON push       |      source stdout / kube watch
+             |          |              |
+             |          v              v
+             |   +-----------------------------+
+             |   | Rust wrapper/supervisor     |
+             |   | normalize source output     |
+             |   +-------------+---------------+
+             |                 |
+             +---------------->| Unix socket frames
+                               v
+                  +--------------------------+
+                  | json-log-viewer-worker  |
+                  | parse / store / filter  |
+                  | summarize / detail rows |
+                  +------------+-------------+
+                               |
+                    pull       | control results
+                  commands     v
+                  +--------------------------+
+                  | json-log-viewer buffer   |
+                  | overlays, folds, windows |
+                  +--------------------------+
 #+end_example
 
 * Package Relationships
 
-- =aws-logs.el= depends on =aws-logs-tail.el=, =aws-logs-insights.el=, and =aws-logs-query.el=.
-- =aws-logs-tail.el= and =aws-logs-insights.el= both depend on =json-log-viewer=.
-- =kube-logs.el= and =kafka-logs.el= also depend on =json-log-viewer=.
-- =json-log-viewer= depends on:
-  - =json-log-viewer-shared=
-  - =json-log-viewer-repository=
-  - =json-log-viewer-async-worker=
-  - =async-job-queue=
+- =aws-logs.el= depends on =aws-logs-tail.el=, =aws-logs-insights.el=, and
+  =aws-logs-query.el=.
+- =aws-logs-tail.el= and =aws-logs-insights.el= depend on =json-log-viewer= for
+  JSON rendering.
+- =kube-logs.el= depends on =composite-log-viewer= and =json-log-viewer=.
+- =kafka-logs.el= depends on =composite-log-viewer= and =json-log-viewer=.
+- =composite-log-viewer.el= depends on =json-log-viewer= and dynamically
+  requires =kube-logs= or =kafka-logs= per source type.
+- =json-log-viewer= starts:
+  - =json-log-viewer-worker=
+  - =json-log-viewer-ingest-wrapper= for wrapped source commands
+  - =kube-log-supervisor= through =kube-logs= when the Rust kube backend is used
+- Cargo/Nix package the three Rust binaries together.
+
 * Concurrency and State Boundaries
 
 ** Main Emacs process
 
 - Owns transient UI state and viewer buffers.
-- Starts and manages external CLI subprocesses.
+- Starts and tracks external CLI/Rust subprocesses.
+- Sends low-volume worker commands.
 - Renders overlays and handles user interaction.
+- Should avoid blocking process filters, synchronous large parses, and large
+  detail materialization.
 
-** Subordinate Emacs worker process
+** Rust worker process
 
-- Performs ordered async jobs for ingestion, filtering rebuilds, and truncation.
-- Writes and reads SQLite outside the main UI path.
+- One worker per viewer buffer.
+- Owns the SQLite file and ingestion socket.
+- Performs JSON parsing, summary extraction, filtering, rerender, load-more,
+  truncation/capping, and detail lookup.
+- Buffers pending live entries until Emacs pulls.
+
+** Rust source processes
+
+- =json-log-viewer-ingest-wrapper= owns CLI stdout parsing for wrapped
+  kube/kafka commands.
+- =kube-log-supervisor= owns Kubernetes watch/log stream concurrency.
+- Both write normalized frames to the viewer worker socket.
 
 ** Buffer-local state
 
 Each viewer buffer has isolated state:
 
-- SQLite file/database handle
-- async queues
+- Rust worker process and socket path
+- ingest process connection for direct Emacs pushes
+- pull timer and in-flight pull state
 - summary path configuration
-- current filter
-- current overlays
-- subscriber list
+- source-specific render configs
+- current filter terms/operator/level
+- rendered entry overlays and fold overlays
+- source process handles for kube/kafka/composite buffers
 
-This makes the architecture naturally multi-buffer and allows different sources to coexist without a global data registry.
+This makes the architecture multi-buffer and allows different sources to
+coexist without a global data registry.
+
+* Option Surfaces That Must Stay In Sync
+
+The transient UIs and =composite-log-viewer-create= are two entry points into
+the same source adapters. Keep their option names, defaults, validation, and
+render behavior synchronized unless an exception is listed below.
+
+** Kubernetes
+
+These transient/session concepts should have matching composite source keys:
+
+- context: =kube-logs-context= and =:context=
+- namespace: =kube-logs-namespace= and =:namespace=
+- namespace override: =kube-logs-namespace-enabled= and =:namespace-enabled=
+- target kind: =kube-logs-target-kind= and =:target-kind=
+- target name: =kube-logs-target= and =:target=
+- regex filter: =kube-logs-filter= and =:filter=
+- stream backend: =kube-logs-stream-backend= and =:stream-backend=
+- debug process buffer: =kube-logs-debug-process-buffer= and
+  =:debug-process-buffer=
+- timestamp path: =kube-logs-timestamp-path= and =:timestamp-path=
+- level path: =kube-logs-level-path= and =:level-path=
+- message path: =kube-logs-message-path= and =:message-path=
+- extra summary paths: =kube-logs-extra-paths= and =:extra-paths=
+
+Intentional composite exceptions:
+
+- Composite kube sources always follow from the start time of the composite
+  session.
+- =:follow= is not needed; it is forced to true.
+- =:tail-lines= is not exposed for historical fetch; it is forced to =0=.
+- =:since= is not exposed; it is forced to nil.
+- Composite sources append to an existing shared viewer instead of replacing a
+  dedicated buffer.
+
+** Kafka
+
+These transient/session concepts should have matching composite source keys:
+
+- connection: =kafka-logs-connection= and =:connection=
+- topic: =kafka-logs-topic= and =:topic=
+- regex filter: =kafka-logs-filter= and =:filter=
+- value wire format: =kafka-logs-value-format= and =:value-format=
+- payload rendering: =kafka-logs-payload-format= and =:payload-format=
+- message path: =kafka-logs-message-path= and =:message-path=
+- JSON detail paths: =kafka-logs-json-paths= and =:json-paths=
+- extra summary paths: =kafka-logs-extra-paths= and =:extra-paths=
+
+Intentional composite exceptions:
+
+- Composite Kafka sources always stream from the topic end.
+- =:stream= is not needed; it is forced to true.
+- =:since=, =:time-range=, and =:max-messages= are not exposed for composite
+  sources.
+- Composite sources append to an existing shared viewer instead of replacing a
+  dedicated buffer.
+
+** Viewer Rendering
+
+Dedicated and composite buffers should render the same source data the same way
+when given the same path options. When adding or renaming formatting options,
+update all of:
+
+- the transient/session variable
+- the dedicated viewer buffer construction
+- the composite source plist contract
+- =json-log-viewer-register-source-config= calls
+- README examples
+- tests for dedicated and composite paths
 
 * Design Invariants
 
 The tests reinforce a few important invariants:
 
 - Path resolution works for both nested keys and dotted JSON keys.
-- Narrowing and widening operate from stored JSON, not only from visible summary text.
-- Streaming viewers ingest entries asynchronously but preserve callback order.
-- Source adapters normalize into viewer-friendly JSON instead of letting the viewer parse source-specific CLI formats directly.
+- Narrowing and widening operate from stored JSON, not only from visible summary
+  text.
+- Multi-term and level filters are represented in Emacs state and executed by
+  the worker.
+- Streaming viewers ingest asynchronously and render via pull batches.
+- Composite buffers use source-specific path config for summary rendering.
+- Source adapters normalize into viewer-friendly JSON instead of letting the
+  viewer parse source-specific CLI formats directly.
+- Worker-backed detail expansion loads fields lazily by entry ID.
 
 * Extension Points
 
 To add a new log source, the current architecture expects:
 
 1. A source package that owns user/session state and command building.
-2. A normalization step that converts source output into JSON lines.
-3. A =json-log-viewer= buffer configured with appropriate summary and detail paths.
-4. Optional transient UI, refresh behavior, or presets.
+2. A bounded one-shot path or a streaming Rust wrapper/supervisor path.
+3. A normalization step that converts source output into JSON lines with a
+   stable =source= field.
+4. A =json-log-viewer= buffer configured with appropriate summary and detail
+   paths.
+5. Optional composite support via a source plist contract and
+   =json-log-viewer-register-source-config=.
+6. Tests that cover both dedicated and composite behavior when both are
+   supported.
 
-Because the viewer contract is JSON-line based, new sources can plug in without changing the renderer or storage model.
+Because the viewer contract is JSON-line based, new sources can plug in without
+changing the renderer or storage model. High-throughput sources should plug in
+through Rust/socket ingestion rather than Emacs process-filter parsing.
