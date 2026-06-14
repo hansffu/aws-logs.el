@@ -39,6 +39,20 @@
     "json TEXT NOT NULL, "
     "search_text_lc TEXT NOT NULL)"))
   (sqlite-execute db "CREATE INDEX log_entry_timestamp_idx ON log_entry(timestamp_epoch, id)")
+  (sqlite-execute
+   db
+   (concat
+    "CREATE INDEX log_entry_display_order_idx "
+    "ON log_entry("
+    "CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END, "
+    "timestamp_epoch, id)"))
+  (sqlite-execute
+   db
+   (concat
+    "CREATE INDEX log_entry_tail_order_idx "
+    "ON log_entry("
+    "CASE WHEN timestamp_epoch IS NULL THEN 0 ELSE 1 END, "
+    "timestamp_epoch DESC, id DESC)"))
   (sqlite-execute db
                   (concat
                    "CREATE INDEX log_entry_level_timestamp_idx "

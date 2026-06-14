@@ -466,6 +466,18 @@ fn setup_db(db: &Connection) -> rusqlite::Result<()> {
            search_text_lc TEXT NOT NULL
          );
          CREATE INDEX log_entry_timestamp_idx ON log_entry(timestamp_epoch, id);
+         CREATE INDEX log_entry_display_order_idx
+           ON log_entry(
+             CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END,
+             timestamp_epoch,
+             id
+           );
+         CREATE INDEX log_entry_tail_order_idx
+           ON log_entry(
+             CASE WHEN timestamp_epoch IS NULL THEN 0 ELSE 1 END,
+             timestamp_epoch DESC,
+             id DESC
+           );
          CREATE INDEX log_entry_level_timestamp_idx ON log_entry(level_lc, timestamp_epoch, id);
          CREATE INDEX log_entry_source_timestamp_idx ON log_entry(source_lc, timestamp_epoch, id);
          CREATE VIRTUAL TABLE log_entry_fts USING fts5(
@@ -1813,5 +1825,34 @@ mod tests {
             .unwrap();
         assert_eq!(base_count, 0);
         assert_eq!(fts_matches, 0);
+    }
+
+    #[test]
+    fn widen_ordering_queries_use_ordering_indexes() {
+        let db = test_db();
+        let display_plan: String = db
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT e.id FROM log_entry e
+                 ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 1 ELSE 0 END,
+                          timestamp_epoch, id",
+                [],
+                |row| row.get(3),
+            )
+            .unwrap();
+        let tail_plan: String = db
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT e.id FROM log_entry e
+                 ORDER BY CASE WHEN timestamp_epoch IS NULL THEN 0 ELSE 1 END,
+                          timestamp_epoch DESC, id DESC
+                 LIMIT 10",
+                [],
+                |row| row.get(3),
+            )
+            .unwrap();
+
+        assert!(display_plan.contains("log_entry_display_order_idx"));
+        assert!(tail_plan.contains("log_entry_tail_order_idx"));
     }
 }
