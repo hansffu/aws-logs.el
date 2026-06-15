@@ -106,6 +106,55 @@
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
+(ert-deftest kube-logs-stream-retry-schedules-restart-test ()
+  (let ((buffer (generate-new-buffer "*kube-stream-retry-test*"))
+        (proc nil)
+        captured-delay
+        captured-timer-fn
+        restarted-attempt)
+    (unwind-protect
+        (progn
+          (setq proc
+                (make-process
+                 :name "kube-stream-retry-test"
+                 :buffer nil
+                 :command '("sh" "-c" "sleep 60")
+                 :noquery t))
+          (process-put proc 'kube-logs-restart-fn
+                       (lambda (attempt)
+                         (setq restarted-attempt attempt)))
+          (process-put proc 'kube-logs-retry-attempt 0)
+          (process-put proc 'kube-logs-description "deployment/payments-api")
+          (process-put proc 'kube-logs-started-at (float-time))
+          (with-current-buffer buffer
+            (setq-local kube-logs--stream-retry-timers nil))
+          (let ((kube-logs-stream-retry-enabled t)
+                (kube-logs-stream-retry-max-delay 30)
+                (kube-logs-stream-retry-reset-after 60))
+            (cl-letf (((symbol-function 'run-at-time)
+                       (lambda (delay _repeat function &rest args)
+                         (setq captured-delay delay)
+                         (setq captured-timer-fn
+                               (lambda ()
+                                 (apply function args)))
+                         'retry-timer))
+                      ((symbol-function 'message)
+                       (lambda (&rest _args) nil)))
+              (kube-logs--schedule-process-retry
+               buffer proc "exited abnormally\n")))
+          (should (= captured-delay 2))
+          (with-current-buffer buffer
+            (should (equal kube-logs--stream-retry-timers '(retry-timer))))
+          (funcall captured-timer-fn)
+          (should (= restarted-attempt 1))
+          (with-current-buffer buffer
+            (should-not kube-logs--stream-retry-timers)))
+      (when (process-live-p proc)
+        (process-put proc 'kube-logs-stop-requested t)
+        (delete-process proc))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
 (ert-deftest kube-logs-supervisor-command-test ()
   (let ((kube-logs-context "prod-cluster")
         (kube-logs-namespace "payments")

@@ -116,6 +116,21 @@ When non-nil, output is piped through grep with this regex."
                  (const :tag "kubectl logs" kubectl))
   :group 'kube-logs)
 
+(defcustom kube-logs-stream-retry-enabled t
+  "When non-nil, restart kube log follow processes after disconnects."
+  :type 'boolean
+  :group 'kube-logs)
+
+(defcustom kube-logs-stream-retry-max-delay 30
+  "Maximum reconnect delay in seconds for kube log follow processes."
+  :type 'integer
+  :group 'kube-logs)
+
+(defcustom kube-logs-stream-retry-reset-after 60
+  "Seconds after which a live kube log stream resets its retry backoff."
+  :type 'integer
+  :group 'kube-logs)
+
 (defcustom kube-logs-debug-process-buffer nil
   "When non-nil, keep a process buffer for Rust supervisor diagnostics.
 
@@ -211,6 +226,9 @@ Each element has the form (NAME . PLIST).")
 
 (defvar-local kube-logs--stream-drain-timer nil
   "Per-buffer timer used to drain queued stream data incrementally.")
+
+(defvar-local kube-logs--stream-retry-timers nil
+  "Retry timers waiting to restart kube log streams in this buffer.")
 
 (defvar-local kube-logs--once-output-buffer nil
   "Temporary process output buffer for one-shot asynchronous fetches.")
@@ -501,6 +519,7 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
   "Stop process and cleanup state associated with BUFFER, if any."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
+      (kube-logs--cancel-stream-retry-timers)
       (let ((processes (delete-dups
                         (delq nil
                               (append kube-logs--processes
@@ -509,6 +528,7 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
                                                  (get-buffer-process buffer))))))))
         (dolist (proc processes)
           (when (process-live-p proc)
+            (process-put proc 'kube-logs-stop-requested t)
             (delete-process proc)))
         (setq kube-logs--process nil)
         (setq kube-logs--processes nil))
@@ -519,6 +539,7 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
       (setq kube-logs--stream-chunks-in nil)
       (setq kube-logs--stream-chunks-out nil)
       (setq kube-logs--stream-pending-lines nil)
+      (setq kube-logs--stream-retry-timers nil)
       (when (buffer-live-p kube-logs--once-output-buffer)
         (kill-buffer kube-logs--once-output-buffer))
       (setq kube-logs--once-output-buffer nil)
@@ -540,6 +561,78 @@ When LINE-BUFFERED is non-nil and a filter is set, use grep --line-buffered."
       (when (eq kube-logs--process process)
         (setq kube-logs--process (car kube-logs--processes))))))
 
+(defun kube-logs--stream-retry-delay (attempt)
+  "Return reconnect delay in seconds for retry ATTEMPT."
+  (min (max 1 (or kube-logs-stream-retry-max-delay 30))
+       (expt 2 (min attempt 4))))
+
+(defun kube-logs--cancel-stream-retry-timers ()
+  "Cancel pending kube stream retry timers in the current buffer."
+  (dolist (timer kube-logs--stream-retry-timers)
+    (when (timerp timer)
+      (cancel-timer timer)))
+  (setq kube-logs--stream-retry-timers nil))
+
+(defun kube-logs--remove-stream-retry-timer (timer)
+  "Stop tracking retry TIMER in the current buffer."
+  (setq kube-logs--stream-retry-timers
+        (delq timer kube-logs--stream-retry-timers)))
+
+(defun kube-logs--process-retry-attempt (process)
+  "Return the next retry attempt for PROCESS."
+  (let* ((started-at (and (processp process)
+                          (process-get process 'kube-logs-started-at)))
+         (elapsed (and (numberp started-at)
+                       (- (float-time) started-at)))
+         (reset-after (or kube-logs-stream-retry-reset-after 60)))
+    (if (and (numberp elapsed)
+             (numberp reset-after)
+             (> reset-after 0)
+             (>= elapsed reset-after))
+        1
+      (1+ (or (and (processp process)
+                   (process-get process 'kube-logs-retry-attempt))
+              0)))))
+
+(defun kube-logs--mark-process-retryable
+    (process viewer-buffer restart-fn attempt description)
+  "Store retry metadata on PROCESS for VIEWER-BUFFER.
+RESTART-FN is called with the next retry attempt after disconnects."
+  (when (processp process)
+    (process-put process 'kube-logs-viewer-buffer viewer-buffer)
+    (process-put process 'kube-logs-restart-fn restart-fn)
+    (process-put process 'kube-logs-retry-attempt (or attempt 0))
+    (process-put process 'kube-logs-description description)
+    (process-put process 'kube-logs-started-at (float-time))))
+
+(defun kube-logs--schedule-process-retry (viewer-buffer process event)
+  "Schedule a reconnect for PROCESS in VIEWER-BUFFER after EVENT."
+  (when (and kube-logs-stream-retry-enabled
+             (processp process)
+             (not (process-get process 'kube-logs-stop-requested))
+             (buffer-live-p viewer-buffer))
+    (let ((restart-fn (process-get process 'kube-logs-restart-fn)))
+      (when restart-fn
+        (let* ((attempt (kube-logs--process-retry-attempt process))
+               (delay (kube-logs--stream-retry-delay attempt))
+               (description (or (process-get process 'kube-logs-description)
+                                "kube logs"))
+               timer)
+          (message "kube logs stream disconnected for %s (%s); retrying in %ss"
+                   description
+                   (string-trim event)
+                   delay)
+          (setq timer
+                (run-at-time
+                 delay nil
+                 (lambda ()
+                   (when (buffer-live-p viewer-buffer)
+                     (with-current-buffer viewer-buffer
+                       (kube-logs--remove-stream-retry-timer timer)
+                       (funcall restart-fn attempt))))))
+          (with-current-buffer viewer-buffer
+            (push timer kube-logs--stream-retry-timers)))))))
+
 (defun kube-logs--reset-buffer-state (buffer &optional install-keymap)
   "Reset kube-logs local state in BUFFER.
 
@@ -553,6 +646,7 @@ When INSTALL-KEYMAP is non-nil, install kube-logs key bindings."
     (setq-local kube-logs--stream-chunks-out nil)
     (setq-local kube-logs--stream-pending-lines nil)
     (setq-local kube-logs--stream-drain-timer nil)
+    (setq-local kube-logs--stream-retry-timers nil)
     (setq-local kube-logs--once-output-buffer nil)
     (setq-local kube-logs--process-log-buffer nil)
     (setq-local kube-logs--process-log-pending-fragment "")
@@ -826,27 +920,9 @@ The stream always follows from now with `--tail=0' and no `--since'."
                ('rust
                 (let* ((socket-path (json-log-viewer-worker-socket-path viewer-buffer))
                        (command (kube-logs--supervisor-command socket-path))
-                       (log-buffer (kube-logs--make-process-log-buffer))
-                       (process
-                        (make-process
-                         :name (kube-logs--process-name)
-                         :buffer log-buffer
-                         :command command
-                         :noquery t
-                         :connection-type 'pipe
-                         :filter
-                         (lambda (proc output)
-                           (kube-logs--supervisor-process-filter
-                            viewer-buffer proc output))
-                         :sentinel
-                         (lambda (proc event)
-                           (kube-logs--supervisor-sentinel
-                            viewer-buffer proc event)))))
-                  (set-process-query-on-exit-flag process nil)
-                  (kube-logs--add-buffer-process viewer-buffer process)
-                  (with-current-buffer viewer-buffer
-                    (setq-local kube-logs--process-log-buffer log-buffer))
-                  (message "Started kube log supervisor for %s" description)))
+                       (log-buffer (kube-logs--make-process-log-buffer)))
+                  (kube-logs--start-supervisor-process
+                   viewer-buffer command description log-buffer)))
                ('kubectl
                 (let* ((args (kube-logs--logs-args))
                        (command (kube-logs--command-with-filter args t))
@@ -856,19 +932,9 @@ The stream always follows from now with `--tail=0' and no `--since'."
                               (kube-logs--viewer-target captured-target)
                               (kube-logs--viewer-target-kind captured-target-kind)
                               (kube-logs--viewer-source-id captured-source-id))
-                          (kube-logs--wrapper-command socket-path command)))
-                       (process
-                        (make-process
-                         :name (kube-logs--process-name)
-                         :buffer viewer-buffer
-                         :command wrapper-command
-                         :noquery t
-                         :connection-type 'pipe
-                         :filter #'kube-logs--wrapper-process-filter)))
-                  (set-process-sentinel process #'kube-logs--stream-process-sentinel)
-                  (set-process-query-on-exit-flag process nil)
-                  (kube-logs--add-buffer-process viewer-buffer process)
-                  (message "Started kube logs stream for %s" description))))))))
+                          (kube-logs--wrapper-command socket-path command))))
+                  (kube-logs--start-kubectl-stream-process
+                   viewer-buffer wrapper-command description))))))))
       viewer)))
 
 (defun kube-logs--parse-json-maybe (value)
@@ -1041,12 +1107,43 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
         (kube-logs--flush-pending-fragment)
         (kube-logs--remove-buffer-process buffer process)))
     (when (and (memq (process-status process) '(exit signal))
+               (buffer-live-p buffer))
+      (kube-logs--schedule-process-retry buffer process event))
+    (when (and (memq (process-status process) '(exit signal))
                (not (zerop (process-exit-status process)))
                (not (and kube-logs-filter
                          (= (process-exit-status process) 1))))
       (message "kubectl logs exited (%s): %s"
                (process-exit-status process)
                (string-trim event)))))
+
+(defun kube-logs--start-kubectl-stream-process
+    (viewer-buffer wrapper-command description &optional attempt)
+  "Start kubectl log wrapper for VIEWER-BUFFER.
+WRAPPER-COMMAND is reused for reconnects.  DESCRIPTION is used in messages.
+ATTEMPT is the current retry attempt, or nil for the initial start."
+  (let* ((retry-attempt (or attempt 0))
+         (process
+          (make-process
+           :name (kube-logs--process-name)
+           :buffer viewer-buffer
+           :command wrapper-command
+           :noquery t
+           :connection-type 'pipe
+           :filter #'kube-logs--wrapper-process-filter))
+         (restart-fn
+          (lambda (next-attempt)
+            (kube-logs--start-kubectl-stream-process
+             viewer-buffer wrapper-command description next-attempt))))
+    (set-process-sentinel process #'kube-logs--stream-process-sentinel)
+    (set-process-query-on-exit-flag process nil)
+    (kube-logs--mark-process-retryable
+     process viewer-buffer restart-fn retry-attempt description)
+    (kube-logs--add-buffer-process viewer-buffer process)
+    (message "%s kube logs stream for %s"
+             (if (> retry-attempt 0) "Restarted" "Started")
+             description)
+    process))
 
 (defun kube-logs--run-once ()
   "Fetch logs once asynchronously and render in json-log-viewer."
@@ -1110,18 +1207,9 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
                     (_ (kube-logs--register-composite-source-config viewer-buffer))
                     (socket-path (json-log-viewer-worker-socket-path viewer-buffer))
                     (wrapper-command
-                     (kube-logs--wrapper-command socket-path command))
-                    (process (make-process
-                              :name (kube-logs--process-name)
-                              :buffer viewer-buffer
-                              :command wrapper-command
-                              :noquery t
-                              :connection-type 'pipe
-                              :filter #'kube-logs--wrapper-process-filter)))
-               (set-process-sentinel process #'kube-logs--stream-process-sentinel)
-               (set-process-query-on-exit-flag process nil)
-               (kube-logs--add-buffer-process viewer-buffer process)
-               (message "Started kube logs stream for %s" description)))))
+                     (kube-logs--wrapper-command socket-path command)))
+               (kube-logs--start-kubectl-stream-process
+                viewer-buffer wrapper-command description)))))
     (display-buffer buffer)))
 
 (defun kube-logs--supervisor-sentinel (viewer-buffer proc event)
@@ -1129,10 +1217,51 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
   (when (memq (process-status proc) '(exit signal))
     (when (buffer-live-p viewer-buffer)
       (kube-logs--remove-buffer-process viewer-buffer proc))
+    (kube-logs--schedule-process-retry viewer-buffer proc event)
     (when (not (zerop (process-exit-status proc)))
       (message "kube log supervisor exited (%s): %s"
                (process-exit-status proc)
                (string-trim event)))))
+
+(defun kube-logs--start-supervisor-process
+    (viewer-buffer command description log-buffer &optional attempt)
+  "Start Rust kube supervisor for VIEWER-BUFFER.
+COMMAND is reused for reconnects.  DESCRIPTION is used in messages.
+LOG-BUFFER receives diagnostics when non-nil.  ATTEMPT is nil for the initial
+start, or the current retry attempt."
+  (let* ((retry-attempt (or attempt 0))
+         (process
+          (make-process
+           :name (kube-logs--process-name)
+           :buffer log-buffer
+           :command command
+           :noquery t
+           :connection-type 'pipe
+           :filter
+           (lambda (proc output)
+             (kube-logs--supervisor-process-filter viewer-buffer proc output))
+           :sentinel
+           (lambda (proc event)
+             (kube-logs--supervisor-sentinel viewer-buffer proc event))))
+         (restart-fn
+          (lambda (next-attempt)
+            (kube-logs--start-supervisor-process
+             viewer-buffer command description log-buffer next-attempt))))
+    (set-process-query-on-exit-flag process nil)
+    (kube-logs--mark-process-retryable
+     process viewer-buffer restart-fn retry-attempt description)
+    (kube-logs--add-buffer-process viewer-buffer process)
+    (with-current-buffer viewer-buffer
+      (setq-local kube-logs--process-log-buffer log-buffer))
+    (if log-buffer
+        (message "%s kube log supervisor for %s; debug buffer %s"
+                 (if (> retry-attempt 0) "Restarted" "Started")
+                 description
+                 (buffer-name log-buffer))
+      (message "%s kube log supervisor for %s"
+               (if (> retry-attempt 0) "Restarted" "Started")
+               description))
+    process))
 
 (defun kube-logs--run-stream-rust ()
   "Start streaming logs through the Rust kube supervisor."
@@ -1146,29 +1275,9 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
                (_ (kube-logs--register-composite-source-config viewer-buffer))
                (socket-path (json-log-viewer-worker-socket-path viewer-buffer))
                (command (kube-logs--supervisor-command socket-path))
-               (log-buffer (kube-logs--make-process-log-buffer))
-               (process
-                (make-process
-                 :name (kube-logs--process-name)
-                 :buffer log-buffer
-                 :command command
-                 :noquery t
-                 :connection-type 'pipe
-                 :filter
-                 (lambda (proc output)
-                   (kube-logs--supervisor-process-filter viewer-buffer proc output))
-                 :sentinel
-                 (lambda (proc event)
-                   (kube-logs--supervisor-sentinel viewer-buffer proc event)))))
-          (set-process-query-on-exit-flag process nil)
-          (kube-logs--add-buffer-process viewer-buffer process)
-          (with-current-buffer viewer-buffer
-            (setq-local kube-logs--process-log-buffer log-buffer))
-          (if log-buffer
-              (message "Started kube log supervisor for %s; debug buffer %s"
-                       description
-                       (buffer-name log-buffer))
-            (message "Started kube log supervisor for %s" description))))))
+               (log-buffer (kube-logs--make-process-log-buffer)))
+          (kube-logs--start-supervisor-process
+           viewer-buffer command description log-buffer)))))
     (display-buffer buffer)))
 
 (defun kube-logs--run-stream ()

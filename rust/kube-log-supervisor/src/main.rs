@@ -143,6 +143,21 @@ impl Supervisor {
     }
 
     async fn run_deployment(self, selector: String) -> Result<(), String> {
+        let mut attempt = 0u32;
+        loop {
+            self.watch_deployment_once(&selector).await?;
+            eprintln!("kube-log-supervisor: pod watch ended");
+            attempt = attempt.saturating_add(1);
+            let delay = retry_delay(attempt);
+            eprintln!(
+                "kube-log-supervisor: restarting pod watch in {}s",
+                delay.as_secs()
+            );
+            sleep(delay).await;
+        }
+    }
+
+    async fn watch_deployment_once(&self, selector: &str) -> Result<(), String> {
         let stream = watcher(
             self.pods.clone(),
             WatcherConfig::default().labels(&selector),
