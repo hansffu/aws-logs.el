@@ -204,6 +204,23 @@ visible frame.  Set to nil or 0 to disable periodic live pulls."
 (defvar-local json-log-viewer--entry-overlays nil
   "Entry overlays in the current viewer buffer.")
 
+(defvar-local json-log-viewer--entry-details-cache nil
+  "Hash table of worker-backed entry details keyed by storage entry id.")
+
+(defun json-log-viewer-embark-copy-message (log-entry)
+  "Copy LOG-ENTRY message to the kill ring.
+
+LOG-ENTRY is the lightweight plist object supplied to Embark actions."
+  (let ((message (or (plist-get log-entry :message)
+                     (plist-get log-entry :summary)
+                     "")))
+    (kill-new message)
+    (message "Copied log message")))
+
+(defvar-keymap json-log-viewer-embark-log-entry-map
+  :doc "Embark keymap for `json-log-viewer-log-entry' targets."
+  "m" #'json-log-viewer-embark-copy-message)
+
 (defvar-local json-log-viewer--current-line-overlay nil
   "Overlay used to highlight current entry.")
 
@@ -416,6 +433,100 @@ buffer's worker-ready callback."
         (when (and (stringp signature)
                    (string-match-p "\\`[0-9]+\\'" signature))
           (string-to-number signature)))))))
+
+(defun json-log-viewer--entry-overlay-summary (entry-overlay)
+  "Return summary text for ENTRY-OVERLAY."
+  (when (and (overlay-buffer entry-overlay)
+             (overlay-start entry-overlay))
+    (with-current-buffer (overlay-buffer entry-overlay)
+      (buffer-substring-no-properties
+       (overlay-start entry-overlay)
+       (save-excursion
+         (goto-char (overlay-start entry-overlay))
+         (line-end-position))))))
+
+(defun json-log-viewer--details-cache ()
+  "Return the current buffer details cache."
+  (or json-log-viewer--entry-details-cache
+      (setq json-log-viewer--entry-details-cache (make-hash-table :test 'eql))))
+
+(defun json-log-viewer--entry-details-result->object (result)
+  "Return a public details object from worker detail RESULT."
+  (let ((raw (plist-get result :raw)))
+    (list :id (plist-get result :entry-id)
+          :raw raw
+          :parsed (json-log-viewer-shared--parse-json-line raw)
+          :details (json-log-viewer--worker-field-rows->fields
+                    (plist-get result :fields)))))
+
+(defun json-log-viewer--cache-entry-details-result (entry-overlay result)
+  "Cache worker detail RESULT on ENTRY-OVERLAY."
+  (let* ((object (json-log-viewer--entry-details-result->object result))
+         (entry-id (plist-get object :id))
+         (fields (plist-get object :details)))
+    (when entry-id
+      (puthash entry-id object (json-log-viewer--details-cache)))
+    (when entry-overlay
+      (overlay-put entry-overlay 'json-log-viewer-entry-fields fields))
+    object))
+
+(defun json-log-viewer-get-details (log-entry &optional buffer)
+  "Return full worker-backed details for LOG-ENTRY.
+
+LOG-ENTRY may be the plist object supplied to Embark actions or a numeric
+storage entry id.  BUFFER defaults to the `:buffer' field in LOG-ENTRY or the
+current buffer.  The returned plist contains `:id', `:raw', `:parsed', and
+`:details'."
+  (let* ((entry-id (if (integerp log-entry)
+                       log-entry
+                     (plist-get log-entry :id)))
+         (target-buffer (or buffer
+                            (and (listp log-entry) (plist-get log-entry :buffer))
+                            (current-buffer))))
+    (unless (integerp entry-id)
+      (user-error "json-log-viewer details require a numeric :id"))
+    (with-current-buffer (json-log-viewer-get-buffer target-buffer)
+      (json-log-viewer--ensure-async-queue-running)
+      (or (gethash entry-id (json-log-viewer--details-cache))
+          (progn
+            (json-log-viewer--async-submit
+             (list :op 'entry-details :entry-id entry-id)
+             t)
+            (or (gethash entry-id (json-log-viewer--details-cache))
+                (user-error "No details returned for log entry %s" entry-id)))))))
+
+(defun json-log-viewer--entry-overlay-object (entry-overlay)
+  "Return an Embark action object for ENTRY-OVERLAY."
+  (let ((entry (overlay-get entry-overlay 'json-log-viewer-entry-data)))
+    (list :id (json-log-viewer--entry-storage-id entry-overlay)
+          :summary (json-log-viewer--entry-overlay-summary entry-overlay)
+          :source (plist-get entry :source)
+          :timestamp (plist-get entry :timestamp)
+          :level (plist-get entry :level)
+          :message (plist-get entry :message)
+          :extra-fields (plist-get entry :extra-fields)
+          :buffer (overlay-buffer entry-overlay))))
+
+(defun json-log-viewer-embark-target-at-point ()
+  "Return an Embark target for the log entry at point.
+
+The target value is a lightweight plist with visible row data and the storage
+entry id.  Actions can call `json-log-viewer-get-details' with that object to
+fetch full worker-backed raw JSON and detail fields."
+  (when (derived-mode-p 'json-log-viewer-mode)
+    (when-let ((entry-overlay (json-log-viewer--entry-overlay-at-point)))
+      `(json-log-viewer-log-entry
+        ,(json-log-viewer--entry-overlay-object entry-overlay)
+        ,(overlay-start entry-overlay) . ,(json-log-viewer--entry-summary-end entry-overlay)))))
+
+(defun json-log-viewer-embark-setup ()
+  "Register json-log-viewer targets with Embark when Embark is loaded."
+  (when (boundp 'embark-target-finders)
+    (add-hook 'embark-target-finders #'json-log-viewer-embark-target-at-point))
+  (when (boundp 'embark-keymap-alist)
+    (add-to-list 'embark-keymap-alist
+                 '(json-log-viewer-log-entry
+                   . json-log-viewer-embark-log-entry-map))))
 
 (defun json-log-viewer--worker-field-rows->fields (rows)
   "Convert worker field ROWS into normalized display fields."
@@ -1718,6 +1829,10 @@ Returns cons cell (ENTRIES . NEXT-ID)."
   (setq json-log-viewer--entry-count 0)
   (setq json-log-viewer--current-line-overlay nil))
 
+(defun json-log-viewer--clear-details-cache ()
+  "Clear cached worker-backed entry details for current buffer."
+  (setq json-log-viewer--entry-details-cache nil))
+
 (defun json-log-viewer--clear-rendered-buffer ()
   "Clear rendered entries while preserving worker storage."
   (let ((inhibit-read-only t))
@@ -1792,14 +1907,17 @@ Returns cons cell (ENTRIES . NEXT-ID)."
   (let* ((entry-id (plist-get result :entry-id))
          (request-id (plist-get result :request-id))
          (entry-overlay (json-log-viewer--entry-overlay-by-storage-id entry-id)))
+    (json-log-viewer--cache-entry-details-result
+     (and (overlayp entry-overlay) (overlay-buffer entry-overlay) entry-overlay)
+     result)
     (when (and (overlayp entry-overlay)
-               (overlay-buffer entry-overlay)
-               (eq (overlay-get entry-overlay 'json-log-viewer-details-request-id)
-                   request-id))
-      (overlay-put entry-overlay 'json-log-viewer-details-request-id nil)
-      (json-log-viewer--entry-render-details-lines
-       entry-overlay
-       (json-log-viewer--worker-field-rows->fields (plist-get result :fields))))))
+               (overlay-buffer entry-overlay))
+      (when (eq (overlay-get entry-overlay 'json-log-viewer-details-request-id)
+                request-id)
+        (overlay-put entry-overlay 'json-log-viewer-details-request-id nil)
+        (json-log-viewer--entry-render-details-lines
+         entry-overlay
+         (overlay-get entry-overlay 'json-log-viewer-entry-fields))))))
 
 (defun json-log-viewer--entry-expand (entry-overlay)
   "Insert details for ENTRY-OVERLAY when currently collapsed."
@@ -1807,8 +1925,10 @@ Returns cons cell (ENTRIES . NEXT-ID)."
     (let ((inhibit-read-only t))
       (save-excursion
         (goto-char (json-log-viewer--entry-summary-end entry-overlay))
-        (let ((details-start (point)))
-          (json-log-viewer--insert-entry-details-lines '(("loading" . "...")))
+        (let ((details-start (point))
+              (cached-fields (overlay-get entry-overlay 'json-log-viewer-entry-fields)))
+          (json-log-viewer--insert-entry-details-lines
+           (or cached-fields '(("loading" . "..."))))
           (let ((details-end (point))
                 (fold-ov (make-overlay details-start (point))))
             (overlay-put fold-ov 'json-log-viewer-fold t)
@@ -1819,7 +1939,8 @@ Returns cons cell (ENTRIES . NEXT-ID)."
             (move-overlay entry-overlay
                           (overlay-start entry-overlay)
                           details-end)
-            (when-let ((entry-id (json-log-viewer--entry-storage-id entry-overlay)))
+            (when-let ((entry-id (and (null cached-fields)
+                                      (json-log-viewer--entry-storage-id entry-overlay))))
               (let* ((request-id json-log-viewer--async-next-request-id)
                      (job (list :op 'entry-details
                                 :entry-id entry-id
@@ -2745,6 +2866,8 @@ stops before the next chunk would exceed the active max-entries cap."
     (overlay-put entry-ov 'json-log-viewer-entry t)
     (overlay-put entry-ov 'json-log-viewer-entry-expanded nil)
     (overlay-put entry-ov 'json-log-viewer-fold-overlay nil)
+    (overlay-put entry-ov 'json-log-viewer-entry-data entry)
+    (overlay-put entry-ov 'json-log-viewer-entry-fields fields)
     (overlay-put entry-ov 'json-log-viewer-log-entry-id entry-id)
     (overlay-put entry-ov 'json-log-viewer-storage-entry-id entry-id)
     (overlay-put entry-ov 'json-log-viewer-storage-timestamp
@@ -2999,6 +3122,9 @@ New entries are always appended to the bottom."
 (with-eval-after-load 'evil
   (json-log-viewer--maybe-load-evil-bindings))
 
+(with-eval-after-load 'embark
+  (json-log-viewer-embark-setup))
+
 (when (featurep 'evil)
   (json-log-viewer--maybe-load-evil-bindings))
 
@@ -3077,6 +3203,7 @@ Returns the created buffer."
       (setq-local json-log-viewer--source-configs nil)
       (setq-local json-log-viewer--json-header-lines-function header-lines-function)
       (setq-local json-log-viewer--seen-signatures (make-hash-table :test 'equal))
+      (setq-local json-log-viewer--entry-details-cache nil)
       (setq-local json-log-viewer--on-worker-ready on-ready)
       (json-log-viewer--start-async-queue)
       (json-log-viewer--ensure-async-queue-running)
@@ -3108,6 +3235,7 @@ When PRESERVE-FILTER is non-nil, keep the current active filter."
         (json-log-viewer--async-submit
          (json-log-viewer--make-async-job 'reset nil)
          t)
+        (json-log-viewer--clear-details-cache)
         (json-log-viewer-replace-entries nil preserve-filter)
         (when normalized-lines
           (json-log-viewer--ingest-lines normalized-lines))))))

@@ -467,6 +467,48 @@
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
+(ert-deftest json-log-viewer-embark-target-and-get-details-test ()
+  (let ((buf (aws-logs-core-test--make-viewer
+              "*json-log-viewer-embark-target-test*"
+              '("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"msg\":\"hello\",\"payload\":{\"service\":\"orders\",\"log\":{\"level\":\"ERROR\"}}}")
+              :timestamp-path "timestamp"
+              :level-path "payload.log.level"
+              :message-path "msg")))
+    (unwind-protect
+        (with-current-buffer buf
+          (goto-char (point-min))
+          (let ((entry-ov (car json-log-viewer--entry-overlays)))
+            (should entry-ov)
+            (should-not (overlay-get entry-ov 'json-log-viewer-entry-fields)))
+          (let* ((target (json-log-viewer-embark-target-at-point))
+                 (object (cadr target))
+                 (details-object (json-log-viewer-get-details object))
+                 (details (plist-get details-object :details))
+                 (parsed (plist-get details-object :parsed)))
+            (should (eq (car target) 'json-log-viewer-log-entry))
+            (should (integerp (plist-get object :id)))
+            (should (string-match-p "hello" (plist-get object :summary)))
+            (should-not (plist-member object :raw))
+            (should-not (plist-member object :details))
+            (should (string-match-p "\"service\":\"orders\""
+                                    (plist-get details-object :raw)))
+            (should (equal (cdr (assoc "payload.service" details)) "orders"))
+            (should (equal (cdr (assoc "payload.log.level" details)) "ERROR"))
+            (should (equal (alist-get 'msg parsed) "hello"))
+            (should (eq (plist-get object :buffer) buf))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest json-log-viewer-embark-copy-message-test ()
+  (let ((kill-ring nil))
+    (json-log-viewer-embark-copy-message
+     '(:id 42 :summary "summary text" :message "message text"))
+    (should (equal (current-kill 0 t) "message text")))
+  (let ((kill-ring nil))
+    (json-log-viewer-embark-copy-message
+     '(:id 42 :summary "summary text"))
+    (should (equal (current-kill 0 t) "summary text"))))
+
 (ert-deftest json-log-viewer-stream-push-respects-auto-follow-test ()
   (let* ((buf (aws-logs-core-test--make-viewer
                "*json-log-viewer-follow-test*"

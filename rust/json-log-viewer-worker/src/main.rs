@@ -440,6 +440,7 @@ impl Store {
         self.output.send(json!({
             "cmd": "expand-details",
             "entry-id": entry_id,
+            "raw": row.as_ref().map(|(text, _, _)| text),
             "fields": fields,
             "request-id": request_id
         }));
