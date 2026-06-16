@@ -1857,11 +1857,27 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
          (kafka-logs--apply-topic-selection kafka-logs-topic))))
     (kafka-logs--transient-reprompt)))
 
-(defun kafka-logs--set-viewer-buffer-from-current-buffer ()
-  "Use current composite log viewer as selected viewer, or clear selection."
-  (setq kafka-logs-viewer-buffer
-        (when (json-log-viewer-composite-buffer-p (current-buffer))
-          (buffer-name (current-buffer)))))
+(defun kafka-logs--viewer-buffer-description ()
+  "Return transient description for the selected Kafka viewer buffer."
+  (format "Buffer: %s" (or kafka-logs-viewer-buffer "new")))
+
+(transient-define-suffix kafka-logs-select-viewer-buffer ()
+  "Select an existing json-log-viewer buffer for Kafka ingestion."
+  :description #'kafka-logs--viewer-buffer-description
+  :transient t
+  (interactive)
+  (let* ((prompt (if kafka-logs-viewer-buffer
+                     (format "Send Kafka logs to buffer (empty=new, current %s): "
+                             kafka-logs-viewer-buffer)
+                   "Send Kafka logs to buffer (empty=new): "))
+         (input (string-trim
+                 (completing-read
+                  prompt (mapcar #'buffer-name (buffer-list)) nil nil
+                  nil 'buffer-name-history))))
+    (setq kafka-logs-viewer-buffer
+          (unless (string-empty-p input)
+            (buffer-name (json-log-viewer-get-buffer input))))
+    (kafka-logs--transient-reprompt)))
 
 (transient-define-suffix kafka-logs-action-run ()
   "Run Kafka logs viewer with current selections."
@@ -1881,6 +1897,7 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
     ("-M" kafka-logs-set-message-path)
     ("-j" kafka-logs-set-json-paths)
     ("-p" kafka-logs-toggle-payload-format)
+    ("-B" kafka-logs-select-viewer-buffer)
     ("-m" kafka-logs-set-max-messages)]
    ["Range (time-span mode)"
     ("a" kafka-logs-set-range-from)
@@ -1892,7 +1909,6 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
   [["Actions"
     ("RET" "Run logs" kafka-logs-action-run)]]
   (interactive)
-  (kafka-logs--set-viewer-buffer-from-current-buffer)
   (transient-setup 'kafka-logs-transient))
 
 (defun kafka-logs ()

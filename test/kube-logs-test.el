@@ -394,18 +394,24 @@
       (when (buffer-live-p viewer)
         (kill-buffer viewer)))))
 
-(ert-deftest kube-logs-transient-viewer-buffer-follows-current-composite-test ()
+(ert-deftest kube-logs-select-viewer-buffer-selects-and-clears-test ()
   (let ((viewer (generate-new-buffer "*kube-logs-composite-current-test*"))
         (kube-logs-viewer-buffer "stale"))
     (unwind-protect
         (progn
           (with-current-buffer viewer
-            (composite-log-viewer-mode)
-            (kube-logs--set-viewer-buffer-from-current-buffer))
+            (composite-log-viewer-mode))
+          (cl-letf (((symbol-function 'completing-read)
+                     (lambda (&rest _args) (buffer-name viewer)))
+                    ((symbol-function 'kube-logs--transient-reprompt)
+                     (lambda () nil)))
+            (call-interactively #'kube-logs-select-viewer-buffer))
           (should (equal kube-logs-viewer-buffer (buffer-name viewer)))
-          (with-temp-buffer
-            (json-log-viewer-mode)
-            (kube-logs--set-viewer-buffer-from-current-buffer))
+          (cl-letf (((symbol-function 'completing-read)
+                     (lambda (&rest _args) ""))
+                    ((symbol-function 'kube-logs--transient-reprompt)
+                     (lambda () nil)))
+            (call-interactively #'kube-logs-select-viewer-buffer))
           (should-not kube-logs-viewer-buffer))
       (when (buffer-live-p viewer)
         (kill-buffer viewer)))))

@@ -97,18 +97,24 @@
       (when (buffer-live-p viewer)
         (kill-buffer viewer)))))
 
-(ert-deftest aws-logs-transient-viewer-buffer-follows-current-composite-test ()
+(ert-deftest aws-logs-select-viewer-buffer-selects-and-clears-test ()
   (let ((viewer (generate-new-buffer "*aws-logs-composite-current-test*"))
         (aws-logs-viewer-buffer "stale"))
     (unwind-protect
         (progn
           (with-current-buffer viewer
-            (composite-log-viewer-mode)
-            (aws-logs--set-viewer-buffer-from-current-buffer))
+            (composite-log-viewer-mode))
+          (cl-letf (((symbol-function 'completing-read)
+                     (lambda (&rest _args) (buffer-name viewer)))
+                    ((symbol-function 'aws-logs--transient-reprompt)
+                     (lambda () nil)))
+            (call-interactively #'aws-logs-select-viewer-buffer))
           (should (equal aws-logs-viewer-buffer (buffer-name viewer)))
-          (with-temp-buffer
-            (json-log-viewer-mode)
-            (aws-logs--set-viewer-buffer-from-current-buffer))
+          (cl-letf (((symbol-function 'completing-read)
+                     (lambda (&rest _args) ""))
+                    ((symbol-function 'aws-logs--transient-reprompt)
+                     (lambda () nil)))
+            (call-interactively #'aws-logs-select-viewer-buffer))
           (should-not aws-logs-viewer-buffer))
       (when (buffer-live-p viewer)
         (kill-buffer viewer)))))

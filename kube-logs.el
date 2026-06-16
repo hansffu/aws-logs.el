@@ -1645,11 +1645,27 @@ This stores one active target; choosing pod/deployment replaces the other."
       (setq kube-logs-filter
             (unless (or (null filter) (string-empty-p filter)) filter)))))
 
-(defun kube-logs--set-viewer-buffer-from-current-buffer ()
-  "Use current composite log viewer as selected viewer, or clear selection."
-  (setq kube-logs-viewer-buffer
-        (when (json-log-viewer-composite-buffer-p (current-buffer))
-          (buffer-name (current-buffer)))))
+(defun kube-logs--viewer-buffer-description ()
+  "Return transient description for the selected kube viewer buffer."
+  (format "Buffer: %s" (or kube-logs-viewer-buffer "new")))
+
+(transient-define-suffix kube-logs-select-viewer-buffer ()
+  "Select an existing json-log-viewer buffer for Kubernetes ingestion."
+  :description #'kube-logs--viewer-buffer-description
+  :transient t
+  (interactive)
+  (let* ((prompt (if kube-logs-viewer-buffer
+                     (format "Send kube logs to buffer (empty=new, current %s): "
+                             kube-logs-viewer-buffer)
+                   "Send kube logs to buffer (empty=new): "))
+         (input (string-trim
+                 (completing-read
+                  prompt (mapcar #'buffer-name (buffer-list)) nil nil
+                  nil 'buffer-name-history))))
+    (setq kube-logs-viewer-buffer
+          (unless (string-empty-p input)
+            (buffer-name (json-log-viewer-get-buffer input))))
+    (kube-logs--transient-reprompt)))
 
 (transient-define-prefix kube-logs-transient ()
   "Transient menu for selecting and running Kubernetes logs."
@@ -1660,6 +1676,7 @@ This stores one active target; choosing pod/deployment replaces the other."
     ("-s" "Since" kube-logs-infix-since)
     ("-F" "Filter" kube-logs-infix-filter)
     ("-f" kube-logs-toggle-follow)
+    ("-B" kube-logs-select-viewer-buffer)
     ("-b" kube-logs-toggle-stream-backend)
     ("-D" kube-logs-toggle-debug-process-buffer)]
    ["Target"
@@ -1672,7 +1689,6 @@ This stores one active target; choosing pod/deployment replaces the other."
     ("RET" "Run logs" kube-logs-action-run)
     ("f" "Formatting…" kube-logs-open-formatting)]]
   (interactive)
-  (kube-logs--set-viewer-buffer-from-current-buffer)
   (transient-setup 'kube-logs-transient))
 
 (defun kube-logs ()

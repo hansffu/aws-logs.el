@@ -640,18 +640,24 @@
       (when (buffer-live-p viewer)
         (kill-buffer viewer)))))
 
-(ert-deftest kafka-logs-transient-viewer-buffer-follows-current-composite-test ()
+(ert-deftest kafka-logs-select-viewer-buffer-selects-and-clears-test ()
   (let ((viewer (generate-new-buffer "*kafka-logs-composite-current-test*"))
         (kafka-logs-viewer-buffer "stale"))
     (unwind-protect
         (progn
           (with-current-buffer viewer
-            (composite-log-viewer-mode)
-            (kafka-logs--set-viewer-buffer-from-current-buffer))
+            (composite-log-viewer-mode))
+          (cl-letf (((symbol-function 'completing-read)
+                     (lambda (&rest _args) (buffer-name viewer)))
+                    ((symbol-function 'kafka-logs--transient-reprompt)
+                     (lambda () nil)))
+            (call-interactively #'kafka-logs-select-viewer-buffer))
           (should (equal kafka-logs-viewer-buffer (buffer-name viewer)))
-          (with-temp-buffer
-            (json-log-viewer-mode)
-            (kafka-logs--set-viewer-buffer-from-current-buffer))
+          (cl-letf (((symbol-function 'completing-read)
+                     (lambda (&rest _args) ""))
+                    ((symbol-function 'kafka-logs--transient-reprompt)
+                     (lambda () nil)))
+            (call-interactively #'kafka-logs-select-viewer-buffer))
           (should-not kafka-logs-viewer-buffer))
       (when (buffer-live-p viewer)
         (kill-buffer viewer)))))
