@@ -232,12 +232,12 @@ a property list as accepted by `aws-logs-make-preset`.")
 (defun aws-logs--transient-reprompt ()
   "Refresh transient so UI reflects current backing fields."
   (transient-quit-one)
-  (transient-setup 'aws-logs-transient))
+  (aws-logs--setup-main-transient))
 
 (defun aws-logs--query-transient-reprompt ()
   "Refresh query transient so UI reflects current backing fields."
   (transient-quit-one)
-  (transient-setup 'aws-logs-query-transient))
+  (aws-logs--setup-query-transient))
 
 
 (declare-function aws-logs--insights-query-edit "aws-logs-query" (initial))
@@ -247,8 +247,28 @@ a property list as accepted by `aws-logs-make-preset`.")
 (declare-function json-log-viewer-composite-buffer-p "composite-log-viewer"
                   (&optional buffer-or-name))
 (declare-function json-log-viewer-get-buffer "json-log-viewer" (buffer-name))
+(declare-function json-log-viewer-transient-bind-terminal-return "json-log-viewer"
+                  (prefix command))
 (declare-function org-read-date "org"
                   (&optional with-time to-time from-string prompt default-time default-input))
+
+(defun aws-logs--setup-main-transient ()
+  "Set up the main aws-logs transient."
+  (transient-setup 'aws-logs-transient)
+  (json-log-viewer-transient-bind-terminal-return
+   'aws-logs-transient 'aws-logs-dwim))
+
+(defun aws-logs--setup-query-transient ()
+  "Set up the aws-logs query transient."
+  (transient-setup 'aws-logs-query-transient)
+  (json-log-viewer-transient-bind-terminal-return
+   'aws-logs-query-transient 'aws-logs-query-done))
+
+(defun aws-logs--setup-formatting-transient ()
+  "Set up the aws-logs formatting transient."
+  (transient-setup 'aws-logs-formatting-transient)
+  (json-log-viewer-transient-bind-terminal-return
+   'aws-logs-formatting-transient 'aws-logs-formatting-done))
 
 (defun aws-logs--query ()
   "Return a one-line summary of `aws-logs-query` for display in transient."
@@ -713,7 +733,7 @@ Returns a cons cell (FROM . TO), where both values are ISO-like strings."
 (defun aws-logs--formatting-reprompt ()
   "Refresh the formatting transient."
   (transient-quit-one)
-  (transient-setup 'aws-logs-formatting-transient))
+  (aws-logs--setup-formatting-transient))
 
 (defun aws-logs--formatting-extra-summary ()
   "Return one-line summary of currently configured extra paths."
@@ -750,7 +770,7 @@ Returns a cons cell (FROM . TO), where both values are ISO-like strings."
   :transient nil
   (interactive)
   (transient-quit-one)
-  (transient-setup 'aws-logs-transient))
+  (aws-logs--setup-main-transient))
 
 (transient-define-prefix aws-logs-formatting-transient ()
   "Formatting options for Insights JSON-path rendering."
@@ -765,22 +785,22 @@ Returns a cons cell (FROM . TO), where both values are ISO-like strings."
       ("d" "Delete extra path" aws-logs-formatting-extra-delete)]]
 
   [["Done"
-    ("RET" "Back to main" aws-logs-formatting-done)]]
+    ("<return>" "Back to main" aws-logs-formatting-done)]]
   (interactive)
-  (transient-setup 'aws-logs-formatting-transient))
+  (aws-logs--setup-formatting-transient))
 
 (transient-define-suffix aws-logs-open-formatting ()
   "Open formatting transient."
   :transient nil
   (interactive)
-  (transient-setup 'aws-logs-formatting-transient))
+  (aws-logs--setup-formatting-transient))
 
 (transient-define-suffix aws-logs-query-done ()
   "Return from query transient to the main transient."
   :transient nil
   (interactive)
   (transient-quit-one)
-  (transient-setup 'aws-logs-transient))
+  (aws-logs--setup-main-transient))
 
 (transient-define-prefix aws-logs-query-transient ()
   "Query options for Logs Insights."
@@ -790,15 +810,15 @@ Returns a cons cell (FROM . TO), where both values are ISO-like strings."
       ("s" "Save active query" aws-logs-query-save)
       ("l" "Load saved query" aws-logs-query-load-saved)]]
   [["Done"
-    ("RET" "Back to main" aws-logs-query-done)]]
+    ("<return>" "Back to main" aws-logs-query-done)]]
   (interactive)
-  (transient-setup 'aws-logs-query-transient))
+  (aws-logs--setup-query-transient))
 
 (transient-define-suffix aws-logs-open-query-transient ()
   "Open query transient."
   :transient nil
   (interactive)
-  (transient-setup 'aws-logs-query-transient))
+  (aws-logs--setup-query-transient))
 
 
 (defun aws-logs--getopt (name args)
@@ -906,11 +926,11 @@ Use the Tail action to stream logs with current selections."
       ("f" "Formatting…" aws-logs-open-formatting)]]
 
   [["Actions"
-    ("RET" aws-logs-dwim)
+    ("<return>" aws-logs-dwim)
     ("t" "Tail" aws-logs-tail)
     ("l" "Logs Insights" aws-logs-insights)]]
   (interactive)
-  (transient-setup 'aws-logs-transient))
+  (aws-logs--setup-main-transient))
 
 (defun aws-logs ()
   "Open aws-logs transient menu for selecting and running log-tail options."

@@ -30,6 +30,8 @@
                   (buffer-or-name log-lines &optional preserve-filter))
 (declare-function json-log-viewer-register-source-config "json-log-viewer"
                   (buffer-or-name source &rest args))
+(declare-function json-log-viewer-transient-bind-terminal-return "json-log-viewer"
+                  (prefix command))
 (declare-function json-log-viewer-unique-source-id "json-log-viewer"
                   (buffer-or-name source &rest args))
 
@@ -273,10 +275,22 @@ Each element has the form (NAME . PLIST).")
   '(:context :namespace :namespace-enabled :target-kind :target :follow :tail-lines :since :filter)
   "Allowed keys for kube-logs presets.")
 
+(defun kube-logs--setup-main-transient ()
+  "Set up the main kube-logs transient."
+  (transient-setup 'kube-logs-transient)
+  (json-log-viewer-transient-bind-terminal-return
+   'kube-logs-transient 'kube-logs-action-run))
+
+(defun kube-logs--setup-formatting-transient ()
+  "Set up the kube-logs formatting transient."
+  (transient-setup 'kube-logs-formatting-transient)
+  (json-log-viewer-transient-bind-terminal-return
+   'kube-logs-formatting-transient 'kube-logs-formatting-done))
+
 (defun kube-logs--transient-reprompt ()
   "Refresh transient so UI reflects current backing fields."
   (transient-quit-one)
-  (transient-setup 'kube-logs-transient))
+  (kube-logs--setup-main-transient))
 
 (defun kube-logs--context-args (&optional context)
   "Return kubectl context args for CONTEXT or current session context."
@@ -1564,7 +1578,7 @@ This stores one active target; choosing pod/deployment replaces the other."
 (defun kube-logs--formatting-reprompt ()
   "Refresh the formatting transient."
   (transient-quit-one)
-  (transient-setup 'kube-logs-formatting-transient))
+  (kube-logs--setup-formatting-transient))
 
 (defun kube-logs--formatting-extra-summary ()
   "Return one-line summary of currently configured extra paths."
@@ -1601,7 +1615,7 @@ This stores one active target; choosing pod/deployment replaces the other."
   :transient nil
   (interactive)
   (transient-quit-one)
-  (transient-setup 'kube-logs-transient))
+  (kube-logs--setup-main-transient))
 
 (transient-define-prefix kube-logs-formatting-transient ()
   "Formatting options for kube-logs JSON-path rendering."
@@ -1616,15 +1630,15 @@ This stores one active target; choosing pod/deployment replaces the other."
       ("d" "Delete extra path" kube-logs-formatting-extra-delete)]]
 
   [["Done"
-    ("RET" "Back to main" kube-logs-formatting-done)]]
+    ("<return>" "Back to main" kube-logs-formatting-done)]]
   (interactive)
-  (transient-setup 'kube-logs-formatting-transient))
+  (kube-logs--setup-formatting-transient))
 
 (transient-define-suffix kube-logs-open-formatting ()
   "Open formatting transient."
   :transient nil
   (interactive)
-  (transient-setup 'kube-logs-formatting-transient))
+  (kube-logs--setup-formatting-transient))
 
 (defun kube-logs--sync-session-from-transient ()
   "Sync backing session vars from active `kube-logs-transient` infix args."
@@ -1686,10 +1700,10 @@ This stores one active target; choosing pod/deployment replaces the other."
     ("d" kube-logs-select-deployment)]]
   [[4 :description (lambda () (format "Active target: %s" (kube-logs--target-description)))]]
   [["Actions"
-    ("RET" "Run logs" kube-logs-action-run)
+    ("<return>" "Run logs" kube-logs-action-run)
     ("f" "Formatting…" kube-logs-open-formatting)]]
   (interactive)
-  (transient-setup 'kube-logs-transient))
+  (kube-logs--setup-main-transient))
 
 (defun kube-logs ()
   "Open kube-logs transient UI."

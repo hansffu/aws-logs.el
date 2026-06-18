@@ -38,6 +38,8 @@
                   (&optional buffer-or-name))
 (declare-function json-log-viewer-register-source-config "json-log-viewer"
                   (buffer-or-name source &rest args))
+(declare-function json-log-viewer-transient-bind-terminal-return "json-log-viewer"
+                  (prefix command))
 (declare-function json-log-viewer-unique-source-id "json-log-viewer"
                   (buffer-or-name source &rest args))
 (declare-function json-log-viewer-push "json-log-viewer"
@@ -293,10 +295,16 @@ Each element has the form (NAME . PLIST).")
   "{\"topic\":\"%t\",\"partition\":%p,\"offset\":%o,\"ts\":%T,\"key_size\":%K,\"key\":\"%k\",\"payload\":%s}\\n"
   "kcat format string used to wrap Avro-decoded payloads as JSON lines.")
 
+(defun kafka-logs--setup-main-transient ()
+  "Set up the main kafka-logs transient."
+  (transient-setup 'kafka-logs-transient)
+  (json-log-viewer-transient-bind-terminal-return
+   'kafka-logs-transient 'kafka-logs-action-run))
+
 (defun kafka-logs--transient-reprompt ()
   "Refresh transient so UI reflects current backing fields."
   (transient-quit-one)
-  (transient-setup 'kafka-logs-transient))
+  (kafka-logs--setup-main-transient))
 
 (defun kafka-logs--normalize-json-paths (paths &optional source)
   "Validate and normalize JSON PATHS.
@@ -1907,9 +1915,9 @@ When DRAIN-ALL is non-nil, consume the full queue in one call."
                              (or kafka-logs-connection "-")
                              (or kafka-logs-topic "-")))]]
   [["Actions"
-    ("RET" "Run logs" kafka-logs-action-run)]]
+    ("<return>" "Run logs" kafka-logs-action-run)]]
   (interactive)
-  (transient-setup 'kafka-logs-transient))
+  (kafka-logs--setup-main-transient))
 
 (defun kafka-logs ()
   "Open kafka-logs transient UI."

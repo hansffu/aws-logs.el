@@ -22,6 +22,56 @@
   "Foldable JSON log viewer buffers."
   :group 'tools)
 
+(defcustom json-log-viewer-transient-terminal-return-commands
+  '(ghostel--send-event vterm-send-return)
+  "Terminal emulator commands to treat as Return in active log transients.
+
+Some terminal emulator modes bind Return before Transient can see the
+suffix key.  When one of these commands is invoked by a Return event while a
+registered Transient prefix is active, reroute it to that prefix's Return
+suffix command."
+  :type '(repeat symbol)
+  :group 'json-log-viewer)
+
+(defvar-local json-log-viewer--transient-terminal-return-alist nil
+  "Alist of transient prefix commands to Return suffix commands.")
+
+(defun json-log-viewer--return-event-p ()
+  "Return non-nil when the current command was invoked by Return."
+  (let ((event (event-basic-type last-command-event)))
+    (or (eq event 'return)
+        (eq event ?\r))))
+
+(defun json-log-viewer--active-transient-prefix-command ()
+  "Return the active transient prefix command, or nil."
+  (when (and (boundp 'transient--prefix) transient--prefix)
+    (ignore-errors
+      (oref transient--prefix command))))
+
+(defun json-log-viewer--transient-terminal-return-pre-command ()
+  "Reroute terminal emulator Return commands to active transient suffixes."
+  (when (and (json-log-viewer--return-event-p)
+             (memq this-command json-log-viewer-transient-terminal-return-commands))
+    (when-let* ((prefix (json-log-viewer--active-transient-prefix-command))
+                (command (alist-get prefix
+                                    json-log-viewer--transient-terminal-return-alist)))
+      (setq this-command command))))
+
+(defun json-log-viewer-transient-bind-terminal-return (prefix command)
+  "Bind Return handling for transient PREFIX to COMMAND.
+
+The visible suffix key is `<return>', but this also keeps `RET' bound in the
+active transient map for contexts that still emit carriage return."
+  (setq-local json-log-viewer--transient-terminal-return-alist
+              (cons (cons prefix command)
+                    (assq-delete-all
+                     prefix json-log-viewer--transient-terminal-return-alist)))
+  (when (and (boundp 'transient--transient-map) transient--transient-map)
+    (define-key transient--transient-map (kbd "RET") command)
+    (define-key transient--transient-map (kbd "<return>") command))
+  (add-hook 'pre-command-hook
+            #'json-log-viewer--transient-terminal-return-pre-command nil t))
+
 (defface json-log-viewer-key-face
   '((t :inherit font-lock-keyword-face))
   "Face for keys in expanded log entry details."
@@ -2569,8 +2619,12 @@ When LEVEL is non-nil, render KEY as an uppercased log level using
     ("t" json-log-viewer-narrow-menu-toggle-operator)
     ("l" json-log-viewer-narrow-menu-set-level)]
    ["Apply"
-    ("RET" "Apply" json-log-viewer-narrow-menu-apply)
-    ("w" "Widen" json-log-viewer-narrow-menu-widen)]])
+    ("<return>" "Apply" json-log-viewer-narrow-menu-apply)
+    ("w" "Widen" json-log-viewer-narrow-menu-widen)]]
+  (interactive)
+  (transient-setup 'json-log-viewer-narrow-menu)
+  (json-log-viewer-transient-bind-terminal-return
+   'json-log-viewer-narrow-menu 'json-log-viewer-narrow-menu-apply))
 
 (defun json-log-viewer-rerender ()
   "Replay stored entries using the current worker-side render mode."
