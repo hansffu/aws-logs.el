@@ -23,6 +23,36 @@
         (json-log-viewer--async-await-pending-count 0)))
     buf))
 
+(ert-deftest aws-logs-list-log-groups-parses-aws-json-array-test ()
+  (let ((aws-logs-region "eu-north-1")
+        (aws-logs-profile nil)
+        (aws-logs-endpoint nil))
+    (cl-letf (((symbol-function 'call-process)
+               (lambda (&rest _args)
+                 (insert (concat "{\"logGroups\":["
+                                 "{\"logGroupName\":\"/aws/demo\"},"
+                                 "{\"logGroupName\":\"/aws/other\"}]}"))
+                 0)))
+      (should (equal (aws-logs--list-log-groups)
+                     '("/aws/demo" "/aws/other"))))))
+
+(ert-deftest aws-logs-list-log-groups-parses-empty-aws-json-array-test ()
+  (let ((aws-logs-region "eu-north-1")
+        (aws-logs-profile nil)
+        (aws-logs-endpoint nil))
+    (cl-letf (((symbol-function 'call-process)
+               (lambda (&rest _args)
+                 (insert "{\"logGroups\":[]}")
+                 0)))
+      (should-not (aws-logs--list-log-groups)))))
+
+(ert-deftest aws-logs-list-log-groups-errors-without-log-groups-test ()
+  (cl-letf (((symbol-function 'call-process)
+             (lambda (&rest _args)
+               (insert "{\"unexpected\":[]}")
+               0)))
+    (should-error (aws-logs--list-log-groups) :type 'user-error)))
+
 (ert-deftest aws-logs-insights-parse-time-range-to-seconds-test ()
   (should (= 30 (aws-logs--insights-parse-time-range-to-seconds "30s")))
   (should (= 600 (aws-logs--insights-parse-time-range-to-seconds "10m")))

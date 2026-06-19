@@ -311,12 +311,15 @@ a property list as accepted by `aws-logs-make-preset`.")
                     exit-status
                     (if (string-empty-p output) "no output" output)))
       (let* ((payload (condition-case _err
-                          (json-parse-string output :object-type 'alist)
+                          (json-parse-string output
+                                             :object-type 'alist
+                                             :array-type 'list)
                         (error
                          (user-error "Failed to parse `describe-log-groups` JSON output: %s"
                                      (if (string-empty-p output) "empty output" output)))))
-             (log-groups (or (alist-get 'logGroups payload) nil)))
-        (unless (listp log-groups)
+             (log-groups-cell (assq 'logGroups payload))
+             (log-groups (cdr log-groups-cell)))
+        (unless (and log-groups-cell (listp log-groups))
           (user-error "Unexpected `describe-log-groups` response: missing `logGroups` list"))
         (delq nil
               (mapcar (lambda (log-group)
