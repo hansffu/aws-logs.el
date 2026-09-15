@@ -14,6 +14,59 @@
 (defvar aws-logs-time-range)
 (defvar aws-logs-query)
 
+(ert-deftest json-log-viewer-finds-installed-rust-programs-test ()
+  (let* ((prefix (make-temp-file "json-log-viewer-install-" t))
+         (json-log-viewer--source-directory
+          (expand-file-name "share/emacs/site-lisp/" prefix))
+         (exec-path nil)
+         (json-log-viewer-worker-program nil)
+         (json-log-viewer-ingest-wrapper-program nil)
+         (json-log-viewer-kube-log-supervisor-program nil))
+    (unwind-protect
+        (progn
+          (make-directory json-log-viewer--source-directory t)
+          (make-directory (expand-file-name "bin" prefix))
+          (dolist (entry '(("json-log-viewer-worker"
+                            . json-log-viewer--worker-program)
+                           ("json-log-viewer-ingest-wrapper"
+                            . json-log-viewer-ingest-wrapper-executable)
+                           ("kube-log-supervisor"
+                            . json-log-viewer-kube-log-supervisor-executable)))
+            (let ((binary (expand-file-name (concat "bin/" (car entry)) prefix)))
+              (write-region "#!/bin/sh\nexit 0\n" nil binary nil 'silent)
+              (set-file-modes binary #o755)
+              (should (equal (funcall (cdr entry)) binary)))))
+      (delete-directory prefix t))))
+
+(ert-deftest json-log-viewer-rust-program-search-order-test ()
+  (let* ((prefix (make-temp-file "json-log-viewer-install-" t))
+         (json-log-viewer--source-directory
+          (expand-file-name "share/emacs/site-lisp/" prefix))
+         (exec-path (list (expand-file-name "path-bin" prefix)))
+         (program "json-log-viewer-worker")
+         (configured (expand-file-name "custom/worker" prefix))
+         (candidates
+          (list configured
+                (expand-file-name (concat "target/debug/" program)
+                                  json-log-viewer--source-directory)
+                (expand-file-name (concat "target/release/" program)
+                                  json-log-viewer--source-directory)
+                (expand-file-name (concat "bin/" program) prefix)
+                (expand-file-name program (car exec-path)))))
+    (unwind-protect
+        (progn
+          (dolist (binary candidates)
+            (make-directory (file-name-directory binary) t)
+            (write-region "#!/bin/sh\nexit 0\n" nil binary nil 'silent)
+            (set-file-modes binary #o755))
+          (dolist (binary candidates)
+            (should (equal (json-log-viewer--find-rust-program program configured)
+                           binary))
+            (set-file-modes binary #o644))
+          (should-error (json-log-viewer--find-rust-program program configured)
+                        :type 'user-error))
+      (delete-directory prefix t))))
+
 (defun aws-logs-core-test--make-viewer (buffer-name initial-lines &rest args)
   "Create json-log-viewer BUFFER-NAME, optionally seeded with INITIAL-LINES."
   (let ((buf (apply #'json-log-viewer-make-buffer buffer-name args)))

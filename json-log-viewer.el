@@ -184,8 +184,9 @@ to `js-mode`."
 (defcustom json-log-viewer-worker-program nil
   "Path to the json-log-viewer Rust worker executable.
 
-When nil, the viewer searches next to the source tree under
-target/debug, target/release, then `exec-path'."
+When nil, search target/debug and target/release beside the Lisp files,
+then bin under the installation prefix for share/emacs/site-lisp layouts,
+then `exec-path'."
   :type '(choice (const :tag "Auto-detect" nil) file)
   :group 'json-log-viewer)
 
@@ -197,16 +198,18 @@ target/debug, target/release, then `exec-path'."
 (defcustom json-log-viewer-ingest-wrapper-program nil
   "Path to the json-log-viewer Rust ingestion wrapper executable.
 
-When nil, the viewer searches next to the source tree under
-target/debug, target/release, then `exec-path'."
+When nil, search target/debug and target/release beside the Lisp files,
+then bin under the installation prefix for share/emacs/site-lisp layouts,
+then `exec-path'."
   :type '(choice (const :tag "Auto-detect" nil) file)
   :group 'json-log-viewer)
 
 (defcustom json-log-viewer-kube-log-supervisor-program nil
   "Path to the kube-log-supervisor Rust executable.
 
-When nil, the viewer searches next to the source tree under
-target/debug, target/release, then `exec-path'."
+When nil, search target/debug and target/release beside the Lisp files,
+then bin under the installation prefix for share/emacs/site-lisp layouts,
+then `exec-path'."
   :type '(choice (const :tag "Auto-detect" nil) file)
   :group 'json-log-viewer)
 
@@ -611,7 +614,9 @@ fetch full worker-backed raw JSON and detail fields."
    json-log-viewer-kube-log-supervisor-program))
 
 (defun json-log-viewer--find-rust-program (program configured)
-  "Return executable PROGRAM, preferring CONFIGURED and local cargo builds."
+  "Return executable PROGRAM, preferring CONFIGURED and local cargo builds.
+Also search the installation prefix's bin directory when the Lisp files
+are installed under share/emacs/site-lisp, before checking `exec-path'."
   (let* ((source-root (and json-log-viewer--source-directory
                            (file-name-as-directory json-log-viewer--source-directory)))
          (debug-candidate (and source-root
@@ -622,6 +627,13 @@ fetch full worker-backed raw JSON and detail fields."
                                  (expand-file-name
                                   (format "target/release/%s" program)
                                   source-root)))
+         ;; Keep the loaded path: Nix installations can symlink the Lisp
+         ;; files and binaries into a shared prefix from separate store paths.
+         (installed-candidate
+          (and source-root
+               (string-match "\\`\\(.*?/\\)share/emacs/site-lisp/" source-root)
+               (expand-file-name (concat "bin/" program)
+                                 (match-string 1 source-root))))
          (found (or (and configured
                          (file-executable-p configured)
                          configured)
@@ -631,6 +643,9 @@ fetch full worker-backed raw JSON and detail fields."
                     (and release-candidate
                          (file-executable-p release-candidate)
                          release-candidate)
+                    (and installed-candidate
+                         (file-executable-p installed-candidate)
+                         installed-candidate)
                     (executable-find program))))
     (or found
         (user-error "Cannot find %s executable; run `cargo build' or customize its program path"

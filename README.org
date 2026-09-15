@@ -152,10 +152,13 @@ nix build .#json-log-viewer-worker
 #+end_src
 
 By default the Elisp client looks for ~target/debug/json-log-viewer-worker~,
-~target/release/json-log-viewer-worker~, then ~json-log-viewer-worker~ on
-~exec-path~. It resolves ~json-log-viewer-ingest-wrapper~ the same way for
-high-throughput kube/kafka streams. Set ~json-log-viewer-worker-program~ or
-~json-log-viewer-ingest-wrapper-program~ to explicit executable paths when
+~target/release/json-log-viewer-worker~, then the installation's ~bin/~ directory
+when the Lisp files are under ~PREFIX/share/emacs/site-lisp/~ (as with Nix),
+and finally ~json-log-viewer-worker~ on ~exec-path~. It resolves
+~json-log-viewer-ingest-wrapper~ and ~kube-log-supervisor~ the same way for
+kube/kafka streams. Set ~json-log-viewer-worker-program~,
+~json-log-viewer-ingest-wrapper-program~, or
+~json-log-viewer-kube-log-supervisor-program~ to explicit executable paths when
 installing the binaries elsewhere.
 
 The control channel uses stdin/stdout. Emacs sends low-volume commands as JSON;
